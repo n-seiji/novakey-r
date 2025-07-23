@@ -27,8 +27,13 @@
     <string>logo.tiff</string>
     <key>tsInputMethodCharacterRepertoireKey</key>
     <array>
+      <string>Hira</string>
+      <string>Kana</string>
+      <string>Hani</string>
       <string>Latn</string>
     </array>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>ja</string>
 
   </dict>
 </plist>
