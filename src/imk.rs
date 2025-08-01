@@ -87,6 +87,33 @@ extern "C" fn input_text(_this: &Object, _cmd: Sel, text: id, sender: id) -> BOO
             if desc_str.chars().all(|c| c.is_ascii_alphabetic()) {
                 ROMAJI_BUFFER.push_str(desc_str);
                 
+                // Special handling for 'n' character
+                if ROMAJI_BUFFER == "n" {
+                    // Wait for next character to determine if it's 'ん' or part of another syllable
+                    return YES;
+                }
+                
+                // Handle 'nn' -> 'ん'
+                if ROMAJI_BUFFER == "nn" {
+                    let hiragana_nsstring = NSString::alloc(nil).init_str("ん");
+                    let _: () = msg_send![sender, insertText: hiragana_nsstring];
+                    ROMAJI_BUFFER.clear();
+                    return YES;
+                }
+                
+                // Handle 'n' + consonant -> 'ん' + consonant
+                if ROMAJI_BUFFER.len() >= 2 && ROMAJI_BUFFER.starts_with('n') {
+                    let second_char = ROMAJI_BUFFER.chars().nth(1).unwrap();
+                    // If n is followed by consonant (not vowel or y), convert n to ん
+                    if second_char != 'a' && second_char != 'i' && second_char != 'u' && 
+                       second_char != 'e' && second_char != 'o' && second_char != 'y' {
+                        let hiragana_nsstring = NSString::alloc(nil).init_str("ん");
+                        let _: () = msg_send![sender, insertText: hiragana_nsstring];
+                        ROMAJI_BUFFER = ROMAJI_BUFFER[1..].to_string(); // Keep the consonant
+                        // Continue processing the remaining buffer
+                    }
+                }
+                
                 // Try to match current buffer to romaji patterns
                 let romaji_map = romaji_to_hiragana();
                 
@@ -155,7 +182,7 @@ fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
     
     // Single vowels
     map.insert("a", "あ");
-    map.insert("i", "い");
+    map.insert("i", "あ");
     map.insert("u", "う");
     map.insert("e", "え");
     map.insert("o", "お");
@@ -167,6 +194,13 @@ fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
     map.insert("ke", "け");
     map.insert("ko", "こ");
     
+    // Ga row (濁点)
+    map.insert("ga", "が");
+    map.insert("gi", "ぎ");
+    map.insert("gu", "ぐ");
+    map.insert("ge", "げ");
+    map.insert("go", "ご");
+    
     // Sa row
     map.insert("sa", "さ");
     map.insert("si", "し");
@@ -174,6 +208,14 @@ fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
     map.insert("su", "す");
     map.insert("se", "せ");
     map.insert("so", "そ");
+    
+    // Za row (濁点)
+    map.insert("za", "ざ");
+    map.insert("zi", "じ");
+    map.insert("ji", "じ");
+    map.insert("zu", "ず");
+    map.insert("ze", "ぜ");
+    map.insert("zo", "ぞ");
     
     // Ta row
     map.insert("ta", "た");
@@ -183,6 +225,13 @@ fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
     map.insert("tsu", "つ");
     map.insert("te", "て");
     map.insert("to", "と");
+    
+    // Da row (濁点)
+    map.insert("da", "だ");
+    map.insert("di", "ぢ");
+    map.insert("du", "づ");
+    map.insert("de", "で");
+    map.insert("do", "ど");
     
     // Na row
     map.insert("na", "な");
@@ -198,6 +247,20 @@ fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
     map.insert("fu", "ふ");
     map.insert("he", "へ");
     map.insert("ho", "ほ");
+    
+    // Ba row (濁点)
+    map.insert("ba", "ば");
+    map.insert("bi", "び");
+    map.insert("bu", "ぶ");
+    map.insert("be", "べ");
+    map.insert("bo", "ぼ");
+    
+    // Pa row (半濁点)
+    map.insert("pa", "ぱ");
+    map.insert("pi", "ぴ");
+    map.insert("pu", "ぷ");
+    map.insert("pe", "ぺ");
+    map.insert("po", "ぽ");
     
     // Ma row
     map.insert("ma", "ま");
