@@ -4,9 +4,15 @@ use objc2_foundation::{NSAutoreleasePool, NSBundle, NSString};
 
 mod composer;
 mod imk;
+mod llm_bridge;
 mod romaji_converter;
 
 fn main() {
+    if std::env::args().any(|a| a == "--test-llm") {
+        llm_bridge::smoke_test();
+        return;
+    }
+
     imk::register_controller();
 
     unsafe {

@@ -10,6 +10,10 @@ run = "cargo build --release"
 description = "Run unit tests"
 run = "cargo test"
 
+[tasks.test-llm]
+description = "FoundationModels availability + 1回変換のスモークテスト"
+run = "cargo run --release -- --test-llm"
+
 [tasks.app]
 description = "Package the release binary into output/NovakeyR.app"
 depends = ["build"]
