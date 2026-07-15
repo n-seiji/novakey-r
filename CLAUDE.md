@@ -33,6 +33,11 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 - `src/main.rs` - Entry point that initializes the NSApplication and IMKServer connection
 - `src/imk.rs` - Input Method Kit integration (controller class, marked text, playful conversion)
 - `src/romaji_converter.rs` - Pure-Rust romaji-to-hiragana conversion engine (unit tested)
+- `src/composer.rs` - 未確定文の状態機械(世代管理・デバウンス・差分抑制・タイムアウト再送、unit tested)
+- `src/llm_bridge.rs` - FoundationModels への FFI(結果は main queue 経由で戻る契約)
+- `swift/LLMBridge.swift` - FoundationModels 呼び出し(build.rs で swiftc コンパイル)
+- 変換モード: ライブ変換(デフォルト)/ スペース変換。入力ソースメニューで切替。
+  LLM が使えない環境(Apple Intelligence 無効等)では生ひらがな確定にフォールバック
 
 ### Key Technical Details
 - Uses macOS InputMethodKit framework via Objective-C bindings (`objc2` / `objc2-foundation`)

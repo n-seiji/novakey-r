@@ -13,6 +13,8 @@ pub const DEBOUNCE_MS: u64 = 300;
 pub const MAX_PENDING_CHARS: usize = 500;
 /// プロンプトに含める確定済み文脈の上限(4096トークン制約対策)
 pub const MAX_CONTEXT_CHARS: usize = 200;
+/// 要求後この時間応答がなければ世代を進めて再要求(ライブ変換のみ)
+pub const TIMEOUT_MS: u64 = 3000;
 
 pub struct Composer<C: KanjiConverter> {
     converter: C,
@@ -26,6 +28,8 @@ pub struct Composer<C: KanjiConverter> {
     last_input_ms: Option<u64>,
     /// この世代で既に要求を出したか(二重要求防止)
     requested_generation: Option<u64>,
+    /// tick 経由で要求を出した時刻(タイムアウト再送用。request_now は対象外)
+    requested_at_ms: Option<u64>,
     /// 確定済みの直近文脈(MAX_CONTEXT_CHARS に切り詰め済み)
     context: String,
 }
@@ -39,6 +43,7 @@ impl<C: KanjiConverter> Composer<C> {
             generation: 0,
             last_input_ms: None,
             requested_generation: None,
+            requested_at_ms: None,
             context: String::new(),
         }
     }
@@ -132,8 +137,17 @@ impl<C: KanjiConverter> Composer<C> {
         if now_ms.saturating_sub(last) < DEBOUNCE_MS {
             return;
         }
+        // タイムアウト: in-flight のまま TIMEOUT_MS 応答なしなら世代を進めて再要求
+        if self.converted.is_none() && self.requested_generation == Some(self.generation) {
+            if let Some(at) = self.requested_at_ms {
+                if now_ms.saturating_sub(at) >= TIMEOUT_MS {
+                    self.generation += 1;
+                }
+            }
+        }
         if self.should_request() {
             self.requested_generation = Some(self.generation);
+            self.requested_at_ms = Some(now_ms);
             self.converter
                 .request(self.generation, &self.hiragana, &self.context);
         }
@@ -337,6 +351,20 @@ mod tests {
         c.push_hiragana("きょう");
         c.request_now();
         assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn 要求後3秒応答がなければ再要求できる() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1300); // 要求1
+        c.tick(2000); // まだ待つ
+        assert_eq!(log.borrow().len(), 1);
+        c.tick(4400); // 3s 超 → 世代を進めて再要求
+        assert_eq!(log.borrow().len(), 2);
+        let reqs = log.borrow();
+        assert!(reqs[1].0 > reqs[0].0); // 新世代
     }
 
     #[test]
