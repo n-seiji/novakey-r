@@ -48,6 +48,8 @@ impl<C: KanjiConverter> Composer<C> {
         }
     }
 
+    // テストで世代を検証するためのアクセサ(本体コードでは未使用)
+    #[cfg(test)]
     pub fn current_generation(&self) -> u64 {
         self.generation
     }
