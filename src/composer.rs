@@ -7,6 +7,13 @@ pub trait KanjiConverter {
     fn request(&mut self, generation: u64, hiragana: &str, context: &str);
 }
 
+/// 入力停止からこの時間経過で変換要求を出す
+pub const DEBOUNCE_MS: u64 = 300;
+/// 未確定がこれを超えたら tick での自動変換を止める(コンテキスト保護)
+pub const MAX_PENDING_CHARS: usize = 500;
+/// プロンプトに含める確定済み文脈の上限(4096トークン制約対策)
+pub const MAX_CONTEXT_CHARS: usize = 200;
+
 pub struct Composer<C: KanjiConverter> {
     converter: C,
     /// 未確定のひらがなバッファ(常に入力の真実源)
@@ -15,6 +22,12 @@ pub struct Composer<C: KanjiConverter> {
     converted: Option<String>,
     /// 変換要求の世代。入力変更・確定・キャンセルで進む
     generation: u64,
+    /// 最後に入力があった時刻(ms)。tick のデバウンス判定に使う
+    last_input_ms: Option<u64>,
+    /// この世代で既に要求を出したか(二重要求防止)
+    requested_generation: Option<u64>,
+    /// 確定済みの直近文脈(MAX_CONTEXT_CHARS に切り詰め済み)
+    context: String,
 }
 
 impl<C: KanjiConverter> Composer<C> {
@@ -24,6 +37,9 @@ impl<C: KanjiConverter> Composer<C> {
             hiragana: String::new(),
             converted: None,
             generation: 0,
+            last_input_ms: None,
+            requested_generation: None,
+            context: String::new(),
         }
     }
 
@@ -85,6 +101,48 @@ impl<C: KanjiConverter> Composer<C> {
     pub fn cancel(&mut self) {
         self.converted = None;
         self.generation += 1;
+    }
+
+    pub fn note_input_time(&mut self, now_ms: u64) {
+        self.last_input_ms = Some(now_ms);
+    }
+
+    pub fn set_context(&mut self, ctx: &str) {
+        // 直近 MAX_CONTEXT_CHARS 文字のみ保持(4096トークン制約対策)
+        let chars: Vec<char> = ctx.chars().collect();
+        let start = chars.len().saturating_sub(MAX_CONTEXT_CHARS);
+        self.context = chars[start..].iter().collect();
+    }
+
+    fn should_request(&self) -> bool {
+        !self.hiragana.is_empty()
+            && self.converted.is_none()
+            && self.requested_generation != Some(self.generation)
+            && self.hiragana.chars().count() <= MAX_PENDING_CHARS
+    }
+
+    pub fn tick(&mut self, now_ms: u64) {
+        let Some(last) = self.last_input_ms else {
+            return;
+        };
+        if now_ms.saturating_sub(last) < DEBOUNCE_MS {
+            return;
+        }
+        if self.should_request() {
+            self.requested_generation = Some(self.generation);
+            self.converter
+                .request(self.generation, &self.hiragana, &self.context);
+        }
+    }
+
+    /// スペース変換モード用: 即時に変換要求。
+    /// 明示操作のため MAX_PENDING_CHARS 超過でも発行する。
+    pub fn request_now(&mut self) {
+        if !self.hiragana.is_empty() && self.requested_generation != Some(self.generation) {
+            self.requested_generation = Some(self.generation);
+            self.converter
+                .request(self.generation, &self.hiragana, &self.context);
+        }
     }
 }
 
@@ -203,5 +261,76 @@ mod tests {
         c.backspace();
         c.backspace();
         assert!(!c.backspace()); // 空なら false
+    }
+
+    #[test]
+    fn 入力後300ms経過のtickで変換要求が飛ぶ() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1200); // まだ 200ms
+        assert!(log.borrow().is_empty());
+        c.tick(1300); // 300ms 経過
+        let reqs = log.borrow();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1, "きょう");
+        assert_eq!(reqs[0].0, c.current_generation());
+    }
+
+    #[test]
+    fn 同一世代で二重要求しない() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1300);
+        c.tick(1400);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn 変換済みなら再要求しない() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1300);
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        c.tick(2000);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn 文脈は200文字に切り詰められる() {
+        let (mut c, log) = composer_with_log();
+        c.set_context(&"あ".repeat(300));
+        c.push_hiragana("きょう");
+        c.request_now();
+        assert_eq!(log.borrow()[0].2.chars().count(), 200);
+    }
+
+    #[test]
+    fn 未確定500文字超はtickで要求しない() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana(&"か".repeat(501));
+        c.note_input_time(1000);
+        c.tick(2000);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn request_nowは即時要求() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.request_now();
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn 空バッファでは要求しない() {
+        let (mut c, log) = composer_with_log();
+        c.request_now();
+        c.note_input_time(0);
+        c.tick(1000);
+        assert!(log.borrow().is_empty());
     }
 }
