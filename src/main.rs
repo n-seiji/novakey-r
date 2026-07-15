@@ -14,6 +14,7 @@ fn main() {
     }
 
     imk::register_controller();
+    imk::init_llm_dispatch();
 
     unsafe {
         let _pool = NSAutoreleasePool::new();

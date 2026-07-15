@@ -11,7 +11,45 @@ use objc2_foundation::{NSNotFound, NSObject, NSRange, NSString};
 use once_cell::sync::Lazy;
 use rand::Rng;
 
+use crate::composer::{Composer, KanjiConverter};
+use crate::llm_bridge;
 use crate::romaji_converter::RomajiConverter;
+
+/// composer からの変換要求を FFI に流すアダプタ。controller_id を焼き込む。
+pub struct LlmKanjiConverter {
+    controller_id: u64,
+}
+
+impl KanjiConverter for LlmKanjiConverter {
+    fn request(&mut self, generation: u64, hiragana: &str, context: &str) {
+        llm_bridge::convert_async(self.controller_id, generation, hiragana, context);
+    }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    // メインスレッド専用。callback は client ポインタを持たず、
+    // ここから controller を引き直す(use-after-free 防止)。
+    static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Swift 側から main queue 上で呼ばれる結果ディスパッチャ。
+fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
+    CONTROLLERS.with(|c| {
+        let controllers = c.borrow();
+        let Some(controller) = controllers.get(&controller_id) else {
+            return; // controller は解放済み: 結果を破棄
+        };
+        controller.handle_llm_result(generation, status, text);
+    });
+}
+
+pub fn init_llm_dispatch() {
+    llm_bridge::set_result_handler(dispatch_llm_result);
+}
 
 #[link(name = "InputMethodKit", kind = "framework")]
 extern "C" {}
@@ -67,6 +105,12 @@ extern_class!(
 // composition in one app never leaks into another.
 pub struct Ivars {
     converter: RefCell<RomajiConverter>,
+    composer: RefCell<Composer<LlmKanjiConverter>>,
+    controller_id: u64,
+    // 直近の inputText/didCommand で受け取った client。
+    // handle_llm_result はメインスレッドで同期的に呼ばれるため、
+    // 直近のイベントサイクル内でのみ有効な弱い参照として扱う。
+    last_client: RefCell<*mut AnyObject>,
 }
 
 declare_class!(
@@ -90,12 +134,20 @@ declare_class!(
             delegate: *mut AnyObject,
             client: *mut AnyObject,
         ) -> Option<Id<Self>> {
+            let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
             let this = this.set_ivars(Ivars {
                 converter: RefCell::new(RomajiConverter::new()),
+                composer: RefCell::new(Composer::new(LlmKanjiConverter { controller_id })),
+                controller_id,
+                last_client: RefCell::new(std::ptr::null_mut()),
             });
-            unsafe {
+            let this: Option<Id<Self>> = unsafe {
                 msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
+            };
+            if let Some(ref obj) = this {
+                CONTROLLERS.with(|c| c.borrow_mut().insert(controller_id, obj.clone()));
             }
+            this
         }
 
         #[method(inputText:client:)]
@@ -189,6 +241,23 @@ declare_class!(
         }
     }
 );
+
+impl NovakeyRInputController {
+    fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
+        if status != llm_bridge::STATUS_OK {
+            unsafe { NSLog!("LLM error status=%d", status) };
+            return; // ひらがな表示を維持(フォールバック)
+        }
+        let client = *self.ivars().last_client.borrow();
+        if client.is_null() {
+            return;
+        }
+        let mut composer = self.ivars().composer.borrow_mut();
+        if let Some(marked) = composer.on_llm_result(generation, text) {
+            unsafe { set_marked_str(client, &marked) };
+        }
+    }
+}
 
 pub fn register_controller() {
     let _ = NovakeyRInputController::class();
