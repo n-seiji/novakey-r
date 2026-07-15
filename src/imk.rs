@@ -49,6 +49,19 @@ fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &
 
 pub fn init_llm_dispatch() {
     llm_bridge::set_result_handler(dispatch_llm_result);
+    let avail = llm_bridge::availability();
+    if avail != llm_bridge::Availability::Available {
+        LLM_ENABLED.with(|e| e.set(false));
+        // NSLog! マクロはこの位置より後で定義されるため extern fn を直接呼ぶ
+        unsafe {
+            let msg = NSString::from_str(&format!("LLM unavailable: {:?}", avail));
+            NSLog(msg.as_ref() as *const NSString as *mut AnyObject);
+        }
+    }
+}
+
+fn llm_enabled() -> bool {
+    LLM_ENABLED.with(|e| e.get())
 }
 
 use std::time::Instant;
@@ -89,7 +102,11 @@ extern "C" fn debounce_fired(context: *mut std::ffi::c_void) {
 }
 
 /// DEBOUNCE_MS + 10ms 後にメインスレッドで composer.tick を打つワンショット。
+/// LLM 無効時は何もしない(ひらがな表示のままのフォールバック)。
 fn schedule_tick(controller_id: u64) {
+    if !llm_enabled() {
+        return;
+    }
     let delay_ns = ((crate::composer::DEBOUNCE_MS + 10) * 1_000_000) as i64;
     let context = Box::into_raw(Box::new(controller_id)) as *mut std::ffi::c_void;
     unsafe {
@@ -155,9 +172,22 @@ extern_class!(
 
 // Per-controller state: each client (app) gets its own converter so
 // composition in one app never leaks into another.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConversionMode {
+    Live,
+    Space,
+}
+
+thread_local! {
+    // 起動時の availability チェック結果。false なら LLM 変換を一切呼ばない
+    // (composer はひらがな表示のまま = フォールバック)。
+    static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 pub struct Ivars {
     converter: RefCell<RomajiConverter>,
     composer: RefCell<Composer<LlmKanjiConverter>>,
+    mode: RefCell<ConversionMode>,
     controller_id: u64,
     // 直近の inputText/didCommand で受け取った client。
     // handle_llm_result はメインスレッドで同期的に呼ばれるため、
@@ -190,6 +220,7 @@ declare_class!(
             let this = this.set_ivars(Ivars {
                 converter: RefCell::new(RomajiConverter::new()),
                 composer: RefCell::new(Composer::new(LlmKanjiConverter { controller_id })),
+                mode: RefCell::new(ConversionMode::Live),
                 controller_id,
                 last_client: RefCell::new(std::ptr::null_mut()),
             });
@@ -219,6 +250,45 @@ declare_class!(
 
             let mut converter = self.ivars().converter.borrow_mut();
 
+            // スペース: 未確定があれば変換トリガー、なければ従来動作
+            if input == " " {
+                let romaji_out = converter.flush();
+                drop(converter);
+                let mut composer = self.ivars().composer.borrow_mut();
+                if let Some(out) = romaji_out {
+                    composer.push_hiragana(&out);
+                }
+                if composer.is_empty() {
+                    // 未確定なし: playful space にフォールバック
+                    if let Some(converted) = playful_convert(" ") {
+                        unsafe { insert_str(client, &converted) };
+                        return Bool::YES;
+                    }
+                    return Bool::NO;
+                }
+                match *self.ivars().mode.borrow() {
+                    ConversionMode::Space => {
+                        if composer.is_converted() {
+                            // 2度目のスペース: 生ひらがなへトグル
+                            composer.cancel();
+                        } else if llm_enabled() {
+                            composer.request_now();
+                        }
+                        let marked = composer.display().to_string();
+                        unsafe { set_marked_str(client, &marked) };
+                    }
+                    ConversionMode::Live => {
+                        // ライブ変換中のスペースは即時変換のショートカット
+                        if llm_enabled() {
+                            composer.request_now();
+                        }
+                        let marked = composer.display().to_string();
+                        unsafe { set_marked_str(client, &marked) };
+                    }
+                }
+                return Bool::YES;
+            }
+
             // Alphabetic input feeds the romaji composition; converted kana
             // accumulates in the composer and stays visible as marked text.
             if !input.is_empty() && input.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -238,7 +308,7 @@ declare_class!(
                 let romaji = self.ivars().converter.borrow().buffer().to_string();
                 let marked = format!("{}{}", composer.display(), romaji);
                 unsafe { set_marked_str(client, &marked) };
-                schedule_tick(self.ivars().controller_id);
+                self.schedule_tick_if_live();
                 return Bool::YES;
             }
 
@@ -262,7 +332,7 @@ declare_class!(
             composer.note_input_time(now_ms());
             let marked = composer.display().to_string();
             unsafe { set_marked_str(client, &marked) };
-            schedule_tick(self.ivars().controller_id);
+            self.schedule_tick_if_live();
             Bool::YES
         }
 
@@ -287,7 +357,7 @@ declare_class!(
                     composer.note_input_time(now_ms());
                     let marked = composer.display().to_string();
                     unsafe { set_marked_str(client, &marked) };
-                    schedule_tick(self.ivars().controller_id);
+                    self.schedule_tick_if_live();
                     return Bool::YES;
                 }
                 // romaji を削った場合の再表示
@@ -344,6 +414,42 @@ declare_class!(
             Bool::NO
         }
 
+        #[method(menu)]
+        fn menu(&self) -> *mut AnyObject {
+            unsafe {
+                let menu: *mut AnyObject = msg_send![objc2::class!(NSMenu), new];
+                let title = NSString::from_str(match *self.ivars().mode.borrow() {
+                    ConversionMode::Live => "ライブ変換: オン",
+                    ConversionMode::Space => "ライブ変換: オフ(スペース変換)",
+                });
+                let item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), alloc];
+                let item: *mut AnyObject = msg_send![
+                    item,
+                    initWithTitle: &*title,
+                    action: sel!(toggleConversionMode:),
+                    keyEquivalent: &*NSString::from_str("")
+                ];
+                let _: () = msg_send![menu, addItem: item];
+                if !llm_enabled() {
+                    let warn = NSString::from_str("LLM利用不可(Apple Intelligence を確認)");
+                    let warn_item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), new];
+                    let _: () = msg_send![warn_item, setTitle: &*warn];
+                    let _: () = msg_send![warn_item, setEnabled: Bool::NO];
+                    let _: () = msg_send![menu, addItem: warn_item];
+                }
+                menu
+            }
+        }
+
+        #[method(toggleConversionMode:)]
+        fn toggle_conversion_mode(&self, _sender: *mut AnyObject) {
+            let mut mode = self.ivars().mode.borrow_mut();
+            *mode = match *mode {
+                ConversionMode::Live => ConversionMode::Space,
+                ConversionMode::Space => ConversionMode::Live,
+            };
+        }
+
         // Called by the system when composition must end (focus change, etc.).
         #[method(commitComposition:)]
         fn commit_composition(&self, client: *mut AnyObject) {
@@ -363,6 +469,13 @@ declare_class!(
 );
 
 impl NovakeyRInputController {
+    // デバウンス変換はライブ変換モードのみ。Space モードは明示スペースで変換する。
+    fn schedule_tick_if_live(&self) {
+        if *self.ivars().mode.borrow() == ConversionMode::Live {
+            schedule_tick(self.ivars().controller_id);
+        }
+    }
+
     fn on_debounce_tick(&self) {
         self.ivars().composer.borrow_mut().tick(now_ms());
     }

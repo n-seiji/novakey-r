@@ -98,6 +98,10 @@ impl<C: KanjiConverter> Composer<C> {
         out
     }
 
+    pub fn is_converted(&self) -> bool {
+        self.converted.is_some()
+    }
+
     pub fn cancel(&mut self) {
         self.converted = None;
         self.generation += 1;
@@ -261,6 +265,16 @@ mod tests {
         c.backspace();
         c.backspace();
         assert!(!c.backspace()); // 空なら false
+    }
+
+    #[test]
+    fn is_convertedは変換結果保持中のみtrue() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        assert!(!c.is_converted());
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        assert!(c.is_converted());
     }
 
     #[test]
