@@ -51,6 +51,58 @@ pub fn init_llm_dispatch() {
     llm_bridge::set_result_handler(dispatch_llm_result);
 }
 
+use std::time::Instant;
+
+static EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+
+fn now_ms() -> u64 {
+    EPOCH.elapsed().as_millis() as u64
+}
+
+// libdispatch 生 FFI (dispatch_after のワンショットタイマー用)
+mod libdispatch {
+    use std::ffi::c_void;
+
+    #[link(name = "System", kind = "dylib")]
+    extern "C" {
+        pub static _dispatch_main_q: c_void;
+        pub fn dispatch_time(when: u64, delta: i64) -> u64;
+        pub fn dispatch_after_f(
+            when: u64,
+            queue: *const c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    pub const DISPATCH_TIME_NOW: u64 = 0;
+}
+
+extern "C" fn debounce_fired(context: *mut std::ffi::c_void) {
+    // main queue 上で呼ばれる。context は Box<u64>(controller_id)。
+    let controller_id = *unsafe { Box::from_raw(context as *mut u64) };
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&controller_id) {
+            controller.on_debounce_tick();
+        }
+    });
+}
+
+/// DEBOUNCE_MS + 10ms 後にメインスレッドで composer.tick を打つワンショット。
+fn schedule_tick(controller_id: u64) {
+    let delay_ns = ((crate::composer::DEBOUNCE_MS + 10) * 1_000_000) as i64;
+    let context = Box::into_raw(Box::new(controller_id)) as *mut std::ffi::c_void;
+    unsafe {
+        let when = libdispatch::dispatch_time(libdispatch::DISPATCH_TIME_NOW, delay_ns);
+        libdispatch::dispatch_after_f(
+            when,
+            &libdispatch::_dispatch_main_q as *const _,
+            context,
+            debounce_fired,
+        );
+    }
+}
+
 #[link(name = "InputMethodKit", kind = "framework")]
 extern "C" {}
 
@@ -162,70 +214,131 @@ declare_class!(
                 );
             }
 
+            // last_client を更新(handle_llm_result 用)
+            *self.ivars().last_client.borrow_mut() = client;
+
             let mut converter = self.ivars().converter.borrow_mut();
 
-            // Alphabetic input feeds the romaji composition; converted kana is
-            // committed and the remaining romaji stays visible as marked text.
+            // Alphabetic input feeds the romaji composition; converted kana
+            // accumulates in the composer and stays visible as marked text.
             if !input.is_empty() && input.chars().all(|c| c.is_ascii_alphabetic()) {
-                let mut committed = String::new();
+                let mut kana = String::new();
                 for ch in input.chars() {
                     if let Some(output) = converter.process_input(ch) {
-                        committed.push_str(&output);
+                        kana.push_str(&output);
                     }
                 }
-                unsafe {
-                    if !committed.is_empty() {
-                        insert_str(client, &committed);
-                    }
-                    set_marked_str(client, converter.buffer());
+                drop(converter);
+                let mut composer = self.ivars().composer.borrow_mut();
+                if !kana.is_empty() {
+                    composer.push_hiragana(&kana);
                 }
+                composer.note_input_time(now_ms());
+                // 表示 = 変換結果orひらがな + 未変換romaji
+                let romaji = self.ivars().converter.borrow().buffer().to_string();
+                let marked = format!("{}{}", composer.display(), romaji);
+                unsafe { set_marked_str(client, &marked) };
+                schedule_tick(self.ivars().controller_id);
                 return Bool::YES;
             }
 
-            // Anything else ends the composition: commit pending romaji first.
-            if let Some(output) = converter.flush() {
-                unsafe { insert_str(client, &output) };
+            // 非アルファベット(数字・記号): pending romaji を flush して composer に
+            // 積み、その文字も未確定文に含める。
+            let romaji_out = converter.flush();
+            drop(converter);
+            let mut composer = self.ivars().composer.borrow_mut();
+            if let Some(out) = romaji_out {
+                composer.push_hiragana(&out);
             }
-
-            // Playful conversion for select characters; otherwise let the
-            // client handle the key itself.
-            if let Some(converted) = playful_convert(input) {
-                unsafe { insert_str(client, &converted) };
-                return Bool::YES;
+            if composer.is_empty() {
+                // 未確定なし: playful 変換 or パススルー(従来動作)
+                if let Some(converted) = playful_convert(input) {
+                    unsafe { insert_str(client, &converted) };
+                    return Bool::YES;
+                }
+                return Bool::NO;
             }
-            Bool::NO
+            composer.push_hiragana(input);
+            composer.note_input_time(now_ms());
+            let marked = composer.display().to_string();
+            unsafe { set_marked_str(client, &marked) };
+            schedule_tick(self.ivars().controller_id);
+            Bool::YES
         }
 
         // Non-character keys (delete, return, escape, ...) arrive here, not in
         // inputText:client:.
         #[method(didCommandBySelector:client:)]
         fn did_command_by_selector(&self, selector: Sel, client: *mut AnyObject) -> Bool {
+            *self.ivars().last_client.borrow_mut() = client;
+
             let mut converter = self.ivars().converter.borrow_mut();
 
+            // Backspace: romaji バッファ優先、次に composer 末尾1文字
             if selector == sel!(deleteBackward:) {
-                if converter.buffer().is_empty() {
-                    return Bool::NO;
+                if !converter.buffer().is_empty() {
+                    converter.handle_backspace();
+                } else {
+                    drop(converter);
+                    let mut composer = self.ivars().composer.borrow_mut();
+                    if !composer.backspace() {
+                        return Bool::NO; // 未確定なし: アプリへパススルー
+                    }
+                    composer.note_input_time(now_ms());
+                    let marked = composer.display().to_string();
+                    unsafe { set_marked_str(client, &marked) };
+                    schedule_tick(self.ivars().controller_id);
+                    return Bool::YES;
                 }
-                converter.handle_backspace();
-                unsafe { set_marked_str(client, converter.buffer()) };
+                // romaji を削った場合の再表示
+                let romaji = converter.buffer().to_string();
+                drop(converter);
+                let composer = self.ivars().composer.borrow();
+                let marked = format!("{}{}", composer.display(), romaji);
+                unsafe { set_marked_str(client, &marked) };
                 return Bool::YES;
             }
 
+            // Enter: 確定
             if selector == sel!(insertNewline:) {
-                // Commit pending romaji, then let the client insert the newline.
                 if let Some(output) = converter.flush() {
-                    unsafe { insert_str(client, &output) };
+                    drop(converter);
+                    self.ivars().composer.borrow_mut().push_hiragana(&output);
+                } else {
+                    drop(converter);
                 }
-                return Bool::NO;
+                let mut composer = self.ivars().composer.borrow_mut();
+                if composer.is_empty() {
+                    return Bool::NO; // 未確定なし: 改行をアプリへ
+                }
+                let text = composer.commit(); // in-flight 無効化込み
+                composer.set_context(&text);
+                unsafe {
+                    set_marked_str(client, "");
+                    insert_str(client, &text);
+                }
+                return Bool::YES; // 改行自体は挿入しない(確定のみ)
             }
 
+            // Esc: 生ひらがなに戻す
             if selector == sel!(cancelOperation:) {
-                if converter.buffer().is_empty() {
+                converter.clear();
+                drop(converter);
+                let mut composer = self.ivars().composer.borrow_mut();
+                if composer.is_empty() {
                     return Bool::NO;
                 }
-                converter.clear();
-                unsafe { set_marked_str(client, "") };
+                composer.cancel();
+                let marked = composer.display().to_string();
+                unsafe { set_marked_str(client, &marked) };
                 return Bool::YES;
+            }
+
+            // 左右矢印: 未確定中は無効(v1 はカーソル移動非対応)
+            if selector == sel!(moveLeft:) || selector == sel!(moveRight:) {
+                let has_pending = !converter.buffer().is_empty()
+                    || !self.ivars().composer.borrow().is_empty();
+                return if has_pending { Bool::YES } else { Bool::NO };
             }
 
             Bool::NO
@@ -235,14 +348,25 @@ declare_class!(
         #[method(commitComposition:)]
         fn commit_composition(&self, client: *mut AnyObject) {
             let mut converter = self.ivars().converter.borrow_mut();
-            if let Some(output) = converter.flush() {
-                unsafe { insert_str(client, &output) };
+            let romaji_out = converter.flush();
+            drop(converter);
+            let mut composer = self.ivars().composer.borrow_mut();
+            if let Some(out) = romaji_out {
+                composer.push_hiragana(&out);
+            }
+            if !composer.is_empty() {
+                let text = composer.commit();
+                unsafe { insert_str(client, &text) };
             }
         }
     }
 );
 
 impl NovakeyRInputController {
+    fn on_debounce_tick(&self) {
+        self.ivars().composer.borrow_mut().tick(now_ms());
+    }
+
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
         if status != llm_bridge::STATUS_OK {
             unsafe { NSLog!("LLM error status=%d", status) };
