@@ -8,55 +8,97 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 
 ## Development Commands
 
-### Building and Packaging
-- `eval "$(mise activate zsh)" && make app` - Build the release binary and package it into a macOS app bundle in `output/NovakeyR.app` (requires mise for Rust environment)
-- `eval "$(mise activate zsh)" && cargo build --release` - Build the Rust binary only (requires mise for Rust environment)
-- `make clean` - Remove the generated app bundle
-- `make run` - Run the compiled app directly
+### Building and Packaging (mise tasks, no Makefile)
+- `mise run app` - Build the release binary and package it into `output/NovakeyR.app`
+- `mise run build` - Build the Rust binary only (`cargo build --release`)
+- `mise run test` - Run unit tests (`cargo test`)
+- `mise run install` - Build, package, and install into `~/Library/Input Methods` (no sudo)
+- `mise run uninstall` - Remove the installed app
+- `mise run logs` - Stream NSLog output from the running IME
+- `mise run clean` - Remove the generated app bundle
+- `mise run run` - Run the packaged binary directly (smoke test)
 
 ### Environment Setup
 - Requires Rust installation via mise: `mise install rust`
 - Use `mise use rust` to activate Rust environment
-- All cargo/rust commands need to be run with `eval "$(mise activate zsh)" &&` prefix
+- **IMPORTANT**: mise environment is already activated in this shell session. DO NOT use `eval "$(mise activate zsh)"` prefix for commands.
 
 ### Testing and Development
-- The project currently has no automated tests
-- Manual testing requires installing the IME in `/Library/Input Methods` and adding it in System Preferences
+- Unit tests cover the romaji conversion engine (`cargo test` / `mise run test`)
+- Manual testing: `mise run install`, then add "NovakeyR" in System Settings > Keyboard > Input Sources (re-login may be required the first time)
 
 ## Architecture
 
 ### Core Components
 - `src/main.rs` - Entry point that initializes the NSApplication and IMKServer connection
-- `src/imk.rs` - Contains the Input Method Kit integration and character conversion logic
+- `src/imk.rs` - Input Method Kit integration (controller class, marked text, playful conversion)
+- `src/romaji_converter.rs` - Pure-Rust romaji-to-hiragana conversion engine (unit tested)
 
 ### Key Technical Details
-- Uses macOS InputMethodKit framework via Objective-C bindings
+- Uses macOS InputMethodKit framework via Objective-C bindings (`objc2` / `objc2-foundation`)
+- Custom `NovakeyRInputController` class extends `IMKInputController` via `declare_class!`;
+  `register_controller()` must run before IMKServer connects so the class is registered
+  with the Objective-C runtime
+- Per-controller state: each controller instance owns a `RomajiConverter`
+  (`RefCell` ivar set in `initWithServer:delegate:client:`)
 - Japanese input processing:
-  - Romaji-to-hiragana conversion via `romaji_to_hiragana()` function
-  - Buffered input system for multi-character romaji sequences
-  - Space key triggers conversion from buffered romaji to hiragana
-  - Hiragana-to-katakana conversion via `hiragana_to_katakana()` function
-- Character conversion happens in `convert()` function with randomized selection from predefined character mappings
-- Custom `NovakeyRInputController` class extends `IMKInputController` to handle input events
-- Uses unsafe Rust blocks extensively for Objective-C interop via the `objc` and `cocoa` crates
-- Global `ROMAJI_BUFFER` for tracking romaji input state
+  - Alphabetic keys feed `RomajiConverter::process_input`; converted kana is committed
+    via `insertText:replacementRange:`, pending romaji is shown as marked text
+    (`setMarkedText:selectionRange:replacementRange:`)
+  - Non-character keys (delete / return / escape) are handled in `didCommandBySelector:client:`
+  - `commitComposition:` flushes pending romaji when focus changes
+- Playful character conversion (`playful_convert()`) randomizes select characters (1/0/space, etc.)
+- Uses unsafe Rust blocks for Objective-C interop
 
 ### Dependencies
-- `objc` - Objective-C runtime bindings
-- `cocoa` - macOS Cocoa framework bindings  
+- `objc2` - Objective-C runtime bindings
+- `objc2-foundation` - Foundation framework bindings (NSString, NSRange, ...)
 - `libc` - C library bindings
 - `rand` - Random number generation for character selection
+- `once_cell` - Lazy statics
 
 ### Installation Process
-The built app must be manually copied to `/Library/Input Methods` and requires logout/login or restart to activate. Users then add "NovakeyR" from System Preferences > Keyboard > Input Sources.
+`mise run install` copies the built app to `~/Library/Input Methods` (user-level, no sudo). First activation may require logout/login. Users then add "NovakeyR" from System Preferences > Keyboard > Input Sources.
 
 ### Japanese Input Features
 - Romaji to hiragana conversion (a→あ, ka→か, etc.)
 - Supports common romaji patterns including alternative spellings (si/shi, tu/tsu, etc.)
-- Space key converts buffered romaji to hiragana
+- Conversion happens incrementally as you type; pending romaji is shown as underlined marked text
+- Space / newline / focus change commit any remaining buffered romaji
 - Automatic buffer management for multi-character sequences
 - Backspace handling for romaji buffer editing
 - Support for Japanese character repertoires: Hiragana, Katakana, Kanji, Latin
+
+## Git Branch Strategy
+
+### Branch Structure
+- `main` - Production-ready code, stable releases
+- `develop` - Development branch, integration of features
+- `feature/*` - Feature branches for new functionality
+- `fix/*` - Bug fix branches
+- `hotfix/*` - Emergency fixes for production
+
+### Workflow
+1. All development work happens on `develop` branch
+2. Create feature branches from `develop` for new features
+3. Create fix branches from `develop` for bug fixes
+4. Merge completed work back to `develop` via pull requests
+5. When ready for release, merge `develop` to `main`
+6. Hotfixes branch from `main` and merge back to both `main` and `develop`
+
+### Current Branch Status
+- **Active branch**: `develop` (as shown in git status)
+- **Main branch**: `main` (target for production releases)
+
+### Commit Convention
+- Use descriptive commit messages
+- Include emoji prefixes when appropriate:
+  - `:sparkles:` (✨) - New features
+  - `:bug:` (🐛) - Bug fixes
+  - `:books:` (📚) - Documentation
+  - `:wrench:` (🔧) - Configuration changes
+  - `:construction:` (🚧) - Work in progress
+  - `:recycle:` (♻️) - Refactoring
 
 ## Claude Code Configuration
 

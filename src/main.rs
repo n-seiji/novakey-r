@@ -1,34 +1,34 @@
-use cocoa::appkit::{NSApp, NSApplication};
-use cocoa::base::{id, nil, BOOL};
-use cocoa::foundation::{NSAutoreleasePool, NSString};
-
-#[macro_use]
-extern crate objc;
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send};
+use objc2_foundation::{NSAutoreleasePool, NSBundle, NSString};
 
 mod imk;
+mod romaji_converter;
 
 fn main() {
     imk::register_controller();
 
     unsafe {
-        let _pool = NSAutoreleasePool::new(nil);
-        let app = NSApp();
-        let k_connection_name = NSString::alloc(nil).init_str("me.sijis.inputmethod.NovakeyR_Connection");
-        let nib_name = NSString::alloc(nil).init_str("MainMenu");
+        let _pool = NSAutoreleasePool::new();
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let connection_name = NSString::from_str("me.sijis.inputmethod.NovakeyR_Connection");
 
-        // TODO: cocoa の NSbundle に置き換えたいかも
-        let bundle: id = msg_send![class!(NSBundle), mainBundle];
-        let identifer: id = msg_send![bundle, bundleIdentifier];
+        let bundle = NSBundle::mainBundle();
+        let identifier = bundle.bundleIdentifier();
 
-        imk::describe(identifer);
-        imk::describe(nib_name);
-        imk::describe(k_connection_name);
+        if let Some(ref id) = identifier {
+            imk::describe(id.as_ref() as *const NSString as *mut AnyObject);
+        }
+        imk::describe(connection_name.as_ref() as *const NSString as *mut AnyObject);
 
-        // NOTE: OBJC 風の書き方を調べる
-        imk::connect_imkserver(k_connection_name, identifer);
+        imk::connect_imkserver(
+            connection_name.as_ref() as *const NSString as *mut AnyObject,
+            identifier
+                .as_ref()
+                .map(|id| id.as_ref() as *const NSString as *mut AnyObject)
+                .unwrap_or(std::ptr::null_mut()),
+        );
 
-        let _: BOOL = msg_send![class!(NSBundle), loadNibNamed:nib_name
-                                owner:app];
-        app.run()
+        let _: () = msg_send![app, run];
     }
 }

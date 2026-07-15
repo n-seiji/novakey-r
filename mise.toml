@@ -1,2 +1,55 @@
 [tools]
 rust = "latest"
+uv = "latest"
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run unit tests"
+run = "cargo test"
+
+[tasks.app]
+description = "Package the release binary into output/NovakeyR.app"
+depends = ["build"]
+run = """
+rm -rf output/NovakeyR.app
+mkdir -p output/NovakeyR.app/Contents/MacOS
+mkdir -p output/NovakeyR.app/Contents/Resources
+cp Info.plist output/NovakeyR.app/Contents/
+cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
+cp -R resources/. output/NovakeyR.app/Contents/Resources/
+"""
+
+[tasks.clean]
+description = "Remove the generated app bundle"
+run = "rm -rf output/NovakeyR.app"
+
+[tasks.run]
+description = "Run the packaged binary directly (smoke test)"
+depends = ["app"]
+run = "./output/NovakeyR.app/Contents/MacOS/novakey_r"
+
+[tasks.install]
+description = "Install NovakeyR.app into ~/Library/Input Methods (no sudo needed)"
+depends = ["app"]
+run = """
+pkill -x novakey_r || true
+mkdir -p "$HOME/Library/Input Methods"
+rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
+cp -R output/NovakeyR.app "$HOME/Library/Input Methods/"
+echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
+"""
+
+[tasks.uninstall]
+description = "Remove NovakeyR.app from ~/Library/Input Methods"
+run = """
+pkill -x novakey_r || true
+rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
+echo "Uninstalled NovakeyR."
+"""
+
+[tasks.logs]
+description = "Stream NSLog output from the running IME"
+run = "log stream --predicate 'process == \"novakey_r\"'"

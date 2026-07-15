@@ -1,324 +1,274 @@
-use cocoa::base::{id, nil, BOOL, NO, YES};
-use cocoa::foundation::NSString;
-use objc::declare::ClassDecl;
-use objc::runtime::{Object, Sel};
-
-use rand::Rng;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::{slice, str};
+
+use objc2::rc::{Allocated, Id};
+use objc2::runtime::{AnyObject, Bool, Sel};
+use objc2::{
+    declare_class, extern_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass,
+};
+use objc2_foundation::{NSNotFound, NSObject, NSRange, NSString};
+use once_cell::sync::Lazy;
+use rand::Rng;
+
+use crate::romaji_converter::RomajiConverter;
 
 #[link(name = "InputMethodKit", kind = "framework")]
 extern "C" {}
 
+// NSApplication is looked up at runtime via class!, so AppKit must be linked
+// explicitly; nothing else pulls it in directly.
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
-    pub fn NSLog(fmt: id, ...);
+    pub fn NSLog(fmt: *mut AnyObject, ...);
 }
 
 macro_rules! NSLog {
-    ( $fmt:expr ) => {
-        NSLog(NSString::alloc(nil).init_str($fmt))
-    };
-    ( $fmt:expr, $( $x:expr ),* ) => {
-        NSLog(NSString::alloc(nil).init_str($fmt), $($x, )*)
-    };
+    ( $fmt:expr ) => {{
+        let ns_str = NSString::from_str($fmt);
+        NSLog(ns_str.as_ref() as *const NSString as *mut AnyObject)
+    }};
+    ( $fmt:expr, $( $x:expr ),* ) => {{
+        let ns_str = NSString::from_str($fmt);
+        NSLog(ns_str.as_ref() as *const NSString as *mut AnyObject, $($x, )*)
+    }};
 }
 
 const UTF8_ENCODING: libc::c_uint = 4;
 
-// TODO: create trait IMKServer
-pub unsafe fn connect_imkserver(name: id /* NSString */, identifer: id /* NSString */) {
-    let server_alloc: id = msg_send![class!(IMKServer), alloc];
-    let _server: id = msg_send![server_alloc, initWithName:name bundleIdentifier:identifer];
-}
+// Declare IMKServer as an external class
+extern_class!(
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    pub struct IMKServer;
 
-pub fn register_controller() {
-    let super_class = class!(IMKInputController);
-    let mut decl = ClassDecl::new("NovakeyRInputController", super_class).unwrap();
-
-    unsafe {
-        decl.add_method(
-            sel!(inputText:client:),
-            input_text as extern "C" fn(&Object, Sel, id, id) -> BOOL,
-        );
+    unsafe impl ClassType for IMKServer {
+        type Super = NSObject;
+        type Mutability = mutability::InteriorMutable;
+        const NAME: &'static str = "IMKServer";
     }
-    decl.register();
+);
+
+// Declare IMKInputController as an external class
+extern_class!(
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    pub struct IMKInputController;
+
+    unsafe impl ClassType for IMKInputController {
+        type Super = NSObject;
+        type Mutability = mutability::InteriorMutable;
+        const NAME: &'static str = "IMKInputController";
+    }
+);
+
+// Per-controller state: each client (app) gets its own converter so
+// composition in one app never leaks into another.
+pub struct Ivars {
+    converter: RefCell<RomajiConverter>,
 }
 
-// Global state for romaji buffer
-static mut ROMAJI_BUFFER: String = String::new();
+declare_class!(
+    pub struct NovakeyRInputController;
 
-extern "C" fn input_text(_this: &Object, _cmd: Sel, text: id, sender: id) -> BOOL {
-    if let Some(desc_str) = to_s(text) {
-        unsafe {
-            NSLog!("Input received: %{public}s", NSString::alloc(nil).init_str(desc_str));
+    unsafe impl ClassType for NovakeyRInputController {
+        type Super = IMKInputController;
+        type Mutability = mutability::InteriorMutable;
+        const NAME: &'static str = "NovakeyRInputController";
+    }
 
-            // Handle space key - convert buffered romaji to hiragana
-            if desc_str == " " {
-                if !ROMAJI_BUFFER.is_empty() {
-                    let romaji_map = romaji_to_hiragana();
-                    if let Some(&hiragana) = romaji_map.get(ROMAJI_BUFFER.as_str()) {
-                        let hiragana_nsstring = NSString::alloc(nil).init_str(hiragana);
-                        let _: () = msg_send![sender, insertText: hiragana_nsstring];
-                        ROMAJI_BUFFER.clear();
-                    } else {
-                        // If no match, output the romaji buffer as is
-                        let romaji_nsstring = NSString::alloc(nil).init_str(&ROMAJI_BUFFER);
-                        let _: () = msg_send![sender, insertText: romaji_nsstring];
-                        ROMAJI_BUFFER.clear();
-                        // Then insert the space
-                        let _: () = msg_send![sender, insertText: text];
-                    }
-                } else {
-                    let _: () = msg_send![sender, insertText: text];
-                }
-                return YES;
-            }
+    impl DeclaredClass for NovakeyRInputController {
+        type Ivars = Ivars;
+    }
 
-            // Handle backspace - remove from buffer
-            if desc_str.len() == 1 && desc_str.chars().next().unwrap() as u32 == 8 { // backspace
-                if !ROMAJI_BUFFER.is_empty() {
-                    ROMAJI_BUFFER.pop();
-                }
-                return YES;
-            }
-
-            // For ASCII alphabetic characters, add to romaji buffer
-            if desc_str.chars().all(|c| c.is_ascii_alphabetic()) {
-                ROMAJI_BUFFER.push_str(desc_str);
-                
-                // Special handling for 'n' character
-                if ROMAJI_BUFFER == "n" {
-                    // Wait for next character to determine if it's 'ん' or part of another syllable
-                    return YES;
-                }
-                
-                // Handle 'nn' -> 'ん'
-                if ROMAJI_BUFFER == "nn" {
-                    let hiragana_nsstring = NSString::alloc(nil).init_str("ん");
-                    let _: () = msg_send![sender, insertText: hiragana_nsstring];
-                    ROMAJI_BUFFER.clear();
-                    return YES;
-                }
-                
-                // Handle 'n' + consonant -> 'ん' + consonant
-                if ROMAJI_BUFFER.len() >= 2 && ROMAJI_BUFFER.starts_with('n') {
-                    let second_char = ROMAJI_BUFFER.chars().nth(1).unwrap();
-                    // If n is followed by consonant (not vowel or y), convert n to ん
-                    if second_char != 'a' && second_char != 'i' && second_char != 'u' && 
-                       second_char != 'e' && second_char != 'o' && second_char != 'y' {
-                        let hiragana_nsstring = NSString::alloc(nil).init_str("ん");
-                        let _: () = msg_send![sender, insertText: hiragana_nsstring];
-                        ROMAJI_BUFFER = ROMAJI_BUFFER[1..].to_string(); // Keep the consonant
-                        // Continue processing the remaining buffer
-                    }
-                }
-                
-                // Try to match current buffer to romaji patterns
-                let romaji_map = romaji_to_hiragana();
-                
-                // Check for exact match
-                if let Some(&hiragana) = romaji_map.get(ROMAJI_BUFFER.as_str()) {
-                    let hiragana_nsstring = NSString::alloc(nil).init_str(hiragana);
-                    let _: () = msg_send![sender, insertText: hiragana_nsstring];
-                    ROMAJI_BUFFER.clear();
-                    return YES;
-                }
-                
-                // Check if buffer could potentially match something longer
-                let has_potential_match = romaji_map.keys().any(|key| key.starts_with(&ROMAJI_BUFFER));
-                
-                if !has_potential_match {
-                    // No potential match, output what we have and start fresh
-                    let romaji_nsstring = NSString::alloc(nil).init_str(&ROMAJI_BUFFER);
-                    let _: () = msg_send![sender, insertText: romaji_nsstring];
-                    ROMAJI_BUFFER.clear();
-                }
-                
-                return YES;
-            }
-
-            // For non-alphabetic characters, first flush buffer then handle normally
-            if !ROMAJI_BUFFER.is_empty() {
-                let romaji_nsstring = NSString::alloc(nil).init_str(&ROMAJI_BUFFER);
-                let _: () = msg_send![sender, insertText: romaji_nsstring];
-                ROMAJI_BUFFER.clear();
-            }
-
-            // Apply original character conversion for special characters
-            if let Some(converted) = convert(desc_str) {
-                let converted_nsstring = NSString::alloc(nil).init_str(&converted);
-                let _: () = msg_send![sender, insertText: converted_nsstring];
-            } else {
-                let _: () = msg_send![sender, insertText: text];
+    unsafe impl NovakeyRInputController {
+        #[method_id(initWithServer:delegate:client:)]
+        fn init_with_server(
+            this: Allocated<Self>,
+            server: *mut AnyObject,
+            delegate: *mut AnyObject,
+            client: *mut AnyObject,
+        ) -> Option<Id<Self>> {
+            let this = this.set_ivars(Ivars {
+                converter: RefCell::new(RomajiConverter::new()),
+            });
+            unsafe {
+                msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
             }
         }
-        return YES;
+
+        #[method(inputText:client:)]
+        fn input_text(&self, text: *mut AnyObject, client: *mut AnyObject) -> Bool {
+            let Some(input) = to_s(text) else {
+                return Bool::NO;
+            };
+            unsafe {
+                NSLog!(
+                    "Input received: %@",
+                    NSString::from_str(input).as_ref() as *const NSString as *mut AnyObject
+                );
+            }
+
+            let mut converter = self.ivars().converter.borrow_mut();
+
+            // Alphabetic input feeds the romaji composition; converted kana is
+            // committed and the remaining romaji stays visible as marked text.
+            if !input.is_empty() && input.chars().all(|c| c.is_ascii_alphabetic()) {
+                let mut committed = String::new();
+                for ch in input.chars() {
+                    if let Some(output) = converter.process_input(ch) {
+                        committed.push_str(&output);
+                    }
+                }
+                unsafe {
+                    if !committed.is_empty() {
+                        insert_str(client, &committed);
+                    }
+                    set_marked_str(client, converter.buffer());
+                }
+                return Bool::YES;
+            }
+
+            // Anything else ends the composition: commit pending romaji first.
+            if let Some(output) = converter.flush() {
+                unsafe { insert_str(client, &output) };
+            }
+
+            // Playful conversion for select characters; otherwise let the
+            // client handle the key itself.
+            if let Some(converted) = playful_convert(input) {
+                unsafe { insert_str(client, &converted) };
+                return Bool::YES;
+            }
+            Bool::NO
+        }
+
+        // Non-character keys (delete, return, escape, ...) arrive here, not in
+        // inputText:client:.
+        #[method(didCommandBySelector:client:)]
+        fn did_command_by_selector(&self, selector: Sel, client: *mut AnyObject) -> Bool {
+            let mut converter = self.ivars().converter.borrow_mut();
+
+            if selector == sel!(deleteBackward:) {
+                if converter.buffer().is_empty() {
+                    return Bool::NO;
+                }
+                converter.handle_backspace();
+                unsafe { set_marked_str(client, converter.buffer()) };
+                return Bool::YES;
+            }
+
+            if selector == sel!(insertNewline:) {
+                // Commit pending romaji, then let the client insert the newline.
+                if let Some(output) = converter.flush() {
+                    unsafe { insert_str(client, &output) };
+                }
+                return Bool::NO;
+            }
+
+            if selector == sel!(cancelOperation:) {
+                if converter.buffer().is_empty() {
+                    return Bool::NO;
+                }
+                converter.clear();
+                unsafe { set_marked_str(client, "") };
+                return Bool::YES;
+            }
+
+            Bool::NO
+        }
+
+        // Called by the system when composition must end (focus change, etc.).
+        #[method(commitComposition:)]
+        fn commit_composition(&self, client: *mut AnyObject) {
+            let mut converter = self.ivars().converter.borrow_mut();
+            if let Some(output) = converter.flush() {
+                unsafe { insert_str(client, &output) };
+            }
+        }
     }
-    return NO;
+);
+
+pub fn register_controller() {
+    let _ = NovakeyRInputController::class();
+    unsafe {
+        NSLog!(
+            "Registered input controller class: %@",
+            NSString::from_str(NovakeyRInputController::NAME).as_ref() as *const NSString
+                as *mut AnyObject
+        );
+    }
 }
 
-fn convert(text: &str) -> Option<String> {
-    let mut rng = rand::thread_rng();
+// TODO: create trait IMKServer
+pub unsafe fn connect_imkserver(name: *mut AnyObject, identifer: *mut AnyObject) {
+    let server_class = IMKServer::class();
+    let server_alloc: *mut AnyObject = msg_send![server_class, alloc];
+    let _server: *mut AnyObject =
+        msg_send![server_alloc, initWithName: name, bundleIdentifier: identifer];
+    NSLog!("IMKServer connection established");
+}
+
+/// Commit text to the client, replacing any marked text.
+unsafe fn insert_str(client: *mut AnyObject, text: &str) {
+    let ns = NSString::from_str(text);
+    let replacement_range = NSRange {
+        location: NSNotFound as usize,
+        length: 0,
+    };
+    let _: () = msg_send![client, insertText: &*ns, replacementRange: replacement_range];
+}
+
+/// Show the pending romaji as underlined marked text (empty string clears it).
+unsafe fn set_marked_str(client: *mut AnyObject, text: &str) {
+    let ns = NSString::from_str(text);
+    let length: usize = msg_send![&*ns, length];
+    let selection_range = NSRange { location: length, length: 0 };
+    let replacement_range = NSRange {
+        location: NSNotFound as usize,
+        length: 0,
+    };
+    let _: () = msg_send![
+        client,
+        setMarkedText: &*ns,
+        selectionRange: selection_range,
+        replacementRange: replacement_range
+    ];
+}
+
+static PLAYFUL_MAP: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
     let mut outs = HashMap::new();
-    
-    // Original character conversion mappings
     outs.insert("l", vec!["l", "I", "|"]);
     outs.insert("1", vec!["l", "1", "I"]);
     outs.insert("I", vec!["l", "I", "|"]);
     outs.insert("O", vec!["O", "0"]);
     outs.insert("0", vec!["O", "0"]);
     outs.insert(" ", vec![" ", "　"]);
+    outs
+});
 
-    if let Some(list) = outs.get(text) {
-        let i: i32 = rng.gen_range(0..list.len() as i32);
-        return Some(list[i as usize].to_string());
-    }
-    return None;
-}
-
-fn romaji_to_hiragana() -> HashMap<&'static str, &'static str> {
-    let mut map = HashMap::new();
-    
-    // Single vowels
-    map.insert("a", "あ");
-    map.insert("i", "あ");
-    map.insert("u", "う");
-    map.insert("e", "え");
-    map.insert("o", "お");
-    
-    // Ka row
-    map.insert("ka", "か");
-    map.insert("ki", "き");
-    map.insert("ku", "く");
-    map.insert("ke", "け");
-    map.insert("ko", "こ");
-    
-    // Ga row (濁点)
-    map.insert("ga", "が");
-    map.insert("gi", "ぎ");
-    map.insert("gu", "ぐ");
-    map.insert("ge", "げ");
-    map.insert("go", "ご");
-    
-    // Sa row
-    map.insert("sa", "さ");
-    map.insert("si", "し");
-    map.insert("shi", "し");
-    map.insert("su", "す");
-    map.insert("se", "せ");
-    map.insert("so", "そ");
-    
-    // Za row (濁点)
-    map.insert("za", "ざ");
-    map.insert("zi", "じ");
-    map.insert("ji", "じ");
-    map.insert("zu", "ず");
-    map.insert("ze", "ぜ");
-    map.insert("zo", "ぞ");
-    
-    // Ta row
-    map.insert("ta", "た");
-    map.insert("ti", "ち");
-    map.insert("chi", "ち");
-    map.insert("tu", "つ");
-    map.insert("tsu", "つ");
-    map.insert("te", "て");
-    map.insert("to", "と");
-    
-    // Da row (濁点)
-    map.insert("da", "だ");
-    map.insert("di", "ぢ");
-    map.insert("du", "づ");
-    map.insert("de", "で");
-    map.insert("do", "ど");
-    
-    // Na row
-    map.insert("na", "な");
-    map.insert("ni", "に");
-    map.insert("nu", "ぬ");
-    map.insert("ne", "ね");
-    map.insert("no", "の");
-    
-    // Ha row
-    map.insert("ha", "は");
-    map.insert("hi", "ひ");
-    map.insert("hu", "ふ");
-    map.insert("fu", "ふ");
-    map.insert("he", "へ");
-    map.insert("ho", "ほ");
-    
-    // Ba row (濁点)
-    map.insert("ba", "ば");
-    map.insert("bi", "び");
-    map.insert("bu", "ぶ");
-    map.insert("be", "べ");
-    map.insert("bo", "ぼ");
-    
-    // Pa row (半濁点)
-    map.insert("pa", "ぱ");
-    map.insert("pi", "ぴ");
-    map.insert("pu", "ぷ");
-    map.insert("pe", "ぺ");
-    map.insert("po", "ぽ");
-    
-    // Ma row
-    map.insert("ma", "ま");
-    map.insert("mi", "み");
-    map.insert("mu", "む");
-    map.insert("me", "め");
-    map.insert("mo", "も");
-    
-    // Ya row
-    map.insert("ya", "や");
-    map.insert("yu", "ゆ");
-    map.insert("yo", "よ");
-    
-    // Ra row
-    map.insert("ra", "ら");
-    map.insert("ri", "り");
-    map.insert("ru", "る");
-    map.insert("re", "れ");
-    map.insert("ro", "ろ");
-    
-    // Wa row
-    map.insert("wa", "わ");
-    map.insert("wo", "を");
-    map.insert("n", "ん");
-    
-    map
-}
-
-fn hiragana_to_katakana(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            'あ' => 'ア', 'い' => 'イ', 'う' => 'ウ', 'え' => 'エ', 'お' => 'オ',
-            'か' => 'カ', 'き' => 'キ', 'く' => 'ク', 'け' => 'ケ', 'こ' => 'コ',
-            'さ' => 'サ', 'し' => 'シ', 'す' => 'ス', 'せ' => 'セ', 'そ' => 'ソ',
-            'た' => 'タ', 'ち' => 'チ', 'つ' => 'ツ', 'て' => 'テ', 'と' => 'ト',
-            'な' => 'ナ', 'に' => 'ニ', 'ぬ' => 'ヌ', 'ね' => 'ネ', 'の' => 'ノ',
-            'は' => 'ハ', 'ひ' => 'ヒ', 'ふ' => 'フ', 'へ' => 'ヘ', 'ほ' => 'ホ',
-            'ま' => 'マ', 'み' => 'ミ', 'む' => 'ム', 'め' => 'メ', 'も' => 'モ',
-            'や' => 'ヤ', 'ゆ' => 'ユ', 'よ' => 'ヨ',
-            'ら' => 'ラ', 'り' => 'リ', 'る' => 'ル', 'れ' => 'レ', 'ろ' => 'ロ',
-            'わ' => 'ワ', 'を' => 'ヲ', 'ん' => 'ン',
-            _ => c,
-        })
-        .collect()
+fn playful_convert(text: &str) -> Option<String> {
+    let list = PLAYFUL_MAP.get(text)?;
+    let i = rand::thread_rng().gen_range(0..list.len());
+    Some(list[i].to_string())
 }
 
 /// Get and print an objects description
-pub unsafe fn describe(obj: *mut Object) {
-    let description: *mut Object = msg_send![obj, description];
+pub unsafe fn describe(obj: *mut AnyObject) {
+    let description: *mut AnyObject = msg_send![obj, description];
     if let Some(desc_str) = to_s(description) {
-        NSLog!("Object description: %{public}s", NSString::alloc(nil).init_str(desc_str));
+        NSLog!(
+            "Object description: %@",
+            NSString::from_str(desc_str).as_ref() as *const NSString as *mut AnyObject
+        );
     }
 }
 
 /// Convert an NSString to a String
-fn to_s<'a>(nsstring_obj: *mut Object) -> Option<&'a str> {
+fn to_s<'a>(nsstring_obj: *mut AnyObject) -> Option<&'a str> {
     let bytes = unsafe {
-        let length = msg_send![nsstring_obj, lengthOfBytesUsingEncoding: UTF8_ENCODING];
+        let length: usize = msg_send![nsstring_obj, lengthOfBytesUsingEncoding: UTF8_ENCODING];
         let utf8_str: *const u8 = msg_send![nsstring_obj, UTF8String];
         slice::from_raw_parts(utf8_str, length)
     };
