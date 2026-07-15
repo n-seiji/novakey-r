@@ -2,6 +2,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use objc2_foundation::{NSAutoreleasePool, NSBundle, NSString};
 
+mod composer;
 mod imk;
 mod romaji_converter;
 
