@@ -24,9 +24,34 @@ private let instructions = """
 private var latestGenerations: [UInt64: UInt64] = [:]
 private var inFlightTasks: [UInt64: Task<Void, Never>] = [:]
 
+// controller ごとの「次の respond 用」先行 prewarm 済みセッション。
+// respond 1回で必ず取り出して使い捨てる(transcript を持ち越さない)。
+private var pooledSessions: [UInt64: (session: LanguageModelSession, prefix: String)] = [:]
+
+private func promptPrefix(ctx: String) -> String {
+    ctx.isEmpty ? "入力: " : "直前の文脈: \(ctx)\n入力: "
+}
+
+private func buildPrompt(input: String, ctx: String) -> String {
+    promptPrefix(ctx: ctx) + "\(input) →"
+}
+
+@MainActor
+private func registerLatest(_ id: UInt64, _ gen: UInt64) {
+    latestGenerations[id] = gen
+    inFlightTasks[id]?.cancel()
+}
+
 @MainActor
 private func isLatest(_ id: UInt64, _ gen: UInt64) -> Bool {
     latestGenerations[id] == gen
+}
+
+@MainActor
+private func trackTask(_ id: UInt64, _ gen: UInt64, _ task: Task<Void, Never>) {
+    if latestGenerations[id] == gen {
+        inFlightTasks[id] = task
+    }
 }
 
 @MainActor
@@ -34,6 +59,24 @@ private func clearInFlightTask(_ id: UInt64, _ gen: UInt64) {
     if latestGenerations[id] == gen {
         inFlightTasks[id] = nil
     }
+}
+
+@MainActor
+private func refillPool(_ controllerId: UInt64, ctx: String) {
+    let prefix = promptPrefix(ctx: ctx)
+    if pooledSessions[controllerId]?.prefix == prefix { return }
+    let session = LanguageModelSession(instructions: instructions)
+    session.prewarm(promptPrefix: Prompt(prefix))
+    pooledSessions[controllerId] = (session, prefix)
+}
+
+@MainActor
+private func takeSession(_ controllerId: UInt64, ctx: String) -> LanguageModelSession {
+    let prefix = promptPrefix(ctx: ctx)
+    if let pooled = pooledSessions.removeValue(forKey: controllerId), pooled.prefix == prefix {
+        return pooled.session
+    }
+    return LanguageModelSession(instructions: instructions)
 }
 
 @_cdecl("novakey_llm_availability")
@@ -75,9 +118,11 @@ private func normalizedReading(_ text: String) -> String? {
 
 private func isPlausibleConversion(input: String, output: String) -> Bool {
     guard let inputReading = normalizedReading(input),
-          let outputReading = normalizedReading(output),
-          !inputReading.isEmpty, !outputReading.isEmpty else {
+          let outputReading = normalizedReading(output) else {
         return true
+    }
+    if inputReading.isEmpty || outputReading.isEmpty {
+        return false
     }
 
     let ratio = Double(outputReading.count) / Double(inputReading.count)
@@ -97,6 +142,17 @@ private func deliver(_ id: UInt64, _ gen: UInt64, _ status: Int32, _ text: Strin
     }
 }
 
+@_cdecl("novakey_llm_prewarm")
+public func novakey_llm_prewarm(
+    _ controllerId: UInt64,
+    _ ctxPtr: UnsafePointer<UInt8>, _ ctxLen: Int
+) {
+    let ctx = String(decoding: UnsafeBufferPointer(start: ctxPtr, count: ctxLen), as: UTF8.self)
+    DispatchQueue.main.async {
+        refillPool(controllerId, ctx: ctx)
+    }
+}
+
 @_cdecl("novakey_llm_convert")
 public func novakey_llm_convert(
     _ controllerId: UInt64, _ generation: UInt64,
@@ -107,26 +163,26 @@ public func novakey_llm_convert(
     let ctx = String(decoding: UnsafeBufferPointer(start: ctxPtr, count: ctxLen), as: UTF8.self)
     // 世代管理はメインスレッド専用。新しい要求が来たら古い要求を捨てる。
     DispatchQueue.main.async {
-        latestGenerations[controllerId] = generation
-        inFlightTasks[controllerId]?.cancel()
-
-        let prompt = ctx.isEmpty ? "入力: \(input) →" : "直前の文脈: \(ctx)\n入力: \(input) →"
+        registerLatest(controllerId, generation)
+        let session = takeSession(controllerId, ctx: ctx)
+        refillPool(controllerId, ctx: ctx)
+        let prompt = buildPrompt(input: input, ctx: ctx)
         let task = Task {
-            guard await isLatest(controllerId, generation), !Task.isCancelled else {
-                return
-            }
-
-            let s = LanguageModelSession(instructions: instructions)
-            s.prewarm()
-
             do {
-                let response = try await s.respond(to: prompt)
+                let stream = session.streamResponse(to: prompt)
+                var latest = ""
+                for try await snapshot in stream {
+                    latest = snapshot.content
+                    guard await isLatest(controllerId, generation), !Task.isCancelled else {
+                        return
+                    }
+                    deliver(controllerId, generation, 3, latest)
+                }
                 guard await isLatest(controllerId, generation), !Task.isCancelled else {
                     return
                 }
-
-                let output = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                if isPlausibleConversion(input: input, output: output) {
+                let output = latest.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !output.isEmpty, isPlausibleConversion(input: input, output: output) {
                     deliver(controllerId, generation, 0, output)
                 } else {
                     deliver(controllerId, generation, 1, "")
@@ -152,6 +208,6 @@ public func novakey_llm_convert(
 
             await clearInFlightTask(controllerId, generation)
         }
-        inFlightTasks[controllerId] = task
+        trackTask(controllerId, generation, task)
     }
 }

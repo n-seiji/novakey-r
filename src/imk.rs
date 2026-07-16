@@ -268,11 +268,12 @@ declare_class!(
                 }
                 match *self.ivars().mode.borrow() {
                     ConversionMode::Space => {
-                        if composer.is_converted() {
-                            // 2度目のスペース: 生ひらがなへトグル
-                            composer.cancel();
+                        if composer.is_revealed() {
+                            composer.unreveal();
                         } else if llm_enabled() {
-                            composer.request_now();
+                            if composer.reveal() == crate::composer::RevealOutcome::Empty {
+                                return Bool::NO;
+                            }
                         }
                         let marked = composer.display().to_string();
                         unsafe { set_marked_str(client, &marked) };
@@ -292,6 +293,12 @@ declare_class!(
             // Alphabetic input feeds the romaji composition; converted kana
             // accumulates in the composer and stays visible as marked text.
             if !input.is_empty() && input.chars().all(|c| c.is_ascii_alphabetic()) {
+                {
+                    let mut composer = self.ivars().composer.borrow_mut();
+                    if composer.is_revealed() {
+                        composer.unreveal();
+                    }
+                }
                 let mut kana = String::new();
                 for ch in input.chars() {
                     if let Some(output) = converter.process_input(ch) {
@@ -300,15 +307,19 @@ declare_class!(
                 }
                 drop(converter);
                 let mut composer = self.ivars().composer.borrow_mut();
+                let starting = composer.is_empty();
                 if !kana.is_empty() {
                     composer.push_hiragana(&kana);
+                }
+                if starting && !composer.is_empty() && llm_enabled() {
+                    llm_bridge::prewarm_async(self.ivars().controller_id, composer.context());
                 }
                 composer.note_input_time(now_ms());
                 // 表示 = 変換結果orひらがな + 未変換romaji
                 let romaji = self.ivars().converter.borrow().buffer().to_string();
                 let marked = format!("{}{}", composer.display(), romaji);
                 unsafe { set_marked_str(client, &marked) };
-                self.schedule_tick_if_live();
+                self.schedule_speculative_tick();
                 return Bool::YES;
             }
 
@@ -332,7 +343,7 @@ declare_class!(
             composer.note_input_time(now_ms());
             let marked = composer.display().to_string();
             unsafe { set_marked_str(client, &marked) };
-            self.schedule_tick_if_live();
+            self.schedule_speculative_tick();
             Bool::YES
         }
 
@@ -357,7 +368,7 @@ declare_class!(
                     composer.note_input_time(now_ms());
                     let marked = composer.display().to_string();
                     unsafe { set_marked_str(client, &marked) };
-                    self.schedule_tick_if_live();
+                    self.schedule_speculative_tick();
                     return Bool::YES;
                 }
                 // romaji を削った場合の再表示
@@ -383,6 +394,9 @@ declare_class!(
                 }
                 let text = composer.commit(); // in-flight 無効化込み
                 composer.set_context(&text);
+                if llm_enabled() {
+                    llm_bridge::prewarm_async(self.ivars().controller_id, composer.context());
+                }
                 unsafe {
                     set_marked_str(client, "");
                     insert_str(client, &text);
@@ -443,11 +457,24 @@ declare_class!(
 
         #[method(toggleConversionMode:)]
         fn toggle_conversion_mode(&self, _sender: *mut AnyObject) {
-            let mut mode = self.ivars().mode.borrow_mut();
-            *mode = match *mode {
-                ConversionMode::Live => ConversionMode::Space,
-                ConversionMode::Space => ConversionMode::Live,
+            let new_mode = {
+                let mut mode = self.ivars().mode.borrow_mut();
+                *mode = match *mode {
+                    ConversionMode::Live => ConversionMode::Space,
+                    ConversionMode::Space => ConversionMode::Live,
+                };
+                *mode
             };
+            let mut composer = self.ivars().composer.borrow_mut();
+            composer.set_live(new_mode == ConversionMode::Live);
+            if new_mode == ConversionMode::Space {
+                composer.unreveal();
+            }
+            let client = *self.ivars().last_client.borrow();
+            if !client.is_null() && !composer.is_empty() {
+                let marked = composer.display().to_string();
+                unsafe { set_marked_str(client, &marked) };
+            }
         }
 
         // Called by the system when composition must end (focus change, etc.).
@@ -469,11 +496,8 @@ declare_class!(
 );
 
 impl NovakeyRInputController {
-    // デバウンス変換はライブ変換モードのみ。Space モードは明示スペースで変換する。
-    fn schedule_tick_if_live(&self) {
-        if *self.ivars().mode.borrow() == ConversionMode::Live {
-            schedule_tick(self.ivars().controller_id);
-        }
+    fn schedule_speculative_tick(&self) {
+        schedule_tick(self.ivars().controller_id);
     }
 
     fn on_debounce_tick(&self) {
@@ -481,19 +505,39 @@ impl NovakeyRInputController {
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
-        if status != llm_bridge::STATUS_OK {
-            unsafe { NSLog!("LLM error status=%d", status) };
-            return; // ひらがな表示を維持(フォールバック)
-        }
         let client = *self.ivars().last_client.borrow();
         if client.is_null() {
             return;
         }
-        if !self.ivars().converter.borrow().buffer().is_empty() {
-            return; // 未変換 romaji 入力中の旧結果は読みバッファを壊すため破棄
-        }
+        let romaji_pending = !self.ivars().converter.borrow().buffer().is_empty();
         let mut composer = self.ivars().composer.borrow_mut();
-        if let Some(marked) = composer.on_llm_result(generation, text) {
+        let marked = match status {
+            llm_bridge::STATUS_PARTIAL => {
+                if romaji_pending {
+                    None
+                } else {
+                    composer.on_llm_partial(generation, text)
+                }
+            }
+            llm_bridge::STATUS_OK => {
+                let marked = composer.on_llm_result(generation, text);
+                if romaji_pending {
+                    None
+                } else {
+                    marked
+                }
+            }
+            _ => {
+                unsafe { NSLog!("LLM error status=%d", status) };
+                let rollback = composer.on_llm_failure(generation);
+                if romaji_pending {
+                    None
+                } else {
+                    rollback
+                }
+            }
+        };
+        if let Some(marked) = marked {
             unsafe { set_marked_str(client, &marked) };
         }
     }

@@ -8,7 +8,7 @@ pub trait KanjiConverter {
 }
 
 /// 入力停止からこの時間経過で変換要求を出す
-pub const DEBOUNCE_MS: u64 = 300;
+pub const DEBOUNCE_MS: u64 = 150;
 /// 未確定がこれを超えたら tick での自動変換を止める(コンテキスト保護)
 pub const MAX_PENDING_CHARS: usize = 500;
 /// プロンプトに含める確定済み文脈の上限(4096トークン制約対策)
@@ -16,12 +16,23 @@ pub const MAX_CONTEXT_CHARS: usize = 200;
 /// 要求後この時間応答がなければ世代を進めて再要求(ライブ変換のみ)
 pub const TIMEOUT_MS: u64 = 3000;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevealOutcome {
+    Shown(String),
+    Pending,
+    Empty,
+}
+
 pub struct Composer<C: KanjiConverter> {
     converter: C,
     /// 未確定のひらがなバッファ(常に入力の真実源)
     hiragana: String,
-    /// 現世代の LLM 変換結果(あれば display はこちら)
+    /// 現世代の LLM 変換結果(reveal/live 時だけ display する)
     converted: Option<String>,
+    /// スペース変換で変換結果を開示中か
+    revealed: bool,
+    /// ライブ変換モード。常時 reveal 扱いにする
+    live: bool,
     /// 変換要求の世代。入力変更・確定・キャンセルで進む
     generation: u64,
     /// 最後に入力があった時刻(ms)。tick のデバウンス判定に使う
@@ -40,6 +51,8 @@ impl<C: KanjiConverter> Composer<C> {
             converter,
             hiragana: String::new(),
             converted: None,
+            revealed: false,
+            live: false,
             generation: 0,
             last_input_ms: None,
             requested_generation: None,
@@ -59,27 +72,40 @@ impl<C: KanjiConverter> Composer<C> {
     }
 
     pub fn display(&self) -> &str {
-        self.converted.as_deref().unwrap_or(&self.hiragana)
+        if self.is_revealed() {
+            self.converted.as_deref().unwrap_or(&self.hiragana)
+        } else {
+            &self.hiragana
+        }
+    }
+
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub fn set_live(&mut self, live: bool) {
+        self.live = live;
+    }
+
+    pub fn is_revealed(&self) -> bool {
+        self.revealed || self.live
     }
 
     fn invalidate(&mut self) {
         self.generation += 1;
         self.converted = None;
+        self.requested_generation = None;
+        self.requested_at_ms = None;
     }
 
     pub fn push_hiragana(&mut self, kana: &str) {
-        // 変換結果が表示中なら、それを土台に追記する(スペース変換後の追加入力仕様)
-        if let Some(converted) = self.converted.take() {
-            self.hiragana = converted;
-        }
+        self.revealed = false;
         self.hiragana.push_str(kana);
         self.invalidate();
     }
 
     pub fn backspace(&mut self) -> bool {
-        if let Some(converted) = self.converted.take() {
-            self.hiragana = converted;
-        }
+        self.revealed = false;
         if self.hiragana.pop().is_none() {
             return false;
         }
@@ -87,31 +113,80 @@ impl<C: KanjiConverter> Composer<C> {
         true
     }
 
+    pub fn reveal(&mut self) -> RevealOutcome {
+        if self.hiragana.is_empty() {
+            return RevealOutcome::Empty;
+        }
+        self.revealed = true;
+        match &self.converted {
+            Some(text) => RevealOutcome::Shown(text.clone()),
+            None => {
+                // 結果未着・失敗後の明示 reveal は再要求できるようにする。
+                self.requested_generation = None;
+                self.requested_at_ms = None;
+                self.request_now();
+                RevealOutcome::Pending
+            }
+        }
+    }
+
+    pub fn unreveal(&mut self) {
+        self.revealed = false;
+    }
+
     pub fn on_llm_result(&mut self, generation: u64, text: &str) -> Option<String> {
         if generation != self.generation {
             return None; // 旧世代: 破棄
         }
-        if self.converted.as_deref() == Some(text) {
-            return None; // 差分なし: setMarkedText を呼ばせない
-        }
+        let changed = self.converted.as_deref() != Some(text);
         self.converted = Some(text.to_string());
+        if self.is_revealed() && changed {
+            Some(text.to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn on_llm_partial(&self, generation: u64, text: &str) -> Option<String> {
+        if generation != self.generation || !self.is_revealed() {
+            return None;
+        }
         Some(text.to_string())
+    }
+
+    pub fn on_llm_failure(&mut self, generation: u64) -> Option<String> {
+        if generation != self.generation {
+            return None;
+        }
+        self.requested_generation = None;
+        self.requested_at_ms = None;
+        if self.is_revealed() {
+            Some(self.hiragana.clone())
+        } else {
+            None
+        }
     }
 
     pub fn commit(&mut self) -> String {
         let out = self.display().to_string();
         self.hiragana.clear();
+        self.revealed = false;
         self.invalidate();
         out
     }
 
+    // テストで変換キャッシュの有無を検証するためのアクセサ(本体コードでは未使用)
+    #[cfg(test)]
     pub fn is_converted(&self) -> bool {
         self.converted.is_some()
     }
 
     pub fn cancel(&mut self) {
+        self.revealed = false;
         self.converted = None;
         self.generation += 1;
+        self.requested_generation = None;
+        self.requested_at_ms = None;
     }
 
     pub fn note_input_time(&mut self, now_ms: u64) {
@@ -211,6 +286,7 @@ mod tests {
     #[test]
     fn 現世代のllm結果はmarked_textとして返る() {
         let (mut c, _) = composer_with_log();
+        c.set_live(true);
         c.push_hiragana("きょうはいいてんき");
         let gen = c.current_generation();
         assert_eq!(
@@ -233,6 +309,7 @@ mod tests {
     #[test]
     fn 同一表示の結果は差分抑制でnone() {
         let (mut c, _) = composer_with_log();
+        c.set_live(true);
         c.push_hiragana("きょう");
         let gen = c.current_generation();
         assert_eq!(c.on_llm_result(gen, "今日"), Some("今日".to_string()));
@@ -254,6 +331,7 @@ mod tests {
     #[test]
     fn 変換済みをcommitすると変換結果が返る() {
         let (mut c, _) = composer_with_log();
+        c.set_live(true);
         c.push_hiragana("きょう");
         let gen = c.current_generation();
         c.on_llm_result(gen, "今日");
@@ -263,6 +341,7 @@ mod tests {
     #[test]
     fn cancelで生ひらがなに戻る() {
         let (mut c, _) = composer_with_log();
+        c.set_live(true);
         c.push_hiragana("きょう");
         let gen = c.current_generation();
         c.on_llm_result(gen, "今日");
@@ -286,6 +365,7 @@ mod tests {
     #[test]
     fn is_convertedは変換結果保持中のみtrue() {
         let (mut c, _) = composer_with_log();
+        c.set_live(true);
         c.push_hiragana("きょう");
         assert!(!c.is_converted());
         let gen = c.current_generation();
@@ -294,13 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn 入力後300ms経過のtickで変換要求が飛ぶ() {
+    fn 入力後debounce経過のtickで変換要求が飛ぶ() {
         let (mut c, log) = composer_with_log();
         c.push_hiragana("きょう");
         c.note_input_time(1000);
-        c.tick(1200); // まだ 200ms
+        c.tick(1000 + DEBOUNCE_MS - 100); // まだ debounce 未満
         assert!(log.borrow().is_empty());
-        c.tick(1300); // 300ms 経過
+        c.tick(1000 + DEBOUNCE_MS); // debounce 経過
         let reqs = log.borrow();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].1, "きょう");
@@ -312,8 +392,8 @@ mod tests {
         let (mut c, log) = composer_with_log();
         c.push_hiragana("きょう");
         c.note_input_time(1000);
-        c.tick(1300);
-        c.tick(1400);
+        c.tick(1000 + DEBOUNCE_MS);
+        c.tick(1000 + DEBOUNCE_MS + 100);
         assert_eq!(log.borrow().len(), 1);
     }
 
@@ -322,7 +402,7 @@ mod tests {
         let (mut c, log) = composer_with_log();
         c.push_hiragana("きょう");
         c.note_input_time(1000);
-        c.tick(1300);
+        c.tick(1000 + DEBOUNCE_MS);
         let gen = c.current_generation();
         c.on_llm_result(gen, "今日");
         c.tick(2000);
@@ -360,10 +440,10 @@ mod tests {
         let (mut c, log) = composer_with_log();
         c.push_hiragana("きょう");
         c.note_input_time(1000);
-        c.tick(1300); // 要求1
+        c.tick(1000 + DEBOUNCE_MS); // 要求1
         c.tick(2000); // まだ待つ
         assert_eq!(log.borrow().len(), 1);
-        c.tick(4400); // 3s 超 → 世代を進めて再要求
+        c.tick(1000 + DEBOUNCE_MS + TIMEOUT_MS + 100); // 3s 超 → 世代を進めて再要求
         assert_eq!(log.borrow().len(), 2);
         let reqs = log.borrow();
         assert!(reqs[1].0 > reqs[0].0); // 新世代
@@ -377,4 +457,176 @@ mod tests {
         c.tick(1000);
         assert!(log.borrow().is_empty());
     }
+
+    #[test]
+    fn 未revealならllm結果はキャッシュされるが表示されない() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_result(gen, "今日"), None);
+        assert_eq!(c.display(), "きょう");
+        assert!(c.is_converted());
+    }
+
+    #[test]
+    fn revealでキャッシュヒットなら即shown() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        assert_eq!(c.reveal(), RevealOutcome::Shown("今日".to_string()));
+        assert_eq!(c.display(), "今日");
+        assert!(c.is_revealed());
+    }
+
+    #[test]
+    fn revealでキャッシュミスならpendingで要求発行() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        assert_eq!(c.reveal(), RevealOutcome::Pending);
+        assert_eq!(log.borrow().len(), 1);
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_result(gen, "今日"), Some("今日".to_string()));
+        assert_eq!(c.display(), "今日");
+    }
+
+    #[test]
+    fn 要求済みでも結果未着ならrevealで再要求する() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1000 + DEBOUNCE_MS);
+        assert_eq!(log.borrow().len(), 1);
+        assert_eq!(c.reveal(), RevealOutcome::Pending);
+        assert_eq!(log.borrow().len(), 2);
+    }
+
+    #[test]
+    fn reveal時に空バッファならempty() {
+        let (mut c, _) = composer_with_log();
+        assert_eq!(c.reveal(), RevealOutcome::Empty);
+    }
+
+    #[test]
+    fn unrevealで生ひらがな表示に戻るがキャッシュは維持() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        c.reveal();
+        c.unreveal();
+        assert_eq!(c.display(), "きょう");
+        assert_eq!(c.reveal(), RevealOutcome::Shown("今日".to_string()));
+    }
+
+    #[test]
+    fn unreveal中に届いたfinalはキャッシュされ再revealで即表示() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.reveal();
+        c.unreveal();
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_result(gen, "今日"), None);
+        assert_eq!(c.reveal(), RevealOutcome::Shown("今日".to_string()));
+    }
+
+    #[test]
+    fn 追記でreveal解除かつ世代が進む() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        c.reveal();
+        c.push_hiragana("は");
+        assert!(!c.is_revealed());
+        assert_eq!(c.display(), "きょうは");
+        assert_eq!(c.on_llm_result(gen, "今日"), None);
+        assert_eq!(c.on_llm_partial(gen, "今日"), None);
+    }
+
+    #[test]
+    fn commitはreveal済みなら変換結果_未revealなら生ひらがな() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        assert_eq!(c.commit(), "きょう");
+
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        c.reveal();
+        assert_eq!(c.commit(), "今日");
+        assert!(!c.is_revealed());
+    }
+
+    #[test]
+    fn cancelでもrevealedがリセットされる() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        c.on_llm_result(gen, "今日");
+        c.reveal();
+        c.cancel();
+        assert!(!c.is_revealed());
+        assert_eq!(c.display(), "きょう");
+        assert_eq!(c.on_llm_result(gen, "今日"), None);
+        assert_eq!(c.reveal(), RevealOutcome::Pending);
+    }
+
+    #[test]
+    fn partialはreveal済みかつ現世代のみ表示_キャッシュしない() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょうは");
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_partial(gen, "今日"), None);
+        c.reveal();
+        assert_eq!(c.on_llm_partial(gen, "今日"), Some("今日".to_string()));
+        assert!(!c.is_converted());
+        assert_eq!(c.on_llm_partial(gen + 1, "今日は"), None);
+    }
+
+    #[test]
+    fn failureでrequested解除とロールバック文字列() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.reveal();
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_failure(gen), Some("きょう".to_string()));
+        assert_eq!(c.reveal(), RevealOutcome::Pending);
+        assert_eq!(log.borrow().len(), 2);
+    }
+
+    #[test]
+    fn 未revealのfailureはロールバック不要() {
+        let (mut c, _) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.note_input_time(1000);
+        c.tick(1000 + DEBOUNCE_MS);
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_failure(gen), None);
+    }
+
+    #[test]
+    fn 旧世代のfailureは無視される() {
+        let (mut c, log) = composer_with_log();
+        c.push_hiragana("きょう");
+        c.reveal();
+        let old = c.current_generation();
+        c.push_hiragana("は");
+        let before = log.borrow().len();
+        assert_eq!(c.on_llm_failure(old), None);
+        assert_eq!(log.borrow().len(), before);
+    }
+
+    #[test]
+    fn live設定時は従来どおり結果到着で即表示() {
+        let (mut c, _) = composer_with_log();
+        c.set_live(true);
+        c.push_hiragana("きょう");
+        let gen = c.current_generation();
+        assert_eq!(c.on_llm_result(gen, "今日"), Some("今日".to_string()));
+        assert_eq!(c.display(), "今日");
+    }
+
 }

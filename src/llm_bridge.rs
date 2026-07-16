@@ -14,6 +14,7 @@ pub enum Availability {
 }
 
 pub const STATUS_OK: i32 = 0;
+pub const STATUS_PARTIAL: i32 = 3;
 
 extern "C" {
     fn novakey_llm_availability() -> i32;
@@ -25,6 +26,7 @@ extern "C" {
         ctx_ptr: *const u8,
         ctx_len: usize,
     );
+    fn novakey_llm_prewarm(controller_id: u64, ctx_ptr: *const u8, ctx_len: usize);
 }
 
 pub fn availability() -> Availability {
@@ -48,6 +50,10 @@ pub fn convert_async(controller_id: u64, generation: u64, hiragana: &str, contex
             context.len(),
         );
     }
+}
+
+pub fn prewarm_async(controller_id: u64, context: &str) {
+    unsafe { novakey_llm_prewarm(controller_id, context.as_ptr(), context.len()) };
 }
 
 type ResultHandler = fn(controller_id: u64, generation: u64, status: i32, text: &str);
@@ -91,7 +97,14 @@ pub fn smoke_test() {
     }
     set_result_handler(|_, _, status, text| {
         println!("status={} text={}", status, text);
-        std::process::exit(0);
+        if status != STATUS_PARTIAL {
+            std::process::exit(if status == STATUS_OK { 0 } else { 1 });
+        }
+    });
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        eprintln!("timeout: no terminal status within 15s");
+        std::process::exit(2);
     });
     convert_async(0, 0, "きょうはいいてんきですね", "");
     // main queue のコールバックを受けるため run loop を回す
