@@ -220,7 +220,7 @@ declare_class!(
             let this = this.set_ivars(Ivars {
                 converter: RefCell::new(RomajiConverter::new()),
                 composer: RefCell::new(Composer::new(LlmKanjiConverter { controller_id })),
-                mode: RefCell::new(ConversionMode::Live),
+                mode: RefCell::new(ConversionMode::Space),
                 controller_id,
                 last_client: RefCell::new(std::ptr::null_mut()),
             });
@@ -488,6 +488,9 @@ impl NovakeyRInputController {
         let client = *self.ivars().last_client.borrow();
         if client.is_null() {
             return;
+        }
+        if !self.ivars().converter.borrow().buffer().is_empty() {
+            return; // 未変換 romaji 入力中の旧結果は読みバッファを壊すため破棄
         }
         let mut composer = self.ivars().composer.borrow_mut();
         if let Some(marked) = composer.on_llm_result(generation, text) {

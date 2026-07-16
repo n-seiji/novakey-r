@@ -39,6 +39,8 @@ run = "./output/NovakeyR.app/Contents/MacOS/novakey_r"
 description = "Install NovakeyR.app into ~/Library/Input Methods (no sudo needed)"
 depends = ["app"]
 run = """
+[ -d "/Library/Input Methods/NovakeyR.app" ] && \
+  echo "Warning: /Library/Input Methods/NovakeyR.app was found. This older system-wide install can cause duplicate entries in Input Sources. Please remove it manually with: sudo rm -rf /Library/Input Methods/NovakeyR.app"
 pkill -x novakey_r || true
 mkdir -p "$HOME/Library/Input Methods"
 rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
