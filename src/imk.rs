@@ -11,18 +11,24 @@ use objc2_foundation::{NSNotFound, NSObject, NSRange, NSString};
 use once_cell::sync::Lazy;
 use rand::Rng;
 
-use crate::composer::{Composer, KanjiConverter};
+use crate::composer::{CandidateEngine, Composer};
+use crate::kkc_bridge;
 use crate::llm_bridge;
 use crate::romaji_converter::RomajiConverter;
 
-/// composer からの変換要求を FFI に流すアダプタ。controller_id を焼き込む。
-pub struct LlmKanjiConverter {
+pub struct KkcEngine {
     controller_id: u64,
 }
 
-impl KanjiConverter for LlmKanjiConverter {
-    fn request(&mut self, generation: u64, hiragana: &str, context: &str) {
-        llm_bridge::convert_async(self.controller_id, generation, hiragana, context);
+impl CandidateEngine for KkcEngine {
+    fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+        kkc_bridge::convert(self.controller_id, revision, hiragana)
+    }
+    fn select(&mut self, revision: u64, engine_index: usize) -> bool {
+        kkc_bridge::select(self.controller_id, revision, engine_index)
+    }
+    fn cancel(&mut self) {
+        kkc_bridge::cancel(self.controller_id);
     }
 }
 
@@ -30,18 +36,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    // メインスレッド専用。callback は client ポインタを持たず、
-    // ここから controller を引き直す(use-after-free 防止)。
     static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
         RefCell::new(HashMap::new());
+    static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static SERVER: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static CANDIDATES_PANEL: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-/// Swift 側から main queue 上で呼ばれる結果ディスパッチャ。
 fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
     CONTROLLERS.with(|c| {
         let controllers = c.borrow();
         let Some(controller) = controllers.get(&controller_id) else {
-            return; // controller は解放済み: 結果を破棄
+            return;
         };
         controller.handle_llm_result(generation, status, text);
     });
@@ -52,7 +58,6 @@ pub fn init_llm_dispatch() {
     let avail = llm_bridge::availability();
     if avail != llm_bridge::Availability::Available {
         LLM_ENABLED.with(|e| e.set(false));
-        // NSLog! マクロはこの位置より後で定義されるため extern fn を直接呼ぶ
         unsafe {
             let msg = NSString::from_str(&format!("LLM unavailable: {:?}", avail));
             NSLog(msg.as_ref() as *const NSString as *mut AnyObject);
@@ -64,67 +69,9 @@ fn llm_enabled() -> bool {
     LLM_ENABLED.with(|e| e.get())
 }
 
-use std::time::Instant;
-
-static EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
-
-fn now_ms() -> u64 {
-    EPOCH.elapsed().as_millis() as u64
-}
-
-// libdispatch 生 FFI (dispatch_after のワンショットタイマー用)
-mod libdispatch {
-    use std::ffi::c_void;
-
-    #[link(name = "System", kind = "dylib")]
-    extern "C" {
-        pub static _dispatch_main_q: c_void;
-        pub fn dispatch_time(when: u64, delta: i64) -> u64;
-        pub fn dispatch_after_f(
-            when: u64,
-            queue: *const c_void,
-            context: *mut c_void,
-            work: extern "C" fn(*mut c_void),
-        );
-    }
-
-    pub const DISPATCH_TIME_NOW: u64 = 0;
-}
-
-extern "C" fn debounce_fired(context: *mut std::ffi::c_void) {
-    // main queue 上で呼ばれる。context は Box<u64>(controller_id)。
-    let controller_id = *unsafe { Box::from_raw(context as *mut u64) };
-    CONTROLLERS.with(|c| {
-        if let Some(controller) = c.borrow().get(&controller_id) {
-            controller.on_debounce_tick();
-        }
-    });
-}
-
-/// DEBOUNCE_MS + 10ms 後にメインスレッドで composer.tick を打つワンショット。
-/// LLM 無効時は何もしない(ひらがな表示のままのフォールバック)。
-fn schedule_tick(controller_id: u64) {
-    if !llm_enabled() {
-        return;
-    }
-    let delay_ns = ((crate::composer::DEBOUNCE_MS + 10) * 1_000_000) as i64;
-    let context = Box::into_raw(Box::new(controller_id)) as *mut std::ffi::c_void;
-    unsafe {
-        let when = libdispatch::dispatch_time(libdispatch::DISPATCH_TIME_NOW, delay_ns);
-        libdispatch::dispatch_after_f(
-            when,
-            &libdispatch::_dispatch_main_q as *const _,
-            context,
-            debounce_fired,
-        );
-    }
-}
-
 #[link(name = "InputMethodKit", kind = "framework")]
 extern "C" {}
 
-// NSApplication is looked up at runtime via class!, so AppKit must be linked
-// explicitly; nothing else pulls it in directly.
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
@@ -145,8 +92,9 @@ macro_rules! NSLog {
 }
 
 const UTF8_ENCODING: libc::c_uint = 4;
+const K_IMK_SINGLE_COLUMN_SCROLLING_PANEL: usize = 1;
+const K_IMK_LOCATE_CANDIDATES_BELOW_HINT: usize = 2;
 
-// Declare IMKServer as an external class
 extern_class!(
     #[derive(Debug, PartialEq, Eq, Hash)]
     pub struct IMKServer;
@@ -158,7 +106,6 @@ extern_class!(
     }
 );
 
-// Declare IMKInputController as an external class
 extern_class!(
     #[derive(Debug, PartialEq, Eq, Hash)]
     pub struct IMKInputController;
@@ -170,28 +117,17 @@ extern_class!(
     }
 );
 
-// Per-controller state: each client (app) gets its own converter so
-// composition in one app never leaks into another.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ConversionMode {
     Live,
     Space,
 }
 
-thread_local! {
-    // 起動時の availability チェック結果。false なら LLM 変換を一切呼ばない
-    // (composer はひらがな表示のまま = フォールバック)。
-    static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
 pub struct Ivars {
     converter: RefCell<RomajiConverter>,
-    composer: RefCell<Composer<LlmKanjiConverter>>,
+    composer: RefCell<Composer<KkcEngine>>,
     mode: RefCell<ConversionMode>,
     controller_id: u64,
-    // 直近の inputText/didCommand で受け取った client。
-    // handle_llm_result はメインスレッドで同期的に呼ばれるため、
-    // 直近のイベントサイクル内でのみ有効な弱い参照として扱う。
     last_client: RefCell<*mut AnyObject>,
 }
 
@@ -219,8 +155,8 @@ declare_class!(
             let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
             let this = this.set_ivars(Ivars {
                 converter: RefCell::new(RomajiConverter::new()),
-                composer: RefCell::new(Composer::new(LlmKanjiConverter { controller_id })),
-                mode: RefCell::new(ConversionMode::Space),
+                composer: RefCell::new(Composer::new(KkcEngine { controller_id })),
+                mode: RefCell::new(ConversionMode::Live),
                 controller_id,
                 last_client: RefCell::new(std::ptr::null_mut()),
             });
@@ -238,93 +174,55 @@ declare_class!(
             let Some(input) = to_s(text) else {
                 return Bool::NO;
             };
-            unsafe {
-                NSLog!(
-                    "Input received: %@",
-                    NSString::from_str(input).as_ref() as *const NSString as *mut AnyObject
-                );
-            }
-
-            // last_client を更新(handle_llm_result 用)
             *self.ivars().last_client.borrow_mut() = client;
-
             let mut converter = self.ivars().converter.borrow_mut();
 
-            // スペース: 未確定があれば変換トリガー、なければ従来動作
             if input == " " {
                 let romaji_out = converter.flush();
                 drop(converter);
                 let mut composer = self.ivars().composer.borrow_mut();
                 if let Some(out) = romaji_out {
                     composer.push_hiragana(&out);
+                    self.request_rerank(&composer);
                 }
                 if composer.is_empty() {
-                    // 未確定なし: playful space にフォールバック
                     if let Some(converted) = playful_convert(" ") {
                         unsafe { insert_str(client, &converted) };
                         return Bool::YES;
                     }
                     return Bool::NO;
                 }
-                match *self.ivars().mode.borrow() {
-                    ConversionMode::Space => {
-                        if composer.is_revealed() {
-                            composer.unreveal();
-                        } else if llm_enabled() {
-                            if composer.reveal() == crate::composer::RevealOutcome::Empty {
-                                return Bool::NO;
-                            }
-                        }
-                        let marked = composer.display().to_string();
-                        unsafe { set_marked_str(client, &marked) };
-                    }
-                    ConversionMode::Live => {
-                        // ライブ変換中のスペースは即時変換のショートカット
-                        if llm_enabled() {
-                            composer.request_now();
-                        }
-                        let marked = composer.display().to_string();
-                        unsafe { set_marked_str(client, &marked) };
-                    }
+                if composer.cycle() {
+                    let marked = composer.display().to_string();
+                    unsafe { set_marked_str(client, &marked) };
+                    self.update_candidates_window(&composer);
+                } else {
+                    let marked = composer.display().to_string();
+                    unsafe { set_marked_str(client, &marked) };
                 }
                 return Bool::YES;
             }
 
-            // Alphabetic input feeds the romaji composition; converted kana
-            // accumulates in the composer and stays visible as marked text.
             if !input.is_empty() && input.chars().all(|c| c.is_ascii_alphabetic()) {
-                {
-                    let mut composer = self.ivars().composer.borrow_mut();
-                    if composer.is_revealed() {
-                        composer.unreveal();
-                    }
-                }
                 let mut kana = String::new();
                 for ch in input.chars() {
                     if let Some(output) = converter.process_input(ch) {
                         kana.push_str(&output);
                     }
                 }
+                let romaji = converter.buffer().to_string();
                 drop(converter);
                 let mut composer = self.ivars().composer.borrow_mut();
-                let starting = composer.is_empty();
                 if !kana.is_empty() {
                     composer.push_hiragana(&kana);
+                    self.request_rerank(&composer);
                 }
-                if starting && !composer.is_empty() && llm_enabled() {
-                    llm_bridge::prewarm_async(self.ivars().controller_id, composer.context());
-                }
-                composer.note_input_time(now_ms());
-                // 表示 = 変換結果orひらがな + 未変換romaji
-                let romaji = self.ivars().converter.borrow().buffer().to_string();
                 let marked = format!("{}{}", composer.display(), romaji);
                 unsafe { set_marked_str(client, &marked) };
-                self.schedule_speculative_tick();
+                self.hide_candidates_window();
                 return Bool::YES;
             }
 
-            // 非アルファベット(数字・記号): pending romaji を flush して composer に
-            // 積み、その文字も未確定文に含める。
             let romaji_out = converter.flush();
             drop(converter);
             let mut composer = self.ivars().composer.borrow_mut();
@@ -332,7 +230,6 @@ declare_class!(
                 composer.push_hiragana(&out);
             }
             if composer.is_empty() {
-                // 未確定なし: playful 変換 or パススルー(従来動作)
                 if let Some(converted) = playful_convert(input) {
                     unsafe { insert_str(client, &converted) };
                     return Bool::YES;
@@ -340,47 +237,40 @@ declare_class!(
                 return Bool::NO;
             }
             composer.push_hiragana(input);
-            composer.note_input_time(now_ms());
+            self.request_rerank(&composer);
             let marked = composer.display().to_string();
             unsafe { set_marked_str(client, &marked) };
-            self.schedule_speculative_tick();
+            self.hide_candidates_window();
             Bool::YES
         }
 
-        // Non-character keys (delete, return, escape, ...) arrive here, not in
-        // inputText:client:.
         #[method(didCommandBySelector:client:)]
         fn did_command_by_selector(&self, selector: Sel, client: *mut AnyObject) -> Bool {
             *self.ivars().last_client.borrow_mut() = client;
-
             let mut converter = self.ivars().converter.borrow_mut();
 
-            // Backspace: romaji バッファ優先、次に composer 末尾1文字
             if selector == sel!(deleteBackward:) {
                 if !converter.buffer().is_empty() {
                     converter.handle_backspace();
-                } else {
+                    let romaji = converter.buffer().to_string();
                     drop(converter);
-                    let mut composer = self.ivars().composer.borrow_mut();
-                    if !composer.backspace() {
-                        return Bool::NO; // 未確定なし: アプリへパススルー
-                    }
-                    composer.note_input_time(now_ms());
-                    let marked = composer.display().to_string();
+                    let composer = self.ivars().composer.borrow();
+                    let marked = format!("{}{}", composer.display(), romaji);
                     unsafe { set_marked_str(client, &marked) };
-                    self.schedule_speculative_tick();
                     return Bool::YES;
                 }
-                // romaji を削った場合の再表示
-                let romaji = converter.buffer().to_string();
                 drop(converter);
-                let composer = self.ivars().composer.borrow();
-                let marked = format!("{}{}", composer.display(), romaji);
+                let mut composer = self.ivars().composer.borrow_mut();
+                if !composer.backspace() {
+                    return Bool::NO;
+                }
+                self.request_rerank(&composer);
+                let marked = composer.display().to_string();
                 unsafe { set_marked_str(client, &marked) };
+                self.hide_candidates_window();
                 return Bool::YES;
             }
 
-            // Enter: 確定
             if selector == sel!(insertNewline:) {
                 if let Some(output) = converter.flush() {
                     drop(converter);
@@ -390,21 +280,17 @@ declare_class!(
                 }
                 let mut composer = self.ivars().composer.borrow_mut();
                 if composer.is_empty() {
-                    return Bool::NO; // 未確定なし: 改行をアプリへ
+                    return Bool::NO;
                 }
-                let text = composer.commit(); // in-flight 無効化込み
-                composer.set_context(&text);
-                if llm_enabled() {
-                    llm_bridge::prewarm_async(self.ivars().controller_id, composer.context());
-                }
+                let text = composer.commit();
                 unsafe {
                     set_marked_str(client, "");
                     insert_str(client, &text);
                 }
-                return Bool::YES; // 改行自体は挿入しない(確定のみ)
+                self.hide_candidates_window();
+                return Bool::YES;
             }
 
-            // Esc: 生ひらがなに戻す
             if selector == sel!(cancelOperation:) {
                 converter.clear();
                 drop(converter);
@@ -412,13 +298,16 @@ declare_class!(
                 if composer.is_empty() {
                     return Bool::NO;
                 }
-                composer.cancel();
+                if composer.is_raw() {
+                    return Bool::NO;
+                }
+                composer.revert_raw();
                 let marked = composer.display().to_string();
                 unsafe { set_marked_str(client, &marked) };
+                self.hide_candidates_window();
                 return Bool::YES;
             }
 
-            // 左右矢印: 未確定中は無効(v1 はカーソル移動非対応)
             if selector == sel!(moveLeft:) || selector == sel!(moveRight:) {
                 let has_pending = !converter.buffer().is_empty()
                     || !self.ivars().composer.borrow().is_empty();
@@ -428,13 +317,71 @@ declare_class!(
             Bool::NO
         }
 
+
+        #[method(candidates:)]
+        fn candidates(&self, _sender: *mut AnyObject) -> *mut AnyObject {
+            let composer = self.ivars().composer.borrow();
+            unsafe {
+                let array: *mut AnyObject = msg_send![objc2::class!(NSMutableArray), new];
+                for cand in composer.candidates() {
+                    let ns = NSString::from_str(&cand.text);
+                    let _: () = msg_send![array, addObject: &*ns];
+                }
+                msg_send![array, autorelease]
+            }
+        }
+
+        #[method(candidateSelectionChanged:)]
+        fn candidate_selection_changed(&self, candidate_string: *mut AnyObject) {
+            let client = *self.ivars().last_client.borrow();
+            if client.is_null() {
+                return;
+            }
+            let text: *mut AnyObject = unsafe { msg_send![candidate_string, string] };
+            let Some(text) = to_s(text) else { return };
+            let mut composer = self.ivars().composer.borrow_mut();
+            if let Some(idx) = composer.candidates().iter().position(|c| c.text == text) {
+                while composer.selected_index() != Some(idx) {
+                    if !composer.cycle() {
+                        return;
+                    }
+                }
+                let marked = composer.display().to_string();
+                unsafe { set_marked_str(client, &marked) };
+            }
+        }
+
+        #[method(candidateSelected:)]
+        fn candidate_selected(&self, candidate_string: *mut AnyObject) {
+            let client = *self.ivars().last_client.borrow();
+            if client.is_null() {
+                return;
+            }
+            let text: *mut AnyObject = unsafe { msg_send![candidate_string, string] };
+            let Some(text) = to_s(text) else { return };
+            let mut composer = self.ivars().composer.borrow_mut();
+            if let Some(idx) = composer.candidates().iter().position(|c| c.text == text) {
+                while composer.selected_index() != Some(idx) {
+                    if !composer.cycle() {
+                        break;
+                    }
+                }
+            }
+            let out = composer.commit();
+            unsafe {
+                set_marked_str(client, "");
+                insert_str(client, &out);
+            }
+            self.hide_candidates_window();
+        }
+
         #[method(menu)]
         fn menu(&self) -> *mut AnyObject {
             unsafe {
                 let menu: *mut AnyObject = msg_send![objc2::class!(NSMenu), new];
                 let title = NSString::from_str(match *self.ivars().mode.borrow() {
                     ConversionMode::Live => "ライブ変換: オン",
-                    ConversionMode::Space => "ライブ変換: オフ(スペース変換)",
+                    ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
                 });
                 let item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), alloc];
                 let item: *mut AnyObject = msg_send![
@@ -445,7 +392,7 @@ declare_class!(
                 ];
                 let _: () = msg_send![menu, addItem: item];
                 if !llm_enabled() {
-                    let warn = NSString::from_str("LLM利用不可(Apple Intelligence を確認)");
+                    let warn = NSString::from_str("LLMリランキング無効(Apple Intelligence を確認)");
                     let warn_item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), new];
                     let _: () = msg_send![warn_item, setTitle: &*warn];
                     let _: () = msg_send![warn_item, setEnabled: Bool::NO];
@@ -467,9 +414,6 @@ declare_class!(
             };
             let mut composer = self.ivars().composer.borrow_mut();
             composer.set_live(new_mode == ConversionMode::Live);
-            if new_mode == ConversionMode::Space {
-                composer.unreveal();
-            }
             let client = *self.ivars().last_client.borrow();
             if !client.is_null() && !composer.is_empty() {
                 let marked = composer.display().to_string();
@@ -477,7 +421,6 @@ declare_class!(
             }
         }
 
-        // Called by the system when composition must end (focus change, etc.).
         #[method(commitComposition:)]
         fn commit_composition(&self, client: *mut AnyObject) {
             let mut converter = self.ivars().converter.borrow_mut();
@@ -491,55 +434,63 @@ declare_class!(
                 let text = composer.commit();
                 unsafe { insert_str(client, &text) };
             }
+            self.hide_candidates_window();
         }
     }
 );
 
 impl NovakeyRInputController {
-    fn schedule_speculative_tick(&self) {
-        schedule_tick(self.ivars().controller_id);
-    }
-
-    fn on_debounce_tick(&self) {
-        self.ivars().composer.borrow_mut().tick(now_ms());
+    fn request_rerank(&self, composer: &Composer<KkcEngine>) {
+        if !llm_enabled() || composer.candidates().len() < 2 || composer.is_raw() {
+            return;
+        }
+        let candidates: Vec<String> = composer.candidates().iter().map(|c| c.text.clone()).collect();
+        llm_bridge::rerank_async(
+            self.ivars().controller_id,
+            composer.current_generation(),
+            composer.display_hiragana(),
+            &candidates,
+        );
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
-        let client = *self.ivars().last_client.borrow();
-        if client.is_null() {
+        if status != llm_bridge::STATUS_OK {
+            unsafe { NSLog!("LLM rerank error status=%d", status) };
             return;
         }
-        let romaji_pending = !self.ivars().converter.borrow().buffer().is_empty();
-        let mut composer = self.ivars().composer.borrow_mut();
-        let marked = match status {
-            llm_bridge::STATUS_PARTIAL => {
-                if romaji_pending {
-                    None
-                } else {
-                    composer.on_llm_partial(generation, text)
-                }
-            }
-            llm_bridge::STATUS_OK => {
-                let marked = composer.on_llm_result(generation, text);
-                if romaji_pending {
-                    None
-                } else {
-                    marked
-                }
-            }
-            _ => {
-                unsafe { NSLog!("LLM error status=%d", status) };
-                let rollback = composer.on_llm_failure(generation);
-                if romaji_pending {
-                    None
-                } else {
-                    rollback
-                }
-            }
+        let Ok(index) = text.trim().parse::<usize>() else {
+            return;
         };
-        if let Some(marked) = marked {
+        let client = *self.ivars().last_client.borrow();
+        if client.is_null() || !self.ivars().converter.borrow().buffer().is_empty() {
+            return;
+        }
+        let mut composer = self.ivars().composer.borrow_mut();
+        if let Some(marked) = composer.apply_rerank(generation, index) {
             unsafe { set_marked_str(client, &marked) };
         }
+    }
+
+    fn update_candidates_window(&self, composer: &Composer<KkcEngine>) {
+        let panel = unsafe { candidates_panel() };
+        if panel.is_null() || composer.candidates().is_empty() {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![panel, updateCandidates];
+            let _: () = msg_send![panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
+        }
+    }
+
+    fn hide_candidates_window(&self) {
+        CANDIDATES_PANEL.with(|p| {
+            let panel = p.get();
+            if !panel.is_null() {
+                unsafe {
+                    let _: () = msg_send![panel, hide];
+                }
+            }
+        });
     }
 }
 
@@ -554,16 +505,36 @@ pub fn register_controller() {
     }
 }
 
-// TODO: create trait IMKServer
 pub unsafe fn connect_imkserver(name: *mut AnyObject, identifer: *mut AnyObject) {
     let server_class = IMKServer::class();
     let server_alloc: *mut AnyObject = msg_send![server_class, alloc];
-    let _server: *mut AnyObject =
+    let server: *mut AnyObject =
         msg_send![server_alloc, initWithName: name, bundleIdentifier: identifer];
+    SERVER.with(|s| s.set(server));
     NSLog!("IMKServer connection established");
 }
 
-/// Commit text to the client, replacing any marked text.
+unsafe fn candidates_panel() -> *mut AnyObject {
+    CANDIDATES_PANEL.with(|cell| {
+        let existing = cell.get();
+        if !existing.is_null() {
+            return existing;
+        }
+        let server = SERVER.with(|s| s.get());
+        if server.is_null() {
+            return std::ptr::null_mut();
+        }
+        let panel: *mut AnyObject = msg_send![objc2::class!(IMKCandidates), alloc];
+        let panel: *mut AnyObject = msg_send![
+            panel,
+            initWithServer: server,
+            panelType: K_IMK_SINGLE_COLUMN_SCROLLING_PANEL
+        ];
+        cell.set(panel);
+        panel
+    })
+}
+
 unsafe fn insert_str(client: *mut AnyObject, text: &str) {
     let ns = NSString::from_str(text);
     let replacement_range = NSRange {
@@ -573,7 +544,6 @@ unsafe fn insert_str(client: *mut AnyObject, text: &str) {
     let _: () = msg_send![client, insertText: &*ns, replacementRange: replacement_range];
 }
 
-/// Show the pending romaji as underlined marked text (empty string clears it).
 unsafe fn set_marked_str(client: *mut AnyObject, text: &str) {
     let ns = NSString::from_str(text);
     let length: usize = msg_send![&*ns, length];
@@ -607,7 +577,6 @@ fn playful_convert(text: &str) -> Option<String> {
     Some(list[i].to_string())
 }
 
-/// Get and print an objects description
 pub unsafe fn describe(obj: *mut AnyObject) {
     let description: *mut AnyObject = msg_send![obj, description];
     if let Some(desc_str) = to_s(description) {
@@ -618,7 +587,6 @@ pub unsafe fn describe(obj: *mut AnyObject) {
     }
 }
 
-/// Convert an NSString to a String
 fn to_s<'a>(nsstring_obj: *mut AnyObject) -> Option<&'a str> {
     let bytes = unsafe {
         let length: usize = msg_send![nsstring_obj, lengthOfBytesUsingEncoding: UTF8_ENCODING];

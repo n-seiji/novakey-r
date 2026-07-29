@@ -14,19 +14,17 @@ pub enum Availability {
 }
 
 pub const STATUS_OK: i32 = 0;
-pub const STATUS_PARTIAL: i32 = 3;
 
 extern "C" {
     fn novakey_llm_availability() -> i32;
-    fn novakey_llm_convert(
+    fn novakey_llm_rerank(
         controller_id: u64,
         generation: u64,
-        input_ptr: *const u8,
-        input_len: usize,
-        ctx_ptr: *const u8,
-        ctx_len: usize,
+        reading_ptr: *const u8,
+        reading_len: usize,
+        cands_ptr: *const u8,
+        cands_len: usize,
     );
-    fn novakey_llm_prewarm(controller_id: u64, ctx_ptr: *const u8, ctx_len: usize);
 }
 
 pub fn availability() -> Availability {
@@ -39,34 +37,31 @@ pub fn availability() -> Availability {
     }
 }
 
-pub fn convert_async(controller_id: u64, generation: u64, hiragana: &str, context: &str) {
+pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, candidates: &[String]) {
+    if candidates.len() < 2 {
+        return;
+    }
+    let joined = candidates.join("\u{1F}");
     unsafe {
-        novakey_llm_convert(
+        novakey_llm_rerank(
             controller_id,
             generation,
-            hiragana.as_ptr(),
-            hiragana.len(),
-            context.as_ptr(),
-            context.len(),
+            reading.as_ptr(),
+            reading.len(),
+            joined.as_ptr(),
+            joined.len(),
         );
     }
 }
 
-pub fn prewarm_async(controller_id: u64, context: &str) {
-    unsafe { novakey_llm_prewarm(controller_id, context.as_ptr(), context.len()) };
-}
-
 type ResultHandler = fn(controller_id: u64, generation: u64, status: i32, text: &str);
 
-// fn ポインタを usize で保持(メインスレッドでのみ読み書きされるが、
-// 型として Sync が必要なため atomic を使う)
 static RESULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_result_handler(f: ResultHandler) {
     RESULT_HANDLER.store(f as usize, Ordering::SeqCst);
 }
 
-/// Swift 側から main queue 上で呼ばれる。
 #[no_mangle]
 pub extern "C" fn novakey_llm_on_result(
     controller_id: u64,
@@ -89,7 +84,6 @@ pub extern "C" fn novakey_llm_on_result(
     f(controller_id, generation, status, text);
 }
 
-/// mise run test-llm 用: availability を表示し1回変換して終了。
 pub fn smoke_test() {
     println!("availability: {:?}", availability());
     if availability() != Availability::Available {
@@ -97,17 +91,19 @@ pub fn smoke_test() {
     }
     set_result_handler(|_, _, status, text| {
         println!("status={} text={}", status, text);
-        if status != STATUS_PARTIAL {
-            std::process::exit(if status == STATUS_OK { 0 } else { 1 });
-        }
+        std::process::exit(if status == STATUS_OK { 0 } else { 1 });
     });
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(15));
         eprintln!("timeout: no terminal status within 15s");
         std::process::exit(2);
     });
-    convert_async(0, 0, "きょうはいいてんきですね", "");
-    // main queue のコールバックを受けるため run loop を回す
+    let candidates = vec![
+        "今日はいい天気ですね".to_string(),
+        "京は良い天気ですね".to_string(),
+        "今日はいい転機ですね".to_string(),
+    ];
+    rerank_async(0, 0, "きょうはいいてんきですね", &candidates);
     unsafe {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
