@@ -11,8 +11,12 @@ description = "Run unit tests"
 run = "cargo test"
 
 [tasks.test-llm]
-description = "FoundationModels availability + 1回変換のスモークテスト"
+description = "LLM候補リランキングのスモークテスト"
 run = "cargo run --release -- --test-llm"
+
+[tasks.test-kkc]
+description = "辞書かな漢字変換の1回変換スモークテスト"
+run = "cargo run --release -- --test-kkc"
 
 [tasks.app]
 description = "Package the release binary into output/NovakeyR.app"
@@ -23,6 +27,7 @@ mkdir -p output/NovakeyR.app/Contents/MacOS
 mkdir -p output/NovakeyR.app/Contents/Resources
 cp Info.plist output/NovakeyR.app/Contents/
 cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
+cp -R swift/AzooKeyBridge/.build/release/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle output/NovakeyR.app/Contents/MacOS/
 cp -R resources/. output/NovakeyR.app/Contents/Resources/
 """
 

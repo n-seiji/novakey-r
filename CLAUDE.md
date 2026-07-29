@@ -31,16 +31,14 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 
 ### Core Components
 - `src/main.rs` - Entry point that initializes the NSApplication and IMKServer connection
-- `src/imk.rs` - Input Method Kit integration (controller class, marked text, playful conversion)
+- `src/imk.rs` - Input Method Kit integration (controller class, marked text, candidate window, playful conversion)
 - `src/romaji_converter.rs` - Pure-Rust romaji-to-hiragana conversion engine (unit tested)
-- `src/composer.rs` - 未確定文の状態機械(世代管理・デバウンス・差分抑制・タイムアウト再送、unit tested)
-- `src/llm_bridge.rs` - FoundationModels への FFI(結果は main queue 経由で戻る契約)
-- `swift/LLMBridge.swift` - FoundationModels 呼び出し(build.rs で swiftc コンパイル)
-- 変換モード: ライブ変換 / スペース変換(デフォルト)。入力ソースメニューで切替。
-  LLM が使えない環境(Apple Intelligence 無効等)では生ひらがな確定にフォールバック
-- 変換フロー: 入力中は生ひらがな表示のまま裏で投機変換(セッション先行prewarm + キャッシュ)。
-  スペースで開示(キャッシュヒットなら即時、ミスなら streamResponse で流し込み)。
-  もう一度スペースでひらがなに戻る。Enter で確定。変換失敗時はひらがな表示へ自動復帰
+- `src/composer.rs` - 未確定文の状態機械(ひらがなバッファ+同期n-best候補+選択状態、unit tested)
+- `src/kkc_bridge.rs` + `swift/AzooKeyBridge/` - AzooKeyKanaKanjiConverter(辞書ラティス)への同期FFI
+- `src/llm_bridge.rs` + `swift/LLMBridge.swift` - FoundationModels によるLLM候補リランキング(非同期・失敗無害)
+- 変換フロー: 打鍵ごとに辞書エンジンで同期変換(数ms)しライブ表示。スペースで候補送り+候補ウィンドウ。
+  Enter 確定(学習更新)。Esc で生ひらがな。LLM は裏で候補番号を選び未操作なら第1候補を差し替える
+- 辞書リソースバンドルを .app の Contents/MacOS/ に同梱(mise run app が実施)
 
 ### Key Technical Details
 - Uses macOS InputMethodKit framework via Objective-C bindings (`objc2` / `objc2-foundation`)
@@ -71,7 +69,7 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 ### Japanese Input Features
 - Romaji to hiragana conversion (a→あ, ka→か, etc.)
 - Supports common romaji patterns including alternative spellings (si/shi, tu/tsu, etc.)
-- Conversion happens incrementally as you type; pending romaji is shown as underlined marked text
+- Kana-kanji conversion happens incrementally as you type; pending romaji is shown after the current candidate as marked text
 - Space / newline / focus change commit any remaining buffered romaji
 - Automatic buffer management for multi-character sequences
 - Backspace handling for romaji buffer editing
