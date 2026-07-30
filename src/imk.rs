@@ -229,14 +229,19 @@ declare_class!(
             if let Some(out) = romaji_out {
                 composer.push_hiragana(&out);
             }
+            let punctuation = japanese_punctuation(input);
             if composer.is_empty() {
+                if let Some(converted) = punctuation {
+                    unsafe { insert_str(client, converted) };
+                    return Bool::YES;
+                }
                 if let Some(converted) = playful_convert(input) {
                     unsafe { insert_str(client, &converted) };
                     return Bool::YES;
                 }
                 return Bool::NO;
             }
-            composer.push_hiragana(input);
+            composer.push_hiragana(punctuation.unwrap_or(input));
             self.request_rerank(&composer);
             let marked = composer.display().to_string();
             unsafe { set_marked_str(client, &marked) };
@@ -575,6 +580,37 @@ fn playful_convert(text: &str) -> Option<String> {
     let list = PLAYFUL_MAP.get(text)?;
     let i = rand::thread_rng().gen_range(0..list.len());
     Some(list[i].to_string())
+}
+
+/// IME で直接入力した ASCII 句読点を、日本語入力用の表記へ正規化する。
+fn japanese_punctuation(text: &str) -> Option<&'static str> {
+    match text {
+        "." => Some("。"),
+        "," => Some("、"),
+        "-" => Some("ー"),
+        "!" => Some("！"),
+        "?" => Some("？"),
+        "[" => Some("「"),
+        "]" => Some("」"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::japanese_punctuation;
+
+    #[test]
+    fn converts_ascii_punctuation_to_japanese_forms() {
+        assert_eq!(japanese_punctuation("."), Some("。"));
+        assert_eq!(japanese_punctuation(","), Some("、"));
+        assert_eq!(japanese_punctuation("-"), Some("ー"));
+        assert_eq!(japanese_punctuation("!"), Some("！"));
+        assert_eq!(japanese_punctuation("?"), Some("？"));
+        assert_eq!(japanese_punctuation("["), Some("「"));
+        assert_eq!(japanese_punctuation("]"), Some("」"));
+        assert_eq!(japanese_punctuation("a"), None);
+    }
 }
 
 pub unsafe fn describe(obj: *mut AnyObject) {

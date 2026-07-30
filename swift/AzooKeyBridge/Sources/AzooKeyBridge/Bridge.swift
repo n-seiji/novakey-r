@@ -26,10 +26,10 @@ private func makeOptions() -> ConvertRequestOptions {
     let dir = memoryDir()
     return .init(
         N_best: 9,
-        requireJapanesePrediction: true,
+        requireJapanesePrediction: false,
         requireEnglishPrediction: false,
         keyboardLanguage: .ja_JP,
-        englishCandidateInRoman2KanaInput: true,
+        englishCandidateInRoman2KanaInput: false,
         fullWidthRomanCandidate: false,
         halfWidthKanaCandidate: false,
         learningType: .inputAndOutput,
