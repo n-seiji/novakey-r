@@ -9,8 +9,13 @@ private struct SessionState {
 private nonisolated(unsafe) var sessions: [UInt64: SessionState] = [:]
 
 private func memoryDir() -> URL {
-    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("NovakeyR", isDirectory: true)
+    let dir: URL
+    if let override = ProcessInfo.processInfo.environment["NOVAKEY_MEMORY_DIR"], !override.isEmpty {
+        dir = URL(fileURLWithPath: override, isDirectory: true)
+    } else {
+        dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("NovakeyR", isDirectory: true)
+    }
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
@@ -24,6 +29,10 @@ private func getConverter() -> KanaKanjiConverter {
 
 private func makeOptions() -> ConvertRequestOptions {
     let dir = memoryDir()
+    let learningType: LearningType =
+        ProcessInfo.processInfo.environment["NOVAKEY_DISABLE_LEARNING"] == "1"
+            ? .nothing
+            : .inputAndOutput
     return .init(
         N_best: 9,
         requireJapanesePrediction: false,
@@ -32,7 +41,7 @@ private func makeOptions() -> ConvertRequestOptions {
         englishCandidateInRoman2KanaInput: false,
         fullWidthRomanCandidate: false,
         halfWidthKanaCandidate: false,
-        learningType: .inputAndOutput,
+        learningType: learningType,
         maxMemoryCount: 65536,
         shouldResetMemory: false,
         memoryDirectoryURL: dir,

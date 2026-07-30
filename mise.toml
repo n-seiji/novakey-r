@@ -18,6 +18,10 @@ run = "cargo run --release -- --test-llm"
 description = "辞書かな漢字変換の1回変換スモークテスト"
 run = "cargo run --release -- --test-kkc"
 
+[tasks.reset-memory]
+description = "変換学習データを全消去する"
+run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"
+
 [tasks.app]
 description = "Package the release binary into output/NovakeyR.app"
 depends = ["build"]

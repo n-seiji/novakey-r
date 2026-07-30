@@ -40,6 +40,11 @@ pub fn cancel(controller_id: u64) {
 }
 
 pub fn smoke_test() {
+    let memory_dir = std::env::temp_dir()
+        .join(format!("novakey-r-kkc-smoke-{}", std::process::id()));
+    std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
+    std::env::set_var("NOVAKEY_MEMORY_DIR", &memory_dir);
+
     let candidates = convert(0, 1, "きょうはいいてんきですね");
     println!("candidates: {}", candidates.len());
     for (i, c) in candidates.iter().enumerate() {
