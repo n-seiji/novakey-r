@@ -36,7 +36,7 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 - `src/composer.rs` - 未確定文の状態機械(ひらがなバッファ+同期n-best候補+選択状態、unit tested)
 - `src/kkc_bridge.rs` + `swift/AzooKeyBridge/` - AzooKeyKanaKanjiConverter(辞書ラティス)への同期FFI
 - `src/llm_bridge.rs` + `swift/LLMBridge.swift` - FoundationModels によるLLM候補リランキング(非同期・失敗無害)
-- 変換フロー: 打鍵ごとに辞書エンジンで同期変換(数ms)しライブ表示。スペースで候補送り+候補ウィンドウ。
+- 変換フロー: 既定は非ライブ(未確定文はひらがな表示、メニューでライブ変換に切替可)。打鍵ごとに辞書エンジンで同期変換し、スペース1回目で第1候補、2回目以降で候補送り+候補ウィンドウ(1〜9で候補確定)。ローマ字そのままの候補(raw)を第1候補の直後に追加。先頭が大文字の語は英単語としてそのまま入力。局面は composer の Phase、キー対応表は keymap.rs。
   Enter 確定(学習更新)。Esc で生ひらがな。LLM は裏で候補番号を選び未操作なら第1候補を差し替える
 - 辞書リソースバンドルを .app の Contents/MacOS/ に同梱(mise run app が実施)
 

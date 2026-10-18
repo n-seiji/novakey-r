@@ -1,6 +1,7 @@
 mod composer;
 mod imk;
 mod imk_client;
+mod keymap;
 mod kkc_bridge;
 mod llm_bridge;
 mod outbound;
