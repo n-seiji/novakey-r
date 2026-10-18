@@ -190,6 +190,14 @@ impl RomajiConverter {
         &self.buffer
     }
 
+    /// マーク文字列に出す未確定ローマ字。先頭の "nn" は確定すれば ん になるので ん で見せる。
+    pub fn pending_display(&self) -> String {
+        match self.buffer.strip_prefix("nn") {
+            Some(rest) => format!("ん{rest}"),
+            None => self.buffer.clone(),
+        }
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
@@ -398,6 +406,34 @@ mod tests {
         result
     }
     
+    fn pending_after(input: &str) -> String {
+        let mut converter = RomajiConverter::new();
+        input.chars().for_each(|ch| {
+            converter.process_input(ch);
+        });
+        converter.pending_display()
+    }
+
+    #[test]
+    fn 未確定のnnはんと表示し_単独のnはそのまま() {
+        assert_eq!(pending_after("n"), "n");
+        assert_eq!(pending_after("nn"), "ん");
+        assert_eq!(pending_after("kon"), "n");
+        assert_eq!(pending_after("konn"), "ん");
+        assert_eq!(pending_after("ka"), "");
+    }
+
+    #[test]
+    fn nnの表示を変えても確定結果は変わらない() {
+        assert_eq!(convert_string("konnichiha"), "こんにちは");
+        assert_eq!(convert_string("konnnichiha"), "こんにちは");
+        assert_eq!(convert_string("kanji"), "かんじ");
+        assert_eq!(convert_string("sannin"), "さんにん");
+        assert_eq!(convert_string("onna"), "おんな");
+        assert_eq!(convert_string("hon"), "ほん");
+        assert_eq!(pending_after("nnn"), "n");
+    }
+
     #[test]
     fn test_basic_vowels() {
         assert_eq!(convert_string("a"), "あ");

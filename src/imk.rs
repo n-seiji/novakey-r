@@ -315,7 +315,7 @@ impl NovakeyRInputController {
 
     /// 表示中の変換結果(またはかな) + 未変換のローマ字。
     fn marked_text(&self) -> String {
-        let romaji = self.ivars().converter.borrow().buffer().to_string();
+        let romaji = self.ivars().converter.borrow().pending_display();
         let display = self.ivars().composer.borrow().display().to_string();
         format!("{display}{romaji}")
     }
