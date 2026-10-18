@@ -2,7 +2,7 @@
 // 契約: novakey_llm_on_result は Swift 側が main queue 上で呼ぶ。
 use std::slice;
 use std::str;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
@@ -28,6 +28,7 @@ extern "C" {
 }
 
 pub fn availability() -> Availability {
+    // SAFETY: 引数なしで状態コードを返す Swift 側の @_cdecl 関数。
     match unsafe { novakey_llm_availability() } {
         0 => Availability::Available,
         4 => Availability::CredentialsMissing,
@@ -40,6 +41,7 @@ pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, context:
         return;
     }
     let joined = candidates.join("\u{1F}");
+    // SAFETY: 各 (ptr, len) は呼び出し中生存する &str / String を指す。Swift 側は呼び出し中にコピーして保持しない。
     unsafe {
         novakey_llm_rerank(
             controller_id,
@@ -56,10 +58,11 @@ pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, context:
 
 type ResultHandler = fn(controller_id: u64, generation: u64, status: i32, text: &str);
 
-static RESULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static RESULT_HANDLER: OnceLock<ResultHandler> = OnceLock::new();
 
+/// 結果ハンドラを登録する。最初の 1 回だけ有効。
 pub fn set_result_handler(f: ResultHandler) {
-    RESULT_HANDLER.store(f as usize, Ordering::SeqCst);
+    let _ = RESULT_HANDLER.set(f);
 }
 
 #[no_mangle]
@@ -70,18 +73,17 @@ pub extern "C" fn novakey_llm_on_result(
     text_ptr: *const u8,
     text_len: usize,
 ) {
-    let handler = RESULT_HANDLER.load(Ordering::SeqCst);
-    if handler == 0 {
+    let Some(handler) = RESULT_HANDLER.get() else {
         return;
-    }
+    };
     let text = if text_ptr.is_null() || text_len == 0 {
         ""
     } else {
+        // SAFETY: Swift 側は (text_ptr, text_len) がこのコールバック中有効なバイト列であることを保証する (契約)。
         let bytes = unsafe { slice::from_raw_parts(text_ptr, text_len) };
         str::from_utf8(bytes).unwrap_or("")
     };
-    let f: ResultHandler = unsafe { std::mem::transmute(handler) };
-    f(controller_id, generation, status, text);
+    handler(controller_id, generation, status, text);
 }
 
 static SMOKE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -106,10 +108,5 @@ pub fn smoke_test() {
     ];
     let _ = SMOKE_START.set(std::time::Instant::now());
     rerank_async(0, 0, "きょうはいしゃにいく", "", &candidates);
-    unsafe {
-        use objc2::runtime::AnyObject;
-        use objc2::{class, msg_send};
-        let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
-        let _: () = msg_send![run_loop, run];
-    }
+    crate::platform::run_main_run_loop();
 }

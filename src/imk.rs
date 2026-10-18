@@ -1,19 +1,20 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::{slice, str};
 
 use objc2::rc::{Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{
-    declare_class, extern_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass,
+    declare_class, extern_class, msg_send_id, mutability, sel, ClassType, DeclaredClass,
 };
-use objc2_foundation::{NSNotFound, NSObject, NSRange, NSString};
+use objc2_foundation::{NSArray, NSObject, NSString};
 use once_cell::sync::Lazy;
 use rand::Rng;
 
 use crate::composer::{CandidateEngine, Composer};
+use crate::imk_client::Client;
 use crate::kkc_bridge;
 use crate::llm_bridge;
+use crate::platform;
 use crate::romaji_converter::RomajiConverter;
 
 pub struct KkcEngine {
@@ -39,8 +40,6 @@ thread_local! {
     static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
         RefCell::new(HashMap::new());
     static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static SERVER: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-    static CANDIDATES_PANEL: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
 fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
@@ -58,53 +57,13 @@ pub fn init_llm_dispatch() {
     let avail = llm_bridge::availability();
     if avail != llm_bridge::Availability::Available {
         LLM_ENABLED.with(|e| e.set(false));
-        unsafe {
-            let msg = NSString::from_str(&format!("LLM unavailable: {:?}", avail));
-            NSLog(msg.as_ref() as *const NSString as *mut AnyObject);
-        }
+        platform::log(&format!("LLM unavailable: {:?}", avail));
     }
 }
 
 fn llm_enabled() -> bool {
     LLM_ENABLED.with(|e| e.get())
 }
-
-#[link(name = "InputMethodKit", kind = "framework")]
-extern "C" {}
-
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {}
-
-#[link(name = "Foundation", kind = "framework")]
-extern "C" {
-    pub fn NSLog(fmt: *mut AnyObject, ...);
-}
-
-macro_rules! NSLog {
-    ( $fmt:expr ) => {{
-        let ns_str = NSString::from_str($fmt);
-        NSLog(ns_str.as_ref() as *const NSString as *mut AnyObject)
-    }};
-    ( $fmt:expr, $( $x:expr ),* ) => {{
-        let ns_str = NSString::from_str($fmt);
-        NSLog(ns_str.as_ref() as *const NSString as *mut AnyObject, $($x, )*)
-    }};
-}
-
-const UTF8_ENCODING: libc::c_uint = 4;
-const K_IMK_SINGLE_COLUMN_SCROLLING_PANEL: usize = 1;
-const K_IMK_LOCATE_CANDIDATES_BELOW_HINT: usize = 2;
-
-extern_class!(
-    #[derive(Debug, PartialEq, Eq, Hash)]
-    pub struct IMKServer;
-
-    unsafe impl ClassType for IMKServer {
-        type Super = NSObject;
-        type Mutability = mutability::InteriorMutable;
-        const NAME: &'static str = "IMKServer";
-    }
-);
 
 extern_class!(
     #[derive(Debug, PartialEq, Eq, Hash)]
@@ -128,7 +87,7 @@ pub struct Ivars {
     composer: RefCell<Composer<KkcEngine>>,
     mode: RefCell<ConversionMode>,
     controller_id: u64,
-    last_client: RefCell<*mut AnyObject>,
+    last_client: RefCell<Option<Client>>,
 }
 
 declare_class!(
@@ -158,8 +117,9 @@ declare_class!(
                 composer: RefCell::new(Composer::new(KkcEngine { controller_id })),
                 mode: RefCell::new(ConversionMode::Live),
                 controller_id,
-                last_client: RefCell::new(std::ptr::null_mut()),
+                last_client: RefCell::new(None),
             });
+            // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
             let this: Option<Id<Self>> = unsafe {
                 msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
             };
@@ -170,11 +130,13 @@ declare_class!(
         }
 
         #[method(inputText:client:)]
-        fn input_text(&self, text: *mut AnyObject, client: *mut AnyObject) -> Bool {
-            let Some(input) = to_s(text) else {
+        fn input_text(&self, text: Option<&NSString>, client: Option<&AnyObject>) -> Bool {
+            let (Some(text), Some(client)) = (text, client) else {
                 return Bool::NO;
             };
-            *self.ivars().last_client.borrow_mut() = client;
+            let input = text.to_string();
+            let client = Client::new(client);
+            *self.ivars().last_client.borrow_mut() = Some(client.clone());
             let mut converter = self.ivars().converter.borrow_mut();
 
             if input == " " {
@@ -187,18 +149,18 @@ declare_class!(
                 }
                 if composer.is_empty() {
                     if let Some(converted) = playful_convert(" ") {
-                        unsafe { insert_str(client, &converted) };
+                        client.insert(&converted);
                         return Bool::YES;
                     }
                     return Bool::NO;
                 }
                 if composer.cycle() {
                     let marked = composer.display().to_string();
-                    unsafe { set_marked_str(client, &marked) };
+                    client.set_marked(&marked);
                     self.update_candidates_window(&composer);
                 } else {
                     let marked = composer.display().to_string();
-                    unsafe { set_marked_str(client, &marked) };
+                    client.set_marked(&marked);
                 }
                 return Bool::YES;
             }
@@ -218,7 +180,7 @@ declare_class!(
                     self.request_rerank(&composer);
                 }
                 let marked = format!("{}{}", composer.display(), romaji);
-                unsafe { set_marked_str(client, &marked) };
+                client.set_marked(&marked);
                 self.hide_candidates_window();
                 return Bool::YES;
             }
@@ -229,29 +191,32 @@ declare_class!(
             if let Some(out) = romaji_out {
                 composer.push_hiragana(&out);
             }
-            let punctuation = japanese_punctuation(input);
+            let punctuation = japanese_punctuation(&input);
             if composer.is_empty() {
                 if let Some(converted) = punctuation {
-                    unsafe { insert_str(client, converted) };
+                    client.insert(converted);
                     return Bool::YES;
                 }
-                if let Some(converted) = playful_convert(input) {
-                    unsafe { insert_str(client, &converted) };
+                if let Some(converted) = playful_convert(&input) {
+                    client.insert(&converted);
                     return Bool::YES;
                 }
                 return Bool::NO;
             }
-            composer.push_hiragana(punctuation.unwrap_or(input));
+            composer.push_hiragana(punctuation.unwrap_or(&input));
             self.request_rerank(&composer);
             let marked = composer.display().to_string();
-            unsafe { set_marked_str(client, &marked) };
+            client.set_marked(&marked);
             self.hide_candidates_window();
             Bool::YES
         }
 
         #[method(didCommandBySelector:client:)]
-        fn did_command_by_selector(&self, selector: Sel, client: *mut AnyObject) -> Bool {
-            *self.ivars().last_client.borrow_mut() = client;
+        fn did_command_by_selector(&self, selector: Sel, client: Option<&AnyObject>) -> Bool {
+            let Some(client) = client.map(Client::new) else {
+                return Bool::NO;
+            };
+            *self.ivars().last_client.borrow_mut() = Some(client.clone());
             let mut converter = self.ivars().converter.borrow_mut();
 
             if selector == sel!(deleteBackward:) {
@@ -261,7 +226,7 @@ declare_class!(
                     drop(converter);
                     let composer = self.ivars().composer.borrow();
                     let marked = format!("{}{}", composer.display(), romaji);
-                    unsafe { set_marked_str(client, &marked) };
+                    client.set_marked(&marked);
                     return Bool::YES;
                 }
                 drop(converter);
@@ -271,7 +236,7 @@ declare_class!(
                 }
                 self.request_rerank(&composer);
                 let marked = composer.display().to_string();
-                unsafe { set_marked_str(client, &marked) };
+                client.set_marked(&marked);
                 self.hide_candidates_window();
                 return Bool::YES;
             }
@@ -288,10 +253,8 @@ declare_class!(
                     return Bool::NO;
                 }
                 let text = composer.commit();
-                unsafe {
-                    set_marked_str(client, "");
-                    insert_str(client, &text);
-                }
+                client.set_marked("");
+                client.insert(&text);
                 self.hide_candidates_window();
                 return Bool::YES;
             }
@@ -308,7 +271,7 @@ declare_class!(
                 }
                 composer.revert_raw();
                 let marked = composer.display().to_string();
-                unsafe { set_marked_str(client, &marked) };
+                client.set_marked(&marked);
                 self.hide_candidates_window();
                 return Bool::YES;
             }
@@ -323,27 +286,23 @@ declare_class!(
         }
 
 
-        #[method(candidates:)]
-        fn candidates(&self, _sender: *mut AnyObject) -> *mut AnyObject {
+        #[method_id(candidates:)]
+        fn candidates(&self, _sender: Option<&AnyObject>) -> Id<NSArray<NSString>> {
             let composer = self.ivars().composer.borrow();
-            unsafe {
-                let array: *mut AnyObject = msg_send![objc2::class!(NSMutableArray), new];
-                for cand in composer.candidates() {
-                    let ns = NSString::from_str(&cand.text);
-                    let _: () = msg_send![array, addObject: &*ns];
-                }
-                msg_send![array, autorelease]
-            }
+            let texts: Vec<Id<NSString>> = composer
+                .candidates()
+                .iter()
+                .map(|cand| NSString::from_str(&cand.text))
+                .collect();
+            NSArray::from_vec(texts)
         }
 
         #[method(candidateSelectionChanged:)]
-        fn candidate_selection_changed(&self, candidate_string: *mut AnyObject) {
-            let client = *self.ivars().last_client.borrow();
-            if client.is_null() {
+        fn candidate_selection_changed(&self, candidate_string: Option<&AnyObject>) {
+            let Some(client) = self.client() else { return };
+            let Some(text) = candidate_string.and_then(platform::attributed_text) else {
                 return;
-            }
-            let text: *mut AnyObject = unsafe { msg_send![candidate_string, string] };
-            let Some(text) = to_s(text) else { return };
+            };
             let mut composer = self.ivars().composer.borrow_mut();
             if let Some(idx) = composer.candidates().iter().position(|c| c.text == text) {
                 while composer.selected_index() != Some(idx) {
@@ -352,18 +311,16 @@ declare_class!(
                     }
                 }
                 let marked = composer.display().to_string();
-                unsafe { set_marked_str(client, &marked) };
+                client.set_marked(&marked);
             }
         }
 
         #[method(candidateSelected:)]
-        fn candidate_selected(&self, candidate_string: *mut AnyObject) {
-            let client = *self.ivars().last_client.borrow();
-            if client.is_null() {
+        fn candidate_selected(&self, candidate_string: Option<&AnyObject>) {
+            let Some(client) = self.client() else { return };
+            let Some(text) = candidate_string.and_then(platform::attributed_text) else {
                 return;
-            }
-            let text: *mut AnyObject = unsafe { msg_send![candidate_string, string] };
-            let Some(text) = to_s(text) else { return };
+            };
             let mut composer = self.ivars().composer.borrow_mut();
             if let Some(idx) = composer.candidates().iter().position(|c| c.text == text) {
                 while composer.selected_index() != Some(idx) {
@@ -373,38 +330,19 @@ declare_class!(
                 }
             }
             let out = composer.commit();
-            unsafe {
-                set_marked_str(client, "");
-                insert_str(client, &out);
-            }
+            client.set_marked("");
+            client.insert(&out);
             self.hide_candidates_window();
         }
 
-        #[method(menu)]
-        fn menu(&self) -> *mut AnyObject {
-            unsafe {
-                let menu: *mut AnyObject = msg_send![objc2::class!(NSMenu), new];
-                let title = NSString::from_str(match *self.ivars().mode.borrow() {
-                    ConversionMode::Live => "ライブ変換: オン",
-                    ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
-                });
-                let item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), alloc];
-                let item: *mut AnyObject = msg_send![
-                    item,
-                    initWithTitle: &*title,
-                    action: sel!(toggleConversionMode:),
-                    keyEquivalent: &*NSString::from_str("")
-                ];
-                let _: () = msg_send![menu, addItem: item];
-                if !llm_enabled() {
-                    let warn = NSString::from_str("LLMリランキング無効(Cloudflare認証情報を確認)");
-                    let warn_item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), new];
-                    let _: () = msg_send![warn_item, setTitle: &*warn];
-                    let _: () = msg_send![warn_item, setEnabled: Bool::NO];
-                    let _: () = msg_send![menu, addItem: warn_item];
-                }
-                menu
-            }
+        #[method_id(menu)]
+        fn menu(&self) -> Id<AnyObject> {
+            let mode_title = match *self.ivars().mode.borrow() {
+                ConversionMode::Live => "ライブ変換: オン",
+                ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
+            };
+            let warning = (!llm_enabled()).then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
+            platform::build_menu(mode_title, warning)
         }
 
         #[method(toggleConversionMode:)]
@@ -419,15 +357,15 @@ declare_class!(
             };
             let mut composer = self.ivars().composer.borrow_mut();
             composer.set_live(new_mode == ConversionMode::Live);
-            let client = *self.ivars().last_client.borrow();
-            if !client.is_null() && !composer.is_empty() {
+            if let (Some(client), false) = (self.client(), composer.is_empty()) {
                 let marked = composer.display().to_string();
-                unsafe { set_marked_str(client, &marked) };
+                client.set_marked(&marked);
             }
         }
 
         #[method(commitComposition:)]
-        fn commit_composition(&self, client: *mut AnyObject) {
+        fn commit_composition(&self, client: Option<&AnyObject>) {
+            let client = client.map(Client::new);
             let mut converter = self.ivars().converter.borrow_mut();
             let romaji_out = converter.flush();
             drop(converter);
@@ -435,9 +373,9 @@ declare_class!(
             if let Some(out) = romaji_out {
                 composer.push_hiragana(&out);
             }
-            if !composer.is_empty() {
+            if let (Some(client), false) = (client, composer.is_empty()) {
                 let text = composer.commit();
-                unsafe { insert_str(client, &text) };
+                client.insert(&text);
             }
             self.hide_candidates_window();
         }
@@ -445,13 +383,19 @@ declare_class!(
 );
 
 impl NovakeyRInputController {
+    fn client(&self) -> Option<Client> {
+        self.ivars().last_client.borrow().clone()
+    }
+
     fn request_rerank(&self, composer: &Composer<KkcEngine>) {
         if !llm_enabled() || composer.candidates().len() < 2 || composer.is_raw() {
             return;
         }
         let candidates: Vec<String> = composer.candidates().iter().map(|c| c.text.clone()).collect();
-        let client = *self.ivars().last_client.borrow();
-        let context = unsafe { preceding_context(client) };
+        let context = self
+            .client()
+            .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
+            .unwrap_or_default();
         llm_bridge::rerank_async(
             self.ivars().controller_id,
             composer.current_generation(),
@@ -463,143 +407,47 @@ impl NovakeyRInputController {
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
         if status != llm_bridge::STATUS_OK {
-            unsafe { NSLog!("LLM rerank error status=%d", status) };
+            platform::log(&format!("LLM rerank error status={}", status));
             return;
         }
         let Ok(index) = text.trim().parse::<usize>() else {
             return;
         };
-        let client = *self.ivars().last_client.borrow();
-        if client.is_null() || !self.ivars().converter.borrow().buffer().is_empty() {
+        let Some(client) = self.client() else { return };
+        if !self.ivars().converter.borrow().buffer().is_empty() {
             return;
         }
         let mut composer = self.ivars().composer.borrow_mut();
         if let Some(marked) = composer.apply_rerank(generation, index) {
-            unsafe { set_marked_str(client, &marked) };
+            client.set_marked(&marked);
         }
     }
 
     fn update_candidates_window(&self, composer: &Composer<KkcEngine>) {
-        let panel = unsafe { candidates_panel() };
-        if panel.is_null() || composer.candidates().is_empty() {
-            return;
-        }
-        unsafe {
-            let _: () = msg_send![panel, updateCandidates];
-            let _: () = msg_send![panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
+        if !composer.candidates().is_empty() {
+            platform::show_candidates();
         }
     }
 
     fn hide_candidates_window(&self) {
-        CANDIDATES_PANEL.with(|p| {
-            let panel = p.get();
-            if !panel.is_null() {
-                unsafe {
-                    let _: () = msg_send![panel, hide];
-                }
-            }
-        });
+        platform::hide_candidates();
     }
 }
 
 pub fn register_controller() {
     let _ = NovakeyRInputController::class();
-    unsafe {
-        NSLog!(
-            "Registered input controller class: %@",
-            NSString::from_str(NovakeyRInputController::NAME).as_ref() as *const NSString
-                as *mut AnyObject
-        );
-    }
+    platform::log(&format!(
+        "Registered input controller class: {}",
+        NovakeyRInputController::NAME
+    ));
 }
 
-pub unsafe fn connect_imkserver(name: *mut AnyObject, identifer: *mut AnyObject) {
-    let server_class = IMKServer::class();
-    let server_alloc: *mut AnyObject = msg_send![server_class, alloc];
-    let server: *mut AnyObject =
-        msg_send![server_alloc, initWithName: name, bundleIdentifier: identifer];
-    SERVER.with(|s| s.set(server));
-    NSLog!("IMKServer connection established");
-}
-
-unsafe fn candidates_panel() -> *mut AnyObject {
-    CANDIDATES_PANEL.with(|cell| {
-        let existing = cell.get();
-        if !existing.is_null() {
-            return existing;
-        }
-        let server = SERVER.with(|s| s.get());
-        if server.is_null() {
-            return std::ptr::null_mut();
-        }
-        let panel: *mut AnyObject = msg_send![objc2::class!(IMKCandidates), alloc];
-        let panel: *mut AnyObject = msg_send![
-            panel,
-            initWithServer: server,
-            panelType: K_IMK_SINGLE_COLUMN_SCROLLING_PANEL
-        ];
-        cell.set(panel);
-        panel
-    })
+/// 入力メソッドとして起動し、run loop に入る。
+pub fn run() {
+    platform::run_application("me.sijis.inputmethod.NovakeyR_Connection");
 }
 
 const CONTEXT_MAX_UTF16: usize = 200;
-
-/// マーク範囲(なければ選択範囲)の直前のテキストを最大200文字返す。取れなければ空。
-unsafe fn preceding_context(client: *mut AnyObject) -> String {
-    if client.is_null() {
-        return String::new();
-    }
-    let marked: NSRange = msg_send![client, markedRange];
-    let anchor = if marked.location != NSNotFound as usize {
-        marked.location
-    } else {
-        let selected: NSRange = msg_send![client, selectedRange];
-        if selected.location == NSNotFound as usize {
-            return String::new();
-        }
-        selected.location
-    };
-    let start = anchor.saturating_sub(CONTEXT_MAX_UTF16);
-    if anchor == start {
-        return String::new();
-    }
-    let range = NSRange { location: start, length: anchor - start };
-    let attributed: *mut AnyObject = msg_send![client, attributedSubstringFromRange: range];
-    if attributed.is_null() {
-        return String::new();
-    }
-    let string: *mut NSString = msg_send![attributed, string];
-    if string.is_null() {
-        return String::new();
-    }
-    (*string).to_string()
-}
-
-unsafe fn insert_str(client: *mut AnyObject, text: &str) {
-    let ns = NSString::from_str(text);
-    let replacement_range = NSRange {
-        location: NSNotFound as usize,
-        length: 0,
-    };
-    let _: () = msg_send![client, insertText: &*ns, replacementRange: replacement_range];
-}
-
-unsafe fn set_marked_str(client: *mut AnyObject, text: &str) {
-    let ns = NSString::from_str(text);
-    let length: usize = msg_send![&*ns, length];
-    let selection_range = NSRange { location: length, length: 0 };
-    let replacement_range = NSRange {
-        location: NSNotFound as usize,
-        length: 0,
-    };
-    let _: () = msg_send![
-        client,
-        setMarkedText: &*ns,
-        selectionRange: selection_range,
-        replacementRange: replacement_range
-    ];
-}
 
 static PLAYFUL_MAP: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
     let mut outs = HashMap::new();
@@ -647,23 +495,4 @@ mod tests {
         assert_eq!(japanese_punctuation("]"), Some("」"));
         assert_eq!(japanese_punctuation("a"), None);
     }
-}
-
-pub unsafe fn describe(obj: *mut AnyObject) {
-    let description: *mut AnyObject = msg_send![obj, description];
-    if let Some(desc_str) = to_s(description) {
-        NSLog!(
-            "Object description: %@",
-            NSString::from_str(desc_str).as_ref() as *const NSString as *mut AnyObject
-        );
-    }
-}
-
-fn to_s<'a>(nsstring_obj: *mut AnyObject) -> Option<&'a str> {
-    let bytes = unsafe {
-        let length: usize = msg_send![nsstring_obj, lengthOfBytesUsingEncoding: UTF8_ENCODING];
-        let utf8_str: *const u8 = msg_send![nsstring_obj, UTF8String];
-        slice::from_raw_parts(utf8_str, length)
-    };
-    str::from_utf8(bytes).ok()
 }

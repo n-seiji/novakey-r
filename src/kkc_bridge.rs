@@ -15,27 +15,35 @@ pub fn convert(controller_id: u64, revision: u64, reading: &str) -> Vec<String> 
     if reading.is_empty() {
         return Vec::new();
     }
-    let ptr = unsafe {
-        novakey_kkc_convert(controller_id, revision, reading.as_ptr(), reading.len())
-    };
-    if ptr.is_null() {
-        return Vec::new();
-    }
-    let joined = unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned();
-    unsafe { libc::free(ptr as *mut libc::c_void) };
+    // SAFETY: (ptr, len) は reading の有効なバイト列。
+    let ptr = unsafe { novakey_kkc_convert(controller_id, revision, reading.as_ptr(), reading.len()) };
+    let joined = take_c_string(ptr);
     if joined.is_empty() {
         return Vec::new();
     }
     joined.split('\u{1F}').map(str::to_string).collect()
 }
 
+/// Swift 側が malloc した NUL 終端文字列を String に写して解放する。null は空文字列。
+fn take_c_string(ptr: *mut c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: ptr は novakey_kkc_convert が返した、malloc 済みで NUL 終端の非 null 文字列。一度だけ読んで free する。
+    unsafe {
+        let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        libc::free(ptr as *mut libc::c_void);
+        s
+    }
+}
+
 pub fn select(controller_id: u64, revision: u64, engine_index: usize) -> bool {
+    // SAFETY: 引数はすべて値渡しの整数。
     unsafe { novakey_kkc_select(controller_id, revision, engine_index as isize) }
 }
 
 pub fn cancel(controller_id: u64) {
+    // SAFETY: 引数は値渡しの整数。
     unsafe { novakey_kkc_cancel(controller_id) };
 }
 

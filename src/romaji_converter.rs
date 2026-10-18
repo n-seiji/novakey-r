@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 // romaji_converter.rs - Romaji to Hiragana conversion logic
 use std::collections::HashMap;
 

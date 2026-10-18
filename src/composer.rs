@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 // composer.rs - 未確定文の状態機械: ひらがなバッファ + 同期変換候補 + 選択状態。
 // 候補は {text, engine_index} で持ち、リランキング後も学習には元 index を渡す。
 

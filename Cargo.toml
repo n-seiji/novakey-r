@@ -8,7 +8,7 @@ build = "build.rs"
 
 [dependencies]
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSString", "NSAutoreleasePool", "NSBundle", "NSRange", "NSObjCRuntime"] }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSAutoreleasePool", "NSBundle", "NSRange", "NSObjCRuntime"] }
 libc = "0.2"
 rand = "0.8.4"
 once_cell = "1.19"
