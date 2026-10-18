@@ -20,7 +20,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=LLMBridge");
-    println!("cargo:rustc-link-lib=framework=FoundationModels");
+    println!("cargo:rustc-link-lib=framework=Security");
     // swiftc static lib は Swift ランタイムのリンクパスが必要
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     // Swift ランタイム dylib を実行時に解決するための rpath

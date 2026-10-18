@@ -397,7 +397,7 @@ declare_class!(
                 ];
                 let _: () = msg_send![menu, addItem: item];
                 if !llm_enabled() {
-                    let warn = NSString::from_str("LLMリランキング無効(Apple Intelligence を確認)");
+                    let warn = NSString::from_str("LLMリランキング無効(Cloudflare認証情報を確認)");
                     let warn_item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), new];
                     let _: () = msg_send![warn_item, setTitle: &*warn];
                     let _: () = msg_send![warn_item, setEnabled: Bool::NO];

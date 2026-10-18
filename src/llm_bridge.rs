@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
     Available,
-    DeviceNotEligible,
-    NotEnabled,
-    ModelNotReady,
+    CredentialsMissing,
     Unknown,
 }
 
@@ -30,9 +28,7 @@ extern "C" {
 pub fn availability() -> Availability {
     match unsafe { novakey_llm_availability() } {
         0 => Availability::Available,
-        1 => Availability::DeviceNotEligible,
-        2 => Availability::NotEnabled,
-        3 => Availability::ModelNotReady,
+        4 => Availability::CredentialsMissing,
         _ => Availability::Unknown,
     }
 }
@@ -84,13 +80,15 @@ pub extern "C" fn novakey_llm_on_result(
     f(controller_id, generation, status, text);
 }
 
+static SMOKE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 pub fn smoke_test() {
     println!("availability: {:?}", availability());
     if availability() != Availability::Available {
         return;
     }
     set_result_handler(|_, _, status, text| {
-        println!("status={} text={}", status, text);
+        println!("status={} text={} elapsed={}ms", status, text, SMOKE_START.get().map_or(0, |t| t.elapsed().as_millis()));
         std::process::exit(if status == STATUS_OK { 0 } else { 1 });
     });
     std::thread::spawn(|| {
@@ -99,11 +97,11 @@ pub fn smoke_test() {
         std::process::exit(2);
     });
     let candidates = vec![
-        "今日はいい天気ですね".to_string(),
-        "京は良い天気ですね".to_string(),
-        "今日はいい転機ですね".to_string(),
+        "今日は医者に行く".to_string(),
+        "今日歯医者に行く".to_string(),
     ];
-    rerank_async(0, 0, "きょうはいいてんきですね", &candidates);
+    let _ = SMOKE_START.set(std::time::Instant::now());
+    rerank_async(0, 0, "きょうはいしゃにいく", &candidates);
     unsafe {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
