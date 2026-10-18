@@ -45,3 +45,10 @@ LLM(FoundationModels)単独のかな漢字変換は、レイテンシ(〜1秒)�
 - ビルド時間/サイズ増(初回 resolve で llama.cpp xcframework ~600MB DL、.a 28MB + bundle 38MB): 開発機のみの問題。CI なし
 - `KanaKanjiConverter` はメインスレッド専用として扱う(IMK イベントは全てメインスレッドなので同期呼び出しで整合)
 - 候補ウィンドウ(IMKCandidates)の挙動が不安定な場合: v1 は表示+クリック選択のみの informational とし、キー操作は自前の候補送りで完結させる
+
+## 追記: リランキングのバックエンド
+
+リランキングのバックエンドは FoundationModels から Cloudflare Workers AI の `@cf/cloudflare/clef-flash`(decision model)に変更した。
+FoundationModels は「きょうはいしゃにいく」で 5/5 失敗したが、Clef-flash は検証した全ケースで正解した。
+レイテンシは 194〜2600ms、p50 は約 500ms。リランキングは非同期のため許容している。
+認証情報は Keychain(service `me.sijis.inputmethod.NovakeyR.cloudflare`)から読む。FFI 契約(`novakey_llm_*`)は維持している。

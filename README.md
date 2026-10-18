@@ -20,7 +20,20 @@ $ make app
 
 `output/NovakeyR.app` が出力されます
 
-### 2. Install
+### 2. Cloudflare 認証情報の登録
+
+候補のリランキングに Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) を使います。
+API トークン(Workers AI の権限が必要)とアカウント ID を macOS の Keychain に登録してください。
+`-w` の後ろに値を書かないと、対話プロンプトで入力できます(コマンド履歴に残りません)。
+
+```sh
+$ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
+$ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
+```
+
+未登録の場合、リランキングは無効になり辞書変換のみで動作します。登録後は IME の再起動が必要です。
+
+### 3. Install
 
 NovakeyR.app を `/Library/Input Methods` 内にコピーします。
 
