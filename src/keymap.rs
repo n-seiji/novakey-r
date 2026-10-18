@@ -3,6 +3,7 @@
 // keymap.rs - (局面, キー) → 動作 の対応表。IMK への副作用は持たず、imk.rs が動作を実行する。
 
 use crate::composer::Phase;
+use crate::translit::{Case, Form};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -24,6 +25,8 @@ pub enum Key {
     Control,
     Up,
     Down,
+    /// Ctrl+J/K/;/L/: や F6〜F10 による字種変換。
+    Translit(Form),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,8 @@ pub enum Action {
     CommitThenPassThrough,
     Revert,
     DeleteBack,
+    /// 組成全体を指定の字種で表示する。
+    Transliterate(Form),
 }
 
 pub fn action_for(phase: Phase, key: Key) -> Action {
@@ -59,6 +64,9 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
     use Key::*;
     use Phase as P;
     match (phase, key) {
+        (P::Empty, Translit(_)) => PassThrough,
+        (_, Translit(form)) => Transliterate(form),
+
         (P::Empty, Space | ShiftSpace) => InsertSpace,
         (P::Empty, Letter { upper: true }) => StartLiteral,
         (P::Empty, Letter { upper: false }) => TypeRomaji,
@@ -86,19 +94,19 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
 
         (P::Converting { .. }, Space | Down) => NextCandidate,
         (P::Converting { .. }, Up | ShiftSpace) => PrevCandidate,
-        (P::Composing | P::Reverted, Up | Down) => PassThrough,
-        (P::Composing | P::Reverted | P::Converting { .. }, Control) => CommitThenPassThrough,
-        (P::Composing | P::Reverted, Space | ShiftSpace) => Convert,
+        (P::Composing | P::Reverted | P::Transliterated(_), Up | Down) => PassThrough,
+        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Control) => CommitThenPassThrough,
+        (P::Composing | P::Reverted | P::Transliterated(_), Space | ShiftSpace) => Convert,
         (P::Converting { window: true, .. }, Digit(n @ 1..=9)) => PickCandidate(n),
-        (P::Composing | P::Reverted | P::Converting { .. }, Letter { .. }) => TypeRomaji,
+        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Letter { .. }) => TypeRomaji,
         (
-            P::Composing | P::Reverted | P::Converting { .. },
+            P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_),
             Digit(_) | Punct | Mark | Hyphen | Symbol,
         ) => TypeText,
-        (P::Composing | P::Reverted | P::Converting { .. }, Enter) => Commit,
+        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Enter) => Commit,
         (P::Reverted, Escape) => PassThrough,
-        (P::Composing | P::Converting { .. }, Escape) => Revert,
-        (P::Composing | P::Reverted | P::Converting { .. }, Backspace) => DeleteBack,
+        (P::Composing | P::Converting { .. } | P::Transliterated(_), Escape) => Revert,
+        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Backspace) => DeleteBack,
     }
 }
 
@@ -159,6 +167,7 @@ impl Key {
             Key::Control => "Control",
             Key::Up => "Up",
             Key::Down => "Down",
+            Key::Translit(form) => form.name(),
         }
     }
 }
@@ -184,7 +193,43 @@ impl Action {
             Action::CommitThenPassThrough => "CommitThenPassThrough",
             Action::Revert => "Revert",
             Action::DeleteBack => "DeleteBack",
+            Action::Transliterate(_) => "Transliterate",
         }
+    }
+}
+
+/// 字種変換の機能キー (F6〜F10) の keyCode と変換先。
+const TRANSLIT_FUNCTION_KEYS: &[(u16, Form)] = &[
+    (97, Form::Hiragana),
+    (98, Form::Katakana),
+    (100, Form::HalfKatakana),
+    (101, Form::FullAlnum(Case::Lower)),
+    (109, Form::HalfAlnum(Case::Lower)),
+];
+
+/// Ctrl を押したときの (キー, 変換先)。キーは charactersIgnoringModifiers の小文字。
+const TRANSLIT_CONTROL_KEYS: &[(&str, Form)] = &[
+    ("j", Form::Hiragana),
+    ("k", Form::Katakana),
+    (";", Form::HalfKatakana),
+    ("l", Form::FullAlnum(Case::Lower)),
+    (":", Form::HalfAlnum(Case::Lower)),
+    ("'", Form::HalfAlnum(Case::Lower)),
+];
+
+/// 字種変換のキーなら変換先を返す。Ctrl 押下中は文字で、それ以外は F6〜F10 を keyCode で引く。
+pub fn translit_form(key_code: u16, control: bool, characters_ignoring_modifiers: &str) -> Option<Form> {
+    if control {
+        let key = characters_ignoring_modifiers.to_lowercase();
+        TRANSLIT_CONTROL_KEYS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, form)| *form)
+    } else {
+        TRANSLIT_FUNCTION_KEYS
+            .iter()
+            .find(|(code, _)| *code == key_code)
+            .map(|(_, form)| *form)
     }
 }
 
@@ -396,5 +441,70 @@ mod tests {
     fn トレース用の名前は入力文字を含まない() {
         assert_eq!(Digit(7).name(), "Digit");
         assert_eq!(PickCandidate(7).name(), "PickCandidate");
+    }
+
+    #[test]
+    fn 字種変換は未確定文があれば実行し_無ければ素通し() {
+        let form = Form::Katakana;
+        assert_eq!(action_for(Phase::Empty, Translit(form)), PassThrough);
+        for phase in [
+            Phase::Composing,
+            Phase::Reverted,
+            Phase::Literal,
+            Phase::Dangling,
+            CONVERTING,
+            WINDOW,
+            Phase::Transliterated(Form::Hiragana),
+        ] {
+            assert_eq!(action_for(phase, Translit(form)), Transliterate(form));
+        }
+    }
+
+    #[test]
+    fn 字種変換中はconverting相当の操作になる() {
+        let phase = Phase::Transliterated(Form::Katakana);
+        assert_eq!(action_for(phase, Enter), Commit);
+        assert_eq!(action_for(phase, Escape), Revert);
+        assert_eq!(action_for(phase, Backspace), DeleteBack);
+        assert_eq!(action_for(phase, Space), Convert);
+        assert_eq!(action_for(phase, ShiftSpace), Convert);
+        assert_eq!(action_for(phase, Letter { upper: false }), TypeRomaji);
+        assert_eq!(action_for(phase, Digit(1)), TypeText);
+        assert_eq!(action_for(phase, Mark), TypeText);
+        assert_eq!(action_for(phase, Control), CommitThenPassThrough);
+        assert_eq!(action_for(phase, Up), PassThrough);
+    }
+
+    #[test]
+    fn ctrlキーと機能キーを変換先に対応させる() {
+        let lower = Case::Lower;
+        for (chars, want) in [
+            ("j", Form::Hiragana),
+            ("k", Form::Katakana),
+            ("K", Form::Katakana),
+            (";", Form::HalfKatakana),
+            ("l", Form::FullAlnum(lower)),
+            (":", Form::HalfAlnum(lower)),
+            ("'", Form::HalfAlnum(lower)),
+        ] {
+            assert_eq!(translit_form(40, true, chars), Some(want), "ctrl+{chars}");
+        }
+        for (code, want) in [
+            (97, Form::Hiragana),
+            (98, Form::Katakana),
+            (100, Form::HalfKatakana),
+            (101, Form::FullAlnum(lower)),
+            (109, Form::HalfAlnum(lower)),
+        ] {
+            assert_eq!(translit_form(code, false, ""), Some(want), "keyCode {code}");
+        }
+    }
+
+    #[test]
+    fn 字種変換に当たらないキーはnone() {
+        assert_eq!(translit_form(0, true, "a"), None);
+        assert_eq!(translit_form(40, false, "k"), None);
+        assert_eq!(translit_form(97, true, ""), None);
+        assert_eq!(translit_form(96, false, ""), None);
     }
 }

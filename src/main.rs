@@ -9,6 +9,7 @@ mod platform;
 mod romaji_converter;
 mod symbols;
 mod trace;
+mod translit;
 
 fn main() {
     if std::env::args().any(|a| a == "--test-kkc") {

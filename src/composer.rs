@@ -6,6 +6,7 @@
 
 use crate::romaji_converter::Flush;
 use crate::symbols;
+use crate::translit::{self, Form};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -33,6 +34,8 @@ pub enum Phase {
     Literal,
     /// ローマ字の末尾が変換しきれず、組成全体を英単語として扱う局面。確定は raw、変換は raw が第 1 候補。
     Dangling,
+    /// 字種変換(カタカナ・全角英数など)の結果を表示している。確定は表示中の文字列で、学習しない。
+    Transliterated(Form),
 }
 
 /// 1 回の入力で生まれた (打鍵, かな) の組。部分削除後は raw をかなで置き換える。
@@ -52,6 +55,9 @@ pub struct Composer<E: CandidateEngine> {
     live: bool,
     generation: u64,
     pending_rerank: Option<usize>,
+    translit: String,
+    /// 字種変換に入る前の局面。スペースで変換に戻るときに使う。
+    base: Phase,
 }
 
 impl<E: CandidateEngine> Composer<E> {
@@ -66,6 +72,8 @@ impl<E: CandidateEngine> Composer<E> {
             live: false,
             generation: 0,
             pending_rerank: None,
+            translit: String::new(),
+            base: Phase::Empty,
         }
     }
 
@@ -109,8 +117,30 @@ impl<E: CandidateEngine> Composer<E> {
                 .candidates
                 .first()
                 .map_or(self.hiragana.as_str(), |c| c.text.as_str()),
+            Phase::Transliterated(_) => &self.translit,
             _ => &self.hiragana,
         }
+    }
+
+    /// 組成全体を form の字種で表示する。直前も同じ種類の字種変換なら、英数形は大文字小文字を巡らせる。
+    pub fn transliterate(&mut self, requested: Form) -> bool {
+        if self.hiragana.is_empty() {
+            return false;
+        }
+        let current = match self.phase {
+            Phase::Transliterated(form) => Some(form),
+            _ => None,
+        };
+        if current.is_none() {
+            self.base = match self.phase {
+                Phase::Converting { .. } | Phase::Reverted => Phase::Composing,
+                other => other,
+            };
+        }
+        let form = translit::next_form(current, requested);
+        self.translit = translit::render(form, &self.hiragana, &self.raw());
+        self.phase = Phase::Transliterated(form);
+        true
     }
 
     fn sync_hiragana(&mut self) {
@@ -235,7 +265,9 @@ impl<E: CandidateEngine> Composer<E> {
         } else {
             last.raw = last.kana.clone();
         }
-        if self.phase == Phase::Literal && !self.units.is_empty() {
+        let literal = self.phase == Phase::Literal
+            || (matches!(self.phase, Phase::Transliterated(_)) && self.base == Phase::Literal);
+        if literal && !self.units.is_empty() {
             self.sync_hiragana();
             self.reset_candidates();
         } else {
@@ -246,6 +278,9 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 最初の変換。保留中のリランキングを反映し、raw 候補を第 1 候補の直後に入れて先頭を選ぶ。
     pub fn begin_conversion(&mut self) -> bool {
+        if matches!(self.phase, Phase::Transliterated(_)) {
+            self.phase = self.base;
+        }
         if !matches!(
             self.phase,
             Phase::Composing | Phase::Reverted | Phase::Dangling
@@ -1132,5 +1167,83 @@ mod tests {
         assert_eq!(c.phase(), Phase::Dangling);
         assert!(!c.is_symbol());
         assert_eq!(c.commit(), "hello");
+    }
+
+    #[test]
+    fn 字種変換は組成全体を指定の字種で表示し_確定しても学習しない() {
+        let (mut c, log) = composer();
+        type_kyou(&mut c);
+        assert!(c.transliterate(Form::Katakana));
+        assert_eq!(c.phase(), Phase::Transliterated(Form::Katakana));
+        assert_eq!(c.display(), "キョウ");
+        assert!(c.transliterate(Form::FullAlnum(translit::Case::Lower)));
+        assert_eq!(c.display(), "ｋｙｏｕ");
+        assert_eq!(c.commit(), "ｋｙｏｕ");
+        assert!(log.selects.borrow().is_empty());
+        assert_eq!(c.phase(), Phase::Empty);
+    }
+
+    #[test]
+    fn 同じ英数キーを続けると大文字小文字を巡る() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        let half = Form::HalfAlnum(translit::Case::Lower);
+        assert!(c.transliterate(half));
+        assert_eq!(c.display(), "kyou");
+        assert!(c.transliterate(half));
+        assert_eq!(c.display(), "KYOU");
+        assert!(c.transliterate(half));
+        assert_eq!(c.display(), "Kyou");
+        assert!(c.transliterate(half));
+        assert_eq!(c.display(), "kyou");
+    }
+
+    #[test]
+    fn 末尾が変換しきれない組成のかな形は子音をそのまま残し_英数形は打鍵から作る() {
+        let (mut c, _) = composer();
+        c.push_input("e", "え", "");
+        c.push_input("n", "", "n");
+        c.push_input("n", "ん", "");
+        c.push_input("te", "て", "");
+        c.push_input("r", "", "r");
+        c.push_flush(Flush::Dangling("r".to_string()));
+        assert_eq!(c.phase(), Phase::Dangling);
+        c.transliterate(Form::Katakana);
+        assert_eq!(c.display(), "エンテr");
+        c.transliterate(Form::HalfKatakana);
+        assert_eq!(c.display(), "ｴﾝﾃr");
+        c.transliterate(Form::HalfAlnum(translit::Case::Lower));
+        assert_eq!(c.display(), "ennter");
+    }
+
+    #[test]
+    fn 字種変換のあとスペースで元のひらがなから通常変換に入る() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.transliterate(Form::Katakana);
+        assert!(c.begin_conversion());
+        assert!(matches!(c.phase(), Phase::Converting { selected: 0, .. }));
+        assert_eq!(c.display(), "今日");
+    }
+
+    #[test]
+    fn 字種変換のあとescでひらがなへ戻りbackspaceは1文字削る() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.transliterate(Form::Katakana);
+        c.revert();
+        assert_eq!(c.phase(), Phase::Reverted);
+        assert_eq!(c.display(), "きょう");
+        c.transliterate(Form::HalfKatakana);
+        assert!(c.backspace());
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.display(), "きょ");
+    }
+
+    #[test]
+    fn 空の組成は字種変換しない() {
+        let (mut c, _) = composer();
+        assert!(!c.transliterate(Form::Katakana));
+        assert_eq!(c.phase(), Phase::Empty);
     }
 }

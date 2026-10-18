@@ -81,21 +81,25 @@ pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
 const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
 pub const NS_EVENT_MASK_KEY_DOWN: usize = 1 << NS_EVENT_TYPE_KEY_DOWN;
 const SHIFT_MODIFIER: usize = 1 << 17;
-const SHORTCUT_MODIFIERS: usize = (1 << 18) | (1 << 19) | (1 << 20);
+const CONTROL_MODIFIER: usize = 1 << 18;
+const COMMAND_OR_OPTION_MODIFIERS: usize = (1 << 19) | (1 << 20);
 
 /// keyDown の NSEvent から取り出した値。
 pub struct KeyEvent {
     pub key_code: u16,
     pub characters: String,
-    /// Command / Control / Option のいずれかが押されている。
-    pub is_shortcut: bool,
+    /// Shift 以外の修飾キーを無視した文字 (Ctrl 押下中にどのキーかを読む)。
+    pub characters_ignoring_modifiers: String,
+    pub is_control: bool,
+    /// Command / Option のいずれかが押されている。
+    pub is_command_or_option: bool,
     pub is_shift: bool,
 }
 
 /// NSEvent が keyDown なら中身を返す。
 pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
     // SAFETY: event は IMK が handleEvent:client: に渡す NSEvent。type / modifierFlags は NSUInteger、keyCode は
-    // unsigned short を返し、characters は keyDown でのみ呼ぶ (NSString、nil 可)。
+    // unsigned short を返し、characters と charactersIgnoringModifiers は keyDown でのみ呼ぶ (NSString、nil 可)。
     unsafe {
         let event_type: usize = msg_send![event, type];
         if event_type != NS_EVENT_TYPE_KEY_DOWN {
@@ -104,10 +108,13 @@ pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
         let key_code: u16 = msg_send![event, keyCode];
         let modifiers: usize = msg_send![event, modifierFlags];
         let characters: Option<Id<NSString>> = msg_send_id![event, characters];
+        let bare: Option<Id<NSString>> = msg_send_id![event, charactersIgnoringModifiers];
         Some(KeyEvent {
             key_code,
             characters: characters.map(|s| s.to_string()).unwrap_or_default(),
-            is_shortcut: modifiers & SHORTCUT_MODIFIERS != 0,
+            characters_ignoring_modifiers: bare.map(|s| s.to_string()).unwrap_or_default(),
+            is_control: modifiers & CONTROL_MODIFIER != 0,
+            is_command_or_option: modifiers & COMMAND_OR_OPTION_MODIFIERS != 0,
             is_shift: modifiers & SHIFT_MODIFIER != 0,
         })
     }

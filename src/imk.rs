@@ -162,12 +162,24 @@ declare_class!(
             let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
                 return Bool::NO;
             };
-            if event.is_shortcut {
+            let translit = (!event.is_command_or_option)
+                .then(|| {
+                    keymap::translit_form(
+                        event.key_code,
+                        event.is_control,
+                        &event.characters_ignoring_modifiers,
+                    )
+                })
+                .flatten();
+            if translit.is_none() && (event.is_control || event.is_command_or_option) {
                 trace::record("handleEvent", "key=Shortcut action=PassThrough");
                 return Bool::NO;
             }
             let client = Client::new(client);
             *self.ivars().last_client.borrow_mut() = Some(client.clone());
+            if let Some(form) = translit {
+                return Bool::new(self.dispatch(Key::Translit(form), "", &client));
+            }
             let handled = match keymap::stroke(event.key_code, &event.characters, event.is_shift) {
                 Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
                     self.dispatch(*key, text, &client) || handled
@@ -287,7 +299,7 @@ declare_class!(
         #[method(commitComposition:)]
         fn commit_composition(&self, client: Option<&AnyObject>) {
             let client = client.map(Client::new);
-            self.flush_romaji();
+            self.flush_romaji(true);
             let is_empty = self.ivars().composer.borrow().is_empty();
             if let (Some(client), false) = (client, is_empty) {
                 let text = self.ivars().composer.borrow_mut().commit();
@@ -326,11 +338,11 @@ impl NovakeyRInputController {
     }
 
     /// 未変換のローマ字を確定かなとして composer へ流す。
-    fn flush_romaji(&self) {
+    fn flush_romaji(&self, rerank: bool) {
         let flush = self.ivars().converter.borrow_mut().flush();
         let ranks = matches!(flush, Flush::Kana(_));
         self.ivars().composer.borrow_mut().push_flush(flush);
-        if ranks {
+        if ranks && rerank {
             self.request_rerank(false);
         }
     }
@@ -393,9 +405,10 @@ impl NovakeyRInputController {
                 | Key::Enter
                 | Key::Control
                 | Key::Letter { upper: true }
+                | Key::Translit(_)
         );
         if flushes {
-            self.flush_romaji();
+            self.flush_romaji(!matches!(key, Key::Translit(_)));
         }
         let has_romaji = !self.ivars().converter.borrow().buffer().is_empty();
         match key {
@@ -499,6 +512,10 @@ impl NovakeyRInputController {
             Action::Revert => {
                 self.ivars().composer.borrow_mut().revert();
                 self.show_typing(client)
+            }
+            Action::Transliterate(form) => {
+                let changed = self.ivars().composer.borrow_mut().transliterate(form);
+                changed && self.show_typing(client)
             }
             Action::DeleteBack => {
                 let deleted = self.ivars().composer.borrow_mut().backspace();
