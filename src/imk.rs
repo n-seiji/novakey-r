@@ -101,6 +101,8 @@ pub struct Ivars {
     last_client: RefCell<Option<Client>>,
     /// show_selection がパネルを更新している間 true。パネルが同期で呼び戻す candidateSelectionChanged: を無視する。
     syncing: Cell<bool>,
+    /// 候補パネルがハイライトしている行。パネルの行番号 API は使えないので、こちらで追跡する。
+    panel_line: Cell<usize>,
 }
 
 declare_class!(
@@ -132,6 +134,7 @@ declare_class!(
                 controller_id,
                 last_client: RefCell::new(None),
                 syncing: Cell::new(false),
+                panel_line: Cell::new(0),
             });
             // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
             let this: Option<Id<Self>> = unsafe {
@@ -204,6 +207,9 @@ declare_class!(
                     .select_candidate_text(&text)
                     .then(|| composer.display().to_string())
             };
+            if let Phase::Converting { selected, .. } = self.phase() {
+                self.ivars().panel_line.set(selected);
+            }
             if let Some(marked) = marked {
                 client.set_marked(&marked);
             }
@@ -489,16 +495,18 @@ impl NovakeyRInputController {
         self.refresh_marked(client);
         // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、composer を再借用する。
         // ここでは借用を持っていない。
-        let selected = match self.phase() {
-            Phase::Converting { selected, .. } => Some(selected),
-            _ => None,
+        let Phase::Converting { selected, .. } = self.phase() else {
+            return true;
         };
         self.ivars().syncing.set(true);
-        platform::show_candidates();
-        if let Some(line) = selected {
-            platform::select_candidate(line);
+        if platform::show_candidates() {
+            self.ivars().panel_line.set(0);
         }
+        let delta = selected as isize - self.ivars().panel_line.get() as isize;
+        platform::move_candidate_highlight(delta);
+        self.ivars().panel_line.set(selected);
         self.ivars().syncing.set(false);
+        trace::record("select", &format!("line={selected} moved={delta}"));
         true
     }
 

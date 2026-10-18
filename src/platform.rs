@@ -168,21 +168,29 @@ fn make_panel(server: &IMKServer) -> Option<Id<AnyObject>> {
     }
 }
 
-/// 候補パネルを (必要なら生成して) 更新・表示する。サーバー未接続なら何もしない。
-pub fn show_candidates() {
+/// 候補パネルを (必要なら生成して) 表示する。非表示だったときだけ候補を読み直し、そのとき true を返す
+/// (読み直したパネルは先頭行を選んでいる)。サーバー未接続なら何もせず false。
+pub fn show_candidates() -> bool {
     CANDIDATES_PANEL.with(|cell| {
         if cell.borrow().is_none() {
             let panel = SERVER.with(|s| s.borrow().as_deref().and_then(make_panel));
             *cell.borrow_mut() = panel;
         }
-        if let Some(panel) = cell.borrow().as_deref() {
-            // SAFETY: panel は生成済みの IMKCandidates で、両セレクタとも引数の型が一致する。
-            unsafe {
-                let _: () = msg_send![panel, updateCandidates];
-                let _: () = msg_send![panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
+        let Some(panel) = cell.borrow().clone() else {
+            return false;
+        };
+        // SAFETY: panel は生成済みの IMKCandidates。isVisible は BOOL を返し、updateCandidates と show: は
+        // 引数の型が一致する。updateCandidates は candidates: を同期で呼び戻すので、借用を外してから呼ぶ。
+        unsafe {
+            let visible: Bool = msg_send![&*panel, isVisible];
+            if visible.as_bool() {
+                return false;
             }
+            let _: () = msg_send![&*panel, updateCandidates];
+            let _: () = msg_send![&*panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
         }
-    });
+        true
+    })
 }
 
 pub fn hide_candidates() {
@@ -196,17 +204,19 @@ pub fn hide_candidates() {
     });
 }
 
-/// 候補パネルのハイライトを line 行目 (0 始まり) に合わせる。パネル未生成なら何もしない。
-/// selectCandidateWithIdentifier: は candidateSelectionChanged: を同期で呼び戻すので、呼び出し側は借用を持たないこと。
-pub fn select_candidate(line: usize) {
-    let line = line as isize;
-    let panel = CANDIDATES_PANEL.with(|cell| cell.borrow().clone());
-    if let Some(panel) = panel {
-        // SAFETY: panel は生成済みの IMKCandidates。candidateIdentifierAtLineNumber: は NSInteger を取り NSInteger を返し、
-        // selectCandidateWithIdentifier: は NSInteger を取り BOOL を返す。
+/// 候補パネルのハイライトを delta 行動かす (正で下、負で上)。
+/// candidateIdentifierAtLineNumber: は常に 0 を返して selectCandidateWithIdentifier: が効かないため、
+/// パネルの moveDown: / moveUp: を使う。どちらも candidateSelectionChanged: を呼び戻しうるので、呼び出し側は借用を持たないこと。
+pub fn move_candidate_highlight(delta: isize) {
+    let Some(panel) = CANDIDATES_PANEL.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let action = if delta > 0 { sel!(moveDown:) } else { sel!(moveUp:) };
+    for _ in 0..delta.unsigned_abs() {
+        // SAFETY: panel は生成済みの IMKCandidates (NSResponder) で、moveDown: / moveUp: は sender (nil 可) を取る。
         unsafe {
-            let identifier: isize = msg_send![&*panel, candidateIdentifierAtLineNumber: line];
-            let _: Bool = msg_send![&*panel, selectCandidateWithIdentifier: identifier];
+            let _: *mut AnyObject =
+                msg_send![&*panel, performSelector: action, withObject: std::ptr::null::<AnyObject>()];
         }
     }
 }
