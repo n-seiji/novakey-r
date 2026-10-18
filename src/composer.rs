@@ -223,6 +223,18 @@ impl<E: CandidateEngine> Composer<E> {
         true
     }
 
+    /// 前の候補へ戻り(先頭なら末尾へ回り)、候補ウィンドウを出す状態にする。
+    pub fn retreat(&mut self) -> bool {
+        let Phase::Converting { selected, .. } = self.phase else {
+            return false;
+        };
+        self.phase = Phase::Converting {
+            selected: (selected + self.candidates.len() - 1) % self.candidates.len(),
+            window: true,
+        };
+        true
+    }
+
     pub fn select_candidate(&mut self, index: usize) -> bool {
         if index >= self.candidates.len() {
             return false;
@@ -460,6 +472,35 @@ mod tests {
         assert_eq!(c.display(), "教");
         c.advance();
         assert_eq!(c.display(), "今日");
+    }
+
+    #[test]
+    fn 戻りは候補を逆順に進め_先頭から末尾へwrapする() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        assert!(c.retreat());
+        assert_eq!(c.display(), "教");
+        assert_eq!(
+            c.phase(),
+            Phase::Converting {
+                selected: c.candidates().len() - 1,
+                window: true
+            }
+        );
+        assert!(c.advance());
+        assert_eq!(c.display(), "今日");
+        c.advance();
+        assert!(c.retreat());
+        assert_eq!(c.display(), "今日");
+    }
+
+    #[test]
+    fn 変換前は戻れない() {
+        let (mut c, _) = composer();
+        assert!(!c.retreat());
+        type_kyou(&mut c);
+        assert!(!c.retreat());
     }
 
     #[test]

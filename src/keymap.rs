@@ -16,6 +16,10 @@ pub enum Key {
     Enter,
     Escape,
     Backspace,
+    /// Tab など、上記以外の制御文字。
+    Control,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +37,15 @@ pub enum Action {
     TypeText,
     Convert,
     NextCandidate,
+    PrevCandidate,
     PickCandidate(u8),
     Commit,
     /// 確定してからスペースを入れる。
     CommitThenSpace,
     /// 確定してから入力された記号を ASCII のまま入れる。
     CommitThenInsert,
+    /// 確定してから、キーをアプリへ素通しする (Tab など)。
+    CommitThenPassThrough,
     Revert,
     DeleteBack,
 }
@@ -52,16 +59,21 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Empty, Letter { upper: true }) => StartLiteral,
         (P::Empty, Letter { upper: false }) => TypeRomaji,
         (P::Empty, Digit(_) | Punct | Hyphen | Symbol) => InsertDirect,
-        (P::Empty, Enter | Escape | Backspace) => PassThrough,
+        (P::Empty, Enter | Escape | Backspace | Control | Up | Down) => PassThrough,
 
         (P::Literal, Space) => CommitThenSpace,
         (P::Literal, Letter { .. } | Digit(_) | Hyphen | Symbol) => TypeLiteral,
         (P::Literal, Punct) => CommitThenInsert,
         (P::Literal, Enter) => Commit,
+        (P::Literal, Control) => CommitThenPassThrough,
+        (P::Literal, Up | Down) => PassThrough,
         (P::Literal, Escape) => Revert,
         (P::Literal, Backspace) => DeleteBack,
 
-        (P::Converting { .. }, Space) => NextCandidate,
+        (P::Converting { .. }, Space | Down) => NextCandidate,
+        (P::Converting { .. }, Up) => PrevCandidate,
+        (P::Composing | P::Reverted, Up | Down) => PassThrough,
+        (P::Composing | P::Reverted | P::Converting { .. }, Control) => CommitThenPassThrough,
         (P::Composing | P::Reverted, Space) => Convert,
         (P::Converting { window: true, .. }, Digit(n @ 1..=9)) => PickCandidate(n),
         (P::Composing | P::Reverted | P::Converting { .. }, Letter { .. }) => TypeRomaji,
@@ -79,6 +91,10 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
 /// 入力された 1 文字をキーに分類する。
 pub fn classify(ch: char) -> Key {
     match ch {
+        '\r' | '\n' => Key::Enter,
+        '\u{1b}' => Key::Escape,
+        '\u{8}' | '\u{7f}' => Key::Backspace,
+        c if c.is_control() => Key::Control,
         ' ' => Key::Space,
         '-' => Key::Hyphen,
         '.' | ',' | '!' | '?' | '[' | ']' => Key::Punct,
@@ -155,6 +171,26 @@ mod tests {
     }
 
     #[test]
+    fn tabなどの制御文字は未確定文があれば確定して素通し_無ければ素通し() {
+        for phase in [Phase::Composing, Phase::Reverted, Phase::Literal, CONVERTING, WINDOW] {
+            assert_eq!(action_for(phase, Control), CommitThenPassThrough);
+        }
+        assert_eq!(action_for(Phase::Empty, Control), PassThrough);
+    }
+
+    #[test]
+    fn 上下キーは変換中のみ候補移動_それ以外は素通し() {
+        assert_eq!(action_for(CONVERTING, Down), NextCandidate);
+        assert_eq!(action_for(WINDOW, Down), NextCandidate);
+        assert_eq!(action_for(CONVERTING, Up), PrevCandidate);
+        assert_eq!(action_for(WINDOW, Up), PrevCandidate);
+        for phase in [Phase::Empty, Phase::Composing, Phase::Reverted, Phase::Literal] {
+            assert_eq!(action_for(phase, Up), PassThrough);
+            assert_eq!(action_for(phase, Down), PassThrough);
+        }
+    }
+
+    #[test]
     fn escは一度だけ変換を戻し_戻した後は素通し() {
         assert_eq!(action_for(Phase::Composing, Escape), Revert);
         assert_eq!(action_for(WINDOW, Escape), Revert);
@@ -179,5 +215,16 @@ mod tests {
         assert_eq!(classify('-'), Hyphen);
         assert_eq!(classify('@'), Symbol);
         assert_eq!(classify('７'), Symbol);
+    }
+
+    #[test]
+    fn 制御文字はテキストではなくキーに分類する() {
+        assert_eq!(classify('\r'), Enter);
+        assert_eq!(classify('\n'), Enter);
+        assert_eq!(classify('\u{1b}'), Escape);
+        assert_eq!(classify('\u{8}'), Backspace);
+        assert_eq!(classify('\u{7f}'), Backspace);
+        assert_eq!(classify('\t'), Control);
+        assert_eq!(classify('\u{3}'), Control);
     }
 }

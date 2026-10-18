@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 
 use objc2::rc::{autoreleasepool, Allocated, Id};
-use objc2::runtime::{AnyObject, Bool};
+use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{class, extern_class, msg_send, msg_send_id, mutability, sel, ClassType};
 use objc2_foundation::{NSBundle, NSObject, NSString};
 
@@ -139,22 +139,59 @@ pub fn hide_candidates() {
     });
 }
 
-/// 入力メソッドのメニュー。warning があれば無効状態の注意項目を追加する。
-pub fn build_menu(mode_title: &str, warning: Option<&str>) -> Id<AnyObject> {
-    let title = NSString::from_str(mode_title);
+/// 候補パネルのハイライトを line 行目 (0 始まり) に合わせる。パネル未生成なら何もしない。
+/// selectCandidateWithIdentifier: は candidateSelectionChanged: を同期で呼び戻すので、呼び出し側は借用を持たないこと。
+pub fn select_candidate(line: usize) {
+    let line = line as isize;
+    let panel = CANDIDATES_PANEL.with(|cell| cell.borrow().clone());
+    if let Some(panel) = panel {
+        // SAFETY: panel は生成済みの IMKCandidates。candidateIdentifierAtLineNumber: は NSInteger を取り NSInteger を返し、
+        // selectCandidateWithIdentifier: は NSInteger を取り BOOL を返す。
+        unsafe {
+            let identifier: isize = msg_send![&*panel, candidateIdentifierAtLineNumber: line];
+            let _: Bool = msg_send![&*panel, selectCandidateWithIdentifier: identifier];
+        }
+    }
+}
+
+/// NSUserDefaults の真偽値。未設定なら false。
+pub fn defaults_bool(key: &str) -> bool {
+    let key = NSString::from_str(key);
+    // SAFETY: standardUserDefaults は NSUserDefaults を返し、boolForKey: は NSString を取り BOOL を返す。
+    unsafe {
+        let defaults: Id<AnyObject> = msg_send_id![class!(NSUserDefaults), standardUserDefaults];
+        let value: Bool = msg_send![&*defaults, boolForKey: &*key];
+        value.as_bool()
+    }
+}
+
+pub fn set_defaults_bool(key: &str, value: bool) {
+    let key = NSString::from_str(key);
+    // SAFETY: setBool:forKey: は (BOOL, NSString) を取り戻り値なし。
+    unsafe {
+        let defaults: Id<AnyObject> = msg_send_id![class!(NSUserDefaults), standardUserDefaults];
+        let _: () = msg_send![&*defaults, setBool: Bool::new(value), forKey: &*key];
+    }
+}
+
+/// 入力メソッドのメニュー。items は (タイトル, アクション)。warning があれば無効状態の注意項目を追加する。
+pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject> {
     let empty = NSString::from_str("");
     // SAFETY: NSMenu/NSMenuItem の標準的な生成と addItem:。各セレクタの引数型は宣言と一致し、
-    // toggleConversionMode: は NovakeyRInputController が実装する。
+    // アクションは NovakeyRInputController が実装する。
     unsafe {
         let menu: Id<AnyObject> = msg_send_id![class!(NSMenu), new];
-        let alloc: Allocated<AnyObject> = msg_send_id![class!(NSMenuItem), alloc];
-        let item: Id<AnyObject> = msg_send_id![
-            alloc,
-            initWithTitle: &*title,
-            action: sel!(toggleConversionMode:),
-            keyEquivalent: &*empty
-        ];
-        let _: () = msg_send![&*menu, addItem: &*item];
+        for (title, action) in items {
+            let title = NSString::from_str(title);
+            let alloc: Allocated<AnyObject> = msg_send_id![class!(NSMenuItem), alloc];
+            let item: Id<AnyObject> = msg_send_id![
+                alloc,
+                initWithTitle: &*title,
+                action: *action,
+                keyEquivalent: &*empty
+            ];
+            let _: () = msg_send![&*menu, addItem: &*item];
+        }
         if let Some(warning) = warning {
             let warn = NSString::from_str(warning);
             let warn_item: Id<AnyObject> = msg_send_id![class!(NSMenuItem), new];

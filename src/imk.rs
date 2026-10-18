@@ -42,7 +42,10 @@ thread_local! {
     static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
         RefCell::new(HashMap::new());
     static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static AI_RERANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
 
 fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
     CONTROLLERS.with(|c| {
@@ -55,12 +58,17 @@ fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &
 }
 
 pub fn init_llm_dispatch() {
+    AI_RERANK.with(|e| e.set(platform::defaults_bool(AI_RERANK_KEY)));
     llm_bridge::set_result_handler(dispatch_llm_result);
     let avail = llm_bridge::availability();
     if avail != llm_bridge::Availability::Available {
         LLM_ENABLED.with(|e| e.set(false));
         platform::log(&format!("LLM unavailable: {:?}", avail));
     }
+}
+
+fn ai_rerank_enabled() -> bool {
+    AI_RERANK.with(|e| e.get())
 }
 
 fn llm_enabled() -> bool {
@@ -158,6 +166,10 @@ declare_class!(
                 Key::Enter
             } else if selector == sel!(cancelOperation:) {
                 Key::Escape
+            } else if selector == sel!(moveDown:) {
+                Key::Down
+            } else if selector == sel!(moveUp:) {
+                Key::Up
             } else if selector == sel!(moveLeft:) || selector == sel!(moveRight:) {
                 let has_pending = !self.ivars().converter.borrow().buffer().is_empty()
                     || !self.ivars().composer.borrow().is_empty();
@@ -212,8 +224,27 @@ declare_class!(
                 ConversionMode::Live => "ライブ変換: オン",
                 ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
             };
-            let warning = (!llm_enabled()).then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
-            platform::build_menu(mode_title, warning)
+            let ai_title = if ai_rerank_enabled() {
+                "AI並べ替え: オン"
+            } else {
+                "AI並べ替え: オフ"
+            };
+            let warning = (ai_rerank_enabled() && !llm_enabled())
+                .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
+            platform::build_menu(
+                &[
+                    (mode_title, sel!(toggleConversionMode:)),
+                    (ai_title, sel!(toggleAIRerank:)),
+                ],
+                warning,
+            )
+        }
+
+        #[method(toggleAIRerank:)]
+        fn toggle_ai_rerank(&self, _sender: *mut AnyObject) {
+            let enabled = !ai_rerank_enabled();
+            AI_RERANK.with(|e| e.set(enabled));
+            platform::set_defaults_bool(AI_RERANK_KEY, enabled);
         }
 
         #[method(toggleConversionMode:)]
@@ -316,6 +347,7 @@ impl NovakeyRInputController {
                 | Key::Hyphen
                 | Key::Symbol
                 | Key::Enter
+                | Key::Control
                 | Key::Letter { upper: true }
         );
         if flushes {
@@ -386,11 +418,15 @@ impl NovakeyRInputController {
             }
             Action::NextCandidate => {
                 self.ivars().composer.borrow_mut().advance();
-                self.refresh_marked(client);
-                // IMKCandidates の updateCandidates は candidates: を同期で呼び戻し、composer を再借用する。
-                // ここでは借用を持っていない。
-                platform::show_candidates();
-                true
+                self.show_selection(client)
+            }
+            Action::PrevCandidate => {
+                self.ivars().composer.borrow_mut().retreat();
+                self.show_selection(client)
+            }
+            Action::CommitThenPassThrough => {
+                self.commit_and_insert(client, "");
+                false
             }
             Action::PickCandidate(number) => {
                 let picked = self
@@ -430,6 +466,22 @@ impl NovakeyRInputController {
         }
     }
 
+    /// 選択中の候補を表示し、候補ウィンドウを出してハイライトを合わせる。
+    fn show_selection(&self, client: &Client) -> bool {
+        self.refresh_marked(client);
+        // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、composer を再借用する。
+        // ここでは借用を持っていない。
+        platform::show_candidates();
+        let selected = match self.phase() {
+            Phase::Converting { selected, .. } => Some(selected),
+            _ => None,
+        };
+        if let Some(line) = selected {
+            platform::select_candidate(line);
+        }
+        true
+    }
+
     /// 入力途中の表示を更新して候補ウィンドウを閉じる。
     fn show_typing(&self, client: &Client) -> bool {
         self.refresh_marked(client);
@@ -450,7 +502,7 @@ impl NovakeyRInputController {
 
     /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
     fn request_rerank(&self, urgent: bool) {
-        if !llm_enabled() {
+        if !ai_rerank_enabled() || !llm_enabled() {
             return;
         }
         let Some(job) = self.rerank_job() else { return };
