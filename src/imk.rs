@@ -1,8 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use objc2::rc::{Allocated, Id};
-use objc2::runtime::{AnyObject, Bool, Sel};
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{
     declare_class, extern_class, msg_send_id, mutability, sel, ClassType, DeclaredClass,
 };
@@ -12,12 +12,13 @@ use rand::Rng;
 
 use crate::composer::{CandidateEngine, Composer, Phase};
 use crate::imk_client::Client;
-use crate::keymap::{self, Action, Key};
+use crate::keymap::{self, Action, Key, Stroke};
 use crate::kkc_bridge;
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
 use crate::romaji_converter::RomajiConverter;
+use crate::trace;
 
 pub struct KkcEngine {
     controller_id: u64,
@@ -98,6 +99,8 @@ pub struct Ivars {
     mode: RefCell<ConversionMode>,
     controller_id: u64,
     last_client: RefCell<Option<Client>>,
+    /// show_selection がパネルを更新している間 true。パネルが同期で呼び戻す candidateSelectionChanged: を無視する。
+    syncing: Cell<bool>,
 }
 
 declare_class!(
@@ -128,6 +131,7 @@ declare_class!(
                 mode: RefCell::new(ConversionMode::Space),
                 controller_id,
                 last_client: RefCell::new(None),
+                syncing: Cell::new(false),
             });
             // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
             let this: Option<Id<Self>> = unsafe {
@@ -139,45 +143,38 @@ declare_class!(
             this
         }
 
-        #[method(inputText:client:)]
-        fn input_text(&self, text: Option<&NSString>, client: Option<&AnyObject>) -> Bool {
-            let (Some(text), Some(client)) = (text, client) else {
-                return Bool::NO;
-            };
-            let client = Client::new(client);
-            *self.ivars().last_client.borrow_mut() = Some(client.clone());
-            let handled = text.to_string().chars().fold(false, |handled, ch| {
-                let key = keymap::classify(ch);
-                self.dispatch(key, &ch.to_string(), &client) || handled
-            });
-            Bool::new(handled)
+        #[method(recognizedEvents:)]
+        fn recognized_events(&self, _client: Option<&AnyObject>) -> usize {
+            platform::NS_EVENT_MASK_KEY_DOWN
         }
 
-        #[method(didCommandBySelector:client:)]
-        fn did_command_by_selector(&self, selector: Sel, client: Option<&AnyObject>) -> Bool {
-            let Some(client) = client.map(Client::new) else {
+        /// キー入力の唯一の入口。候補パネル表示中も先にここへ届く (make_panel 参照)。
+        #[method(handleEvent:client:)]
+        fn handle_event(&self, event: Option<&AnyObject>, client: Option<&AnyObject>) -> Bool {
+            let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
                 return Bool::NO;
             };
+            if event.is_shortcut {
+                trace::record("handleEvent", "key=Shortcut action=PassThrough");
+                return Bool::NO;
+            }
+            let client = Client::new(client);
             *self.ivars().last_client.borrow_mut() = Some(client.clone());
-
-            let key = if selector == sel!(deleteBackward:) {
-                Key::Backspace
-            } else if selector == sel!(insertNewline:) {
-                Key::Enter
-            } else if selector == sel!(cancelOperation:) {
-                Key::Escape
-            } else if selector == sel!(moveDown:) {
-                Key::Down
-            } else if selector == sel!(moveUp:) {
-                Key::Up
-            } else if selector == sel!(moveLeft:) || selector == sel!(moveRight:) {
-                let has_pending = !self.ivars().converter.borrow().buffer().is_empty()
-                    || !self.ivars().composer.borrow().is_empty();
-                return Bool::new(has_pending);
-            } else {
-                return Bool::NO;
+            let handled = match keymap::stroke(event.key_code, &event.characters) {
+                Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
+                    self.dispatch(*key, text, &client) || handled
+                }),
+                Stroke::Navigation => {
+                    let has_pending = !self.ivars().converter.borrow().buffer().is_empty()
+                        || !self.ivars().composer.borrow().is_empty();
+                    trace::record(
+                        "handleEvent",
+                        &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
+                    );
+                    has_pending
+                }
             };
-            Bool::new(self.dispatch(key, "", &client))
+            Bool::new(handled)
         }
 
         #[method_id(candidates:)]
@@ -193,10 +190,14 @@ declare_class!(
 
         #[method(candidateSelectionChanged:)]
         fn candidate_selection_changed(&self, candidate_string: Option<&AnyObject>) {
+            if self.ivars().syncing.get() {
+                return;
+            }
             let Some(client) = self.client() else { return };
-            let Some(text) = candidate_string.and_then(platform::attributed_text) else {
+            let Some(text) = candidate_string.and_then(platform::candidate_text) else {
                 return;
             };
+            trace::record("candidateSelectionChanged", &format!("phase={:?}", self.phase()));
             let marked = {
                 let mut composer = self.ivars().composer.borrow_mut();
                 composer
@@ -211,9 +212,10 @@ declare_class!(
         #[method(candidateSelected:)]
         fn candidate_selected(&self, candidate_string: Option<&AnyObject>) {
             let Some(client) = self.client() else { return };
-            let Some(text) = candidate_string.and_then(platform::attributed_text) else {
+            let Some(text) = candidate_string.and_then(platform::candidate_text) else {
                 return;
             };
+            trace::record("candidateSelected", &format!("phase={:?}", self.phase()));
             self.ivars().composer.borrow_mut().select_candidate_text(&text);
             self.commit_and_insert(&client, "");
         }
@@ -330,11 +332,27 @@ impl NovakeyRInputController {
 
     /// キー処理の入口。キーを動作表で解決して実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &Client) -> bool {
+        let phase = self.phase();
         if let Some(handled) = self.prepare(key, client) {
+            trace::record(
+                "handleEvent",
+                &format!("key={} phase={phase:?} action=Romaji handled={handled}", key.name()),
+            );
             return handled;
         }
-        let action = keymap::action_for(self.phase(), key);
-        self.perform(action, text, client)
+        let phase = self.phase();
+        let action = keymap::action_for(phase, key);
+        let handled = self.perform(action, text, client);
+        trace::record(
+            "handleEvent",
+            &format!(
+                "key={} phase={phase:?} action={} handled={handled} now={:?}",
+                key.name(),
+                action.name(),
+                self.phase()
+            ),
+        );
+        handled
     }
 
     /// 動作表に引く前の、ローマ字バッファ側の後始末。ここで処理が済んだら Some。
@@ -471,14 +489,16 @@ impl NovakeyRInputController {
         self.refresh_marked(client);
         // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、composer を再借用する。
         // ここでは借用を持っていない。
-        platform::show_candidates();
         let selected = match self.phase() {
             Phase::Converting { selected, .. } => Some(selected),
             _ => None,
         };
+        self.ivars().syncing.set(true);
+        platform::show_candidates();
         if let Some(line) = selected {
             platform::select_candidate(line);
         }
+        self.ivars().syncing.set(false);
         true
     }
 

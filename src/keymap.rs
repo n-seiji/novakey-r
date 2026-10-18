@@ -88,6 +88,89 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
     }
 }
 
+/// 物理キー 1 打鍵の解釈。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stroke {
+    /// 動作表で引くキーと、その入力文字 (特殊キーは空)。
+    Keys(Vec<(Key, String)>),
+    /// ←→ や機能キー。未確定文があれば握りつぶし、無ければアプリへ素通しする。
+    Navigation,
+}
+
+/// keyCode と characters から打鍵を解釈する。特殊キーは keyCode で、それ以外は文字で分類する。
+pub fn stroke(key_code: u16, characters: &str) -> Stroke {
+    let special = match key_code {
+        36 | 76 => Some(Key::Enter),
+        53 => Some(Key::Escape),
+        51 => Some(Key::Backspace),
+        48 => Some(Key::Control),
+        49 => Some(Key::Space),
+        125 => Some(Key::Down),
+        126 => Some(Key::Up),
+        123 | 124 => return Stroke::Navigation,
+        _ => None,
+    };
+    if let Some(key) = special {
+        return Stroke::Keys(vec![(key, String::new())]);
+    }
+    let is_function_key = |c: char| ('\u{F700}'..='\u{F8FF}').contains(&c);
+    if characters.is_empty() || characters.chars().any(is_function_key) {
+        return Stroke::Navigation;
+    }
+    Stroke::Keys(
+        characters
+            .chars()
+            .map(|ch| (classify(ch), ch.to_string()))
+            .collect(),
+    )
+}
+
+impl Key {
+    /// トレース用の名前。入力文字 (Digit の数字など) を含めない。
+    pub fn name(self) -> &'static str {
+        match self {
+            Key::Space => "Space",
+            Key::Digit(_) => "Digit",
+            Key::Letter { upper: true } => "Letter(upper)",
+            Key::Letter { upper: false } => "Letter",
+            Key::Punct => "Punct",
+            Key::Hyphen => "Hyphen",
+            Key::Symbol => "Symbol",
+            Key::Enter => "Enter",
+            Key::Escape => "Escape",
+            Key::Backspace => "Backspace",
+            Key::Control => "Control",
+            Key::Up => "Up",
+            Key::Down => "Down",
+        }
+    }
+}
+
+impl Action {
+    /// トレース用の名前。候補番号など打鍵に由来する値を含めない。
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::PassThrough => "PassThrough",
+            Action::InsertSpace => "InsertSpace",
+            Action::InsertDirect => "InsertDirect",
+            Action::TypeRomaji => "TypeRomaji",
+            Action::StartLiteral => "StartLiteral",
+            Action::TypeLiteral => "TypeLiteral",
+            Action::TypeText => "TypeText",
+            Action::Convert => "Convert",
+            Action::NextCandidate => "NextCandidate",
+            Action::PrevCandidate => "PrevCandidate",
+            Action::PickCandidate(_) => "PickCandidate",
+            Action::Commit => "Commit",
+            Action::CommitThenSpace => "CommitThenSpace",
+            Action::CommitThenInsert => "CommitThenInsert",
+            Action::CommitThenPassThrough => "CommitThenPassThrough",
+            Action::Revert => "Revert",
+            Action::DeleteBack => "DeleteBack",
+        }
+    }
+}
+
 /// 入力された 1 文字をキーに分類する。
 pub fn classify(ch: char) -> Key {
     match ch {
@@ -226,5 +309,33 @@ mod tests {
         assert_eq!(classify('\u{7f}'), Backspace);
         assert_eq!(classify('\t'), Control);
         assert_eq!(classify('\u{3}'), Control);
+    }
+
+    #[test]
+    fn 特殊キーはkeycodeで_それ以外は文字で解釈する() {
+        assert_eq!(stroke(49, " "), Stroke::Keys(vec![(Space, String::new())]));
+        assert_eq!(stroke(36, "\r"), Stroke::Keys(vec![(Enter, String::new())]));
+        assert_eq!(stroke(76, "\u{3}"), Stroke::Keys(vec![(Enter, String::new())]));
+        assert_eq!(stroke(125, "\u{F701}"), Stroke::Keys(vec![(Down, String::new())]));
+        assert_eq!(stroke(126, "\u{F700}"), Stroke::Keys(vec![(Up, String::new())]));
+        assert_eq!(stroke(51, "\u{7f}"), Stroke::Keys(vec![(Backspace, String::new())]));
+        assert_eq!(stroke(48, "\t"), Stroke::Keys(vec![(Control, String::new())]));
+        assert_eq!(stroke(53, "\u{1b}"), Stroke::Keys(vec![(Escape, String::new())]));
+        assert_eq!(stroke(0, "A"), Stroke::Keys(vec![(Letter { upper: true }, "A".to_string())]));
+        assert_eq!(stroke(18, "1"), Stroke::Keys(vec![(Digit(1), "1".to_string())]));
+    }
+
+    #[test]
+    fn 左右キーと機能キーと文字なしの打鍵は移動扱い() {
+        assert_eq!(stroke(123, "\u{F702}"), Stroke::Navigation);
+        assert_eq!(stroke(124, "\u{F703}"), Stroke::Navigation);
+        assert_eq!(stroke(117, "\u{F728}"), Stroke::Navigation);
+        assert_eq!(stroke(104, ""), Stroke::Navigation);
+    }
+
+    #[test]
+    fn トレース用の名前は入力文字を含まない() {
+        assert_eq!(Digit(7).name(), "Digit");
+        assert_eq!(PickCandidate(7).name(), "PickCandidate");
     }
 }

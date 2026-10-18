@@ -7,7 +7,9 @@ use objc2::{class, extern_class, msg_send, msg_send_id, mutability, sel, ClassTy
 use objc2_foundation::{NSBundle, NSObject, NSString};
 
 #[link(name = "InputMethodKit", kind = "framework")]
-extern "C" {}
+extern "C" {
+    static IMKCandidatesSendServerKeyEventFirst: &'static NSString;
+}
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
@@ -59,11 +61,53 @@ pub fn is_secure_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() }
 }
 
-/// NSAttributedString (候補パネルが渡す引数) の文字列部分を取り出す。
-pub fn attributed_text(attributed: &AnyObject) -> Option<String> {
-    // SAFETY: IMK の候補コールバックは NSAttributedString を渡し、`string` は NSString を返す。
-    let string: Option<Id<NSString>> = unsafe { msg_send_id![attributed, string] };
-    string.map(|s| s.to_string())
+/// 候補パネルが渡す候補 (NSString か NSAttributedString) の文字列。どちらでもなければ None。
+pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
+    // SAFETY: isKindOfClass: は Class を取り BOOL を返す。NSAttributedString の `string` は NSString を返し、
+    // NSString と判定できたオブジェクトは NSString として参照してよい。
+    unsafe {
+        let attributed: Bool = msg_send![candidate, isKindOfClass: class!(NSAttributedString)];
+        if attributed.as_bool() {
+            let string: Option<Id<NSString>> = msg_send_id![candidate, string];
+            return string.map(|s| s.to_string());
+        }
+        let plain: Bool = msg_send![candidate, isKindOfClass: class!(NSString)];
+        plain
+            .as_bool()
+            .then(|| (*(candidate as *const AnyObject as *const NSString)).to_string())
+    }
+}
+
+const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
+pub const NS_EVENT_MASK_KEY_DOWN: usize = 1 << NS_EVENT_TYPE_KEY_DOWN;
+const SHORTCUT_MODIFIERS: usize = (1 << 18) | (1 << 19) | (1 << 20);
+
+/// keyDown の NSEvent から取り出した値。
+pub struct KeyEvent {
+    pub key_code: u16,
+    pub characters: String,
+    /// Command / Control / Option のいずれかが押されている。
+    pub is_shortcut: bool,
+}
+
+/// NSEvent が keyDown なら中身を返す。
+pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
+    // SAFETY: event は IMK が handleEvent:client: に渡す NSEvent。type / modifierFlags は NSUInteger、keyCode は
+    // unsigned short を返し、characters は keyDown でのみ呼ぶ (NSString、nil 可)。
+    unsafe {
+        let event_type: usize = msg_send![event, type];
+        if event_type != NS_EVENT_TYPE_KEY_DOWN {
+            return None;
+        }
+        let key_code: u16 = msg_send![event, keyCode];
+        let modifiers: usize = msg_send![event, modifierFlags];
+        let characters: Option<Id<NSString>> = msg_send_id![event, characters];
+        Some(KeyEvent {
+            key_code,
+            characters: characters.map(|s| s.to_string()).unwrap_or_default(),
+            is_shortcut: modifiers & SHORTCUT_MODIFIERS != 0,
+        })
+    }
 }
 
 /// 入力メソッドサーバーを起動し、メインの run loop に入る。戻らない想定。
@@ -103,11 +147,24 @@ fn connect_imkserver(name: &NSString, bundle_id: Option<&NSString>) {
     log("IMKServer connection established");
 }
 
+/// 候補パネルを作る。キー入力は先に入力コントローラへ届くようにし、パネルは表示専用にする
+/// (既定ではパネルが先にキーを受け取り、handleEvent:client: が呼ばれない)。
 fn make_panel(server: &IMKServer) -> Option<Id<AnyObject>> {
-    // SAFETY: IMKCandidates の initWithServer:panelType: は IMKServer と NSUInteger を取る。
+    // SAFETY: IMKCandidates の initWithServer:panelType: は IMKServer と NSUInteger を取る。setAttributes: は
+    // NSDictionary を取り、IMKCandidatesSendServerKeyEventFirst は InputMethodKit が公開する NSString 定数。
     unsafe {
         let alloc: Allocated<AnyObject> = msg_send_id![class!(IMKCandidates), alloc];
-        msg_send_id![alloc, initWithServer: server, panelType: K_IMK_SINGLE_COLUMN_SCROLLING_PANEL]
+        let panel: Option<Id<AnyObject>> =
+            msg_send_id![alloc, initWithServer: server, panelType: K_IMK_SINGLE_COLUMN_SCROLLING_PANEL];
+        let panel = panel?;
+        let yes: Id<AnyObject> = msg_send_id![class!(NSNumber), numberWithBool: Bool::YES];
+        let attributes: Id<AnyObject> = msg_send_id![
+            class!(NSDictionary),
+            dictionaryWithObject: &*yes,
+            forKey: IMKCandidatesSendServerKeyEventFirst
+        ];
+        let _: () = msg_send![&*panel, setAttributes: &*attributes];
+        Some(panel)
     }
 }
 

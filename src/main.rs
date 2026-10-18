@@ -7,6 +7,7 @@ mod llm_bridge;
 mod outbound;
 mod platform;
 mod romaji_converter;
+mod trace;
 
 fn main() {
     if std::env::args().any(|a| a == "--test-kkc") {
