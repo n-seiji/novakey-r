@@ -18,6 +18,7 @@ use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
 use crate::romaji_converter::{Flush, RomajiConverter};
+use crate::symbols;
 use crate::trace;
 
 pub struct KkcEngine {
@@ -386,6 +387,7 @@ impl NovakeyRInputController {
                 | Key::ShiftSpace
                 | Key::Digit(_)
                 | Key::Punct
+                | Key::Mark
                 | Key::Hyphen
                 | Key::Symbol
                 | Key::Enter
@@ -423,9 +425,7 @@ impl NovakeyRInputController {
                 client.insert(" ");
                 true
             }
-            Action::InsertDirect => japanese_punctuation(text)
-                .map(str::to_string)
-                .or_else(|| playful_convert(text))
+            Action::InsertDirect => playful_convert(text)
                 .map(|converted| client.insert(&converted))
                 .is_some(),
             Action::TypeRomaji => {
@@ -446,7 +446,7 @@ impl NovakeyRInputController {
                 self.show_typing(client)
             }
             Action::TypeText => {
-                self.push_input(text, japanese_punctuation(text).unwrap_or(text));
+                self.push_input(text, symbols::default_form(text).unwrap_or(text));
                 self.show_typing(client)
             }
             Action::Convert => {
@@ -540,7 +540,9 @@ impl NovakeyRInputController {
 
     fn rerank_job(&self) -> Option<RerankJob> {
         let composer = self.ivars().composer.borrow();
-        (composer.phase() == Phase::Composing && composer.candidates().len() >= 2).then(|| {
+        (composer.phase() == Phase::Composing
+            && !composer.is_symbol()
+            && composer.candidates().len() >= 2).then(|| {
             RerankJob {
                 generation: composer.current_generation(),
                 hiragana: composer.display_hiragana().to_string(),
@@ -645,23 +647,9 @@ fn playful_convert(text: &str) -> Option<String> {
     Some(list[i].to_string())
 }
 
-/// IME で直接入力した ASCII 句読点を、日本語入力用の表記へ正規化する。
-fn japanese_punctuation(text: &str) -> Option<&'static str> {
-    match text {
-        "." => Some("。"),
-        "," => Some("、"),
-        "-" => Some("ー"),
-        "!" => Some("！"),
-        "?" => Some("？"),
-        "[" => Some("「"),
-        "]" => Some("」"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{japanese_punctuation, rerank_allowed};
+    use super::rerank_allowed;
 
     #[test]
     fn rerank_never_runs_when_ai_toggle_is_off() {
@@ -673,17 +661,5 @@ mod tests {
     fn rerank_is_blocked_when_credentials_are_missing() {
         assert!(!rerank_allowed(true, true));
         assert!(rerank_allowed(true, false));
-    }
-
-    #[test]
-    fn converts_ascii_punctuation_to_japanese_forms() {
-        assert_eq!(japanese_punctuation("."), Some("。"));
-        assert_eq!(japanese_punctuation(","), Some("、"));
-        assert_eq!(japanese_punctuation("-"), Some("ー"));
-        assert_eq!(japanese_punctuation("!"), Some("！"));
-        assert_eq!(japanese_punctuation("?"), Some("？"));
-        assert_eq!(japanese_punctuation("["), Some("「"));
-        assert_eq!(japanese_punctuation("]"), Some("」"));
-        assert_eq!(japanese_punctuation("a"), None);
     }
 }

@@ -5,6 +5,7 @@
 // ローマ字そのまま(raw)の候補は engine_index を持たず、確定しても学習しない。
 
 use crate::romaji_converter::Flush;
+use crate::symbols;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -130,6 +131,16 @@ impl<E: CandidateEngine> Composer<E> {
             return;
         }
         self.phase = Phase::Composing;
+        if let Some(forms) = self.symbol_variants() {
+            self.candidates = forms
+                .iter()
+                .map(|form| Candidate {
+                    text: (*form).to_string(),
+                    engine_index: None,
+                })
+                .collect();
+            return;
+        }
         let texts = self.engine.convert(self.generation, &self.hiragana);
         for (engine_index, text) in texts.into_iter().enumerate() {
             if !self.candidates.iter().any(|c| c.text == text) {
@@ -139,6 +150,19 @@ impl<E: CandidateEngine> Composer<E> {
                 });
             }
         }
+    }
+
+    /// 組成全体が記号 1 つだけのときの異体候補。かなと混ざれば None(辞書変換に任せる)。
+    fn symbol_variants(&self) -> Option<&'static [&'static str]> {
+        match self.units.as_slice() {
+            [_] => symbols::variants(&self.hiragana),
+            _ => None,
+        }
+    }
+
+    /// 組成全体が記号 1 つだけか。LLM の並べ替えや学習の対象にしない。
+    pub fn is_symbol(&self) -> bool {
+        self.symbol_variants().is_some()
     }
 
     /// ローマ字バッファの確定結果を取り込む。Dangling なら局面を Dangling にする。
@@ -370,7 +394,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     fn insert_raw_candidate(&mut self) {
         let raw = self.raw();
-        if raw.is_empty() || self.candidates.iter().any(|c| c.text == raw) {
+        if raw.is_empty() || self.is_symbol() || self.candidates.iter().any(|c| c.text == raw) {
             return;
         }
         let position = match self.phase {
@@ -1006,5 +1030,107 @@ mod tests {
         c.push_flush(conv.flush());
         assert_eq!(c.phase(), Phase::Dangling);
         assert_eq!(c.commit(), "enter");
+    }
+
+    fn type_symbol(c: &mut Composer<MockEngine>, ascii: &str) {
+        let form = crate::symbols::default_form(ascii).unwrap_or(ascii);
+        c.push_input(ascii, form, "");
+    }
+
+    #[test]
+    fn 記号1つの組成は既定の和文表記を表示し_enterでそのまま確定する() {
+        let (mut c, log) = composer();
+        type_symbol(&mut c, "[");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.display(), "「");
+        assert!(log.converts.borrow().is_empty());
+        assert_eq!(c.commit(), "「");
+        assert!(log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn 記号だけの変換は異体の表から候補を出し_rawは足さず_学習もしない() {
+        let (mut c, log) = composer();
+        type_symbol(&mut c, "[");
+        assert!(c.is_symbol());
+        assert!(c.begin_conversion());
+        assert_eq!(
+            texts(&c),
+            vec!["「", "『", "【", "〔", "［", "〈", "《", "(", "（", "｢"]
+        );
+        assert!(c.advance());
+        assert_eq!(c.display(), "『");
+        assert_eq!(c.commit(), "『");
+        assert!(log.selects.borrow().is_empty());
+        assert_eq!(*c.engine_cancels(), 1);
+    }
+
+    #[test]
+    fn 記号の候補は戻りと番号選択でも選べる() {
+        let (mut c, _) = composer();
+        type_symbol(&mut c, ".");
+        c.begin_conversion();
+        assert!(c.retreat());
+        assert_eq!(c.display(), ".");
+        assert!(c.select_candidate(1));
+        assert_eq!(c.commit(), "．");
+    }
+
+    #[test]
+    fn 記号の後にローマ字を続けると辞書変換の組成になる() {
+        let (mut c, log) = composer();
+        let mut conv = RomajiConverter::new();
+        type_symbol(&mut c, "[");
+        type_word(&mut c, &mut conv, "kagi");
+        type_symbol(&mut c, "]");
+        assert_eq!(c.display_hiragana(), "「かぎ」");
+        assert!(!c.is_symbol());
+        assert_eq!(c.raw(), "[kagi]");
+        assert_eq!(log.converts.borrow().last().map(|(_, h)| h.as_str()), Some("「かぎ」"));
+        assert!(c.begin_conversion());
+        assert_eq!(c.candidates()[0].text, "「かぎ」K1");
+        assert_eq!(texts(&c)[1], "[kagi]");
+    }
+
+    #[test]
+    fn 記号の直後の1文字だけのローマ字でも組成が続く() {
+        let (mut c, _) = composer();
+        let mut conv = RomajiConverter::new();
+        type_symbol(&mut c, "(");
+        type_word(&mut c, &mut conv, "a");
+        c.push_flush(conv.flush());
+        assert_eq!(c.display_hiragana(), "（あ");
+        assert_eq!(c.commit(), "（あ");
+    }
+
+    #[test]
+    fn 記号を並べた組成は辞書変換に任せる() {
+        let (mut c, _) = composer();
+        type_symbol(&mut c, "[");
+        type_symbol(&mut c, "]");
+        assert!(!c.is_symbol());
+        assert_eq!(c.display_hiragana(), "「」");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c)[0], "「」K1");
+    }
+
+    #[test]
+    fn かなを消して記号だけに戻ると異体の表に戻る() {
+        let (mut c, _) = composer();
+        type_symbol(&mut c, "[");
+        c.push_input("a", "あ", "");
+        assert!(!c.is_symbol());
+        assert!(c.backspace());
+        assert!(c.is_symbol());
+        assert!(c.backspace());
+        assert_eq!(c.phase(), Phase::Empty);
+    }
+
+    #[test]
+    fn 記号は英単語入力の英字とは混ざらない() {
+        let mut c = typed_and_flushed("hello");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert!(!c.is_symbol());
+        assert_eq!(c.commit(), "hello");
     }
 }

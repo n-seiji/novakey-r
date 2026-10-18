@@ -7,6 +7,7 @@ mod llm_bridge;
 mod outbound;
 mod platform;
 mod romaji_converter;
+mod symbols;
 mod trace;
 
 fn main() {

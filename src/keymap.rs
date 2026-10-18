@@ -13,6 +13,8 @@ pub enum Key {
     Letter { upper: bool },
     /// 日本語入力では句読点などに置き換わる記号 (. , ! ? [ ])。
     Punct,
+    /// 和文の記号に置き換わり、スペースで異体を選べる記号 (( ) ~ / { } : ;)。
+    Mark,
     Hyphen,
     Symbol,
     Enter,
@@ -60,11 +62,12 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Empty, Space | ShiftSpace) => InsertSpace,
         (P::Empty, Letter { upper: true }) => StartLiteral,
         (P::Empty, Letter { upper: false }) => TypeRomaji,
-        (P::Empty, Digit(_) | Punct | Hyphen | Symbol) => InsertDirect,
+        (P::Empty, Punct | Mark | Hyphen) => TypeText,
+        (P::Empty, Digit(_) | Symbol) => InsertDirect,
         (P::Empty, Enter | Escape | Backspace | Control | Up | Down) => PassThrough,
 
         (P::Literal, Space | ShiftSpace) => CommitThenSpace,
-        (P::Literal, Letter { .. } | Digit(_) | Hyphen | Symbol) => TypeLiteral,
+        (P::Literal, Letter { .. } | Digit(_) | Hyphen | Mark | Symbol) => TypeLiteral,
         (P::Literal, Punct) => CommitThenInsert,
         (P::Literal, Enter) => Commit,
         (P::Literal, Control) => CommitThenPassThrough,
@@ -77,7 +80,7 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Dangling, Control) => CommitThenPassThrough,
         (P::Dangling, Up | Down) => PassThrough,
         (P::Dangling, Letter { .. }) => TypeRomaji,
-        (P::Dangling, Digit(_) | Punct | Hyphen | Symbol) => CommitThenInsert,
+        (P::Dangling, Digit(_) | Punct | Mark | Hyphen | Symbol) => CommitThenInsert,
         (P::Dangling, Escape) => Revert,
         (P::Dangling, Backspace) => DeleteBack,
 
@@ -90,7 +93,7 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Composing | P::Reverted | P::Converting { .. }, Letter { .. }) => TypeRomaji,
         (
             P::Composing | P::Reverted | P::Converting { .. },
-            Digit(_) | Punct | Hyphen | Symbol,
+            Digit(_) | Punct | Mark | Hyphen | Symbol,
         ) => TypeText,
         (P::Composing | P::Reverted | P::Converting { .. }, Enter) => Commit,
         (P::Reverted, Escape) => PassThrough,
@@ -147,6 +150,7 @@ impl Key {
             Key::Letter { upper: true } => "Letter(upper)",
             Key::Letter { upper: false } => "Letter",
             Key::Punct => "Punct",
+            Key::Mark => "Mark",
             Key::Hyphen => "Hyphen",
             Key::Symbol => "Symbol",
             Key::Enter => "Enter",
@@ -194,6 +198,7 @@ pub fn classify(ch: char) -> Key {
         ' ' => Key::Space,
         '-' => Key::Hyphen,
         '.' | ',' | '!' | '?' | '[' | ']' => Key::Punct,
+        '(' | ')' | '~' | '/' | '{' | '}' | ':' | ';' => Key::Mark,
         c if c.is_ascii_alphabetic() => Key::Letter {
             upper: c.is_ascii_uppercase(),
         },
@@ -257,6 +262,26 @@ mod tests {
         assert_eq!(action_for(CONVERTING, Digit(3)), TypeText);
         assert_eq!(action_for(Phase::Composing, Digit(3)), TypeText);
         assert_eq!(action_for(Phase::Empty, Digit(3)), InsertDirect);
+    }
+
+    #[test]
+    fn 未確定文が無いとき記号は組成を始め_数字と他の記号は直接入力() {
+        for key in [Punct, Mark, Hyphen] {
+            assert_eq!(action_for(Phase::Empty, key), TypeText);
+        }
+        assert_eq!(action_for(Phase::Empty, Digit(0)), InsertDirect);
+        assert_eq!(action_for(Phase::Empty, Symbol), InsertDirect);
+    }
+
+    #[test]
+    fn 記号の続きは組成に加え_英単語入力中はasciiのまま() {
+        for phase in [Phase::Composing, Phase::Reverted, CONVERTING, WINDOW] {
+            assert_eq!(action_for(phase, Mark), TypeText);
+            assert_eq!(action_for(phase, Punct), TypeText);
+        }
+        assert_eq!(action_for(Phase::Literal, Mark), TypeLiteral);
+        assert_eq!(action_for(Phase::Literal, Punct), CommitThenInsert);
+        assert_eq!(action_for(Phase::Dangling, Mark), CommitThenInsert);
     }
 
     #[test]
@@ -327,6 +352,9 @@ mod tests {
         assert_eq!(classify('A'), Letter { upper: true });
         assert_eq!(classify('.'), Punct);
         assert_eq!(classify('-'), Hyphen);
+        for ch in "()~/{}:;".chars() {
+            assert_eq!(classify(ch), Mark, "{ch}");
+        }
         assert_eq!(classify('@'), Symbol);
         assert_eq!(classify('７'), Symbol);
     }
