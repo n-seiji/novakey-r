@@ -155,13 +155,14 @@ declare_class!(
                     }
                     return Bool::NO;
                 }
-                if composer.cycle() {
-                    let marked = composer.display().to_string();
-                    client.set_marked(&marked);
-                    self.update_candidates_window(&composer);
-                } else {
-                    let marked = composer.display().to_string();
-                    client.set_marked(&marked);
+                let cycled = composer.cycle();
+                let marked = composer.display().to_string();
+                let has_candidates = !composer.candidates().is_empty();
+                // IMKCandidates の updateCandidates は candidates: を同期で呼び戻し、composer を再借用する。
+                drop(composer);
+                client.set_marked(&marked);
+                if cycled && has_candidates {
+                    platform::show_candidates();
                 }
                 return Bool::YES;
             }
@@ -442,11 +443,6 @@ impl NovakeyRInputController {
         }
     }
 
-    fn update_candidates_window(&self, composer: &Composer<KkcEngine>) {
-        if !composer.candidates().is_empty() {
-            platform::show_candidates();
-        }
-    }
 
     fn hide_candidates_window(&self) {
         platform::hide_candidates();
