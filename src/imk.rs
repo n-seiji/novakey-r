@@ -450,10 +450,13 @@ impl NovakeyRInputController {
             return;
         }
         let candidates: Vec<String> = composer.candidates().iter().map(|c| c.text.clone()).collect();
+        let client = *self.ivars().last_client.borrow();
+        let context = unsafe { preceding_context(client) };
         llm_bridge::rerank_async(
             self.ivars().controller_id,
             composer.current_generation(),
             composer.display_hiragana(),
+            &context,
             &candidates,
         );
     }
@@ -538,6 +541,39 @@ unsafe fn candidates_panel() -> *mut AnyObject {
         cell.set(panel);
         panel
     })
+}
+
+const CONTEXT_MAX_UTF16: usize = 200;
+
+/// マーク範囲(なければ選択範囲)の直前のテキストを最大200文字返す。取れなければ空。
+unsafe fn preceding_context(client: *mut AnyObject) -> String {
+    if client.is_null() {
+        return String::new();
+    }
+    let marked: NSRange = msg_send![client, markedRange];
+    let anchor = if marked.location != NSNotFound as usize {
+        marked.location
+    } else {
+        let selected: NSRange = msg_send![client, selectedRange];
+        if selected.location == NSNotFound as usize {
+            return String::new();
+        }
+        selected.location
+    };
+    let start = anchor.saturating_sub(CONTEXT_MAX_UTF16);
+    if anchor == start {
+        return String::new();
+    }
+    let range = NSRange { location: start, length: anchor - start };
+    let attributed: *mut AnyObject = msg_send![client, attributedSubstringFromRange: range];
+    if attributed.is_null() {
+        return String::new();
+    }
+    let string: *mut NSString = msg_send![attributed, string];
+    if string.is_null() {
+        return String::new();
+    }
+    (*string).to_string()
 }
 
 unsafe fn insert_str(client: *mut AnyObject, text: &str) {

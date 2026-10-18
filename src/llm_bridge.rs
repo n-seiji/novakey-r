@@ -22,6 +22,8 @@ extern "C" {
         reading_len: usize,
         cands_ptr: *const u8,
         cands_len: usize,
+        ctx_ptr: *const u8,
+        ctx_len: usize,
     );
 }
 
@@ -33,7 +35,7 @@ pub fn availability() -> Availability {
     }
 }
 
-pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, candidates: &[String]) {
+pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, context: &str, candidates: &[String]) {
     if candidates.len() < 2 {
         return;
     }
@@ -46,6 +48,8 @@ pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, candidat
             reading.len(),
             joined.as_ptr(),
             joined.len(),
+            context.as_ptr(),
+            context.len(),
         );
     }
 }
@@ -101,7 +105,7 @@ pub fn smoke_test() {
         "今日歯医者に行く".to_string(),
     ];
     let _ = SMOKE_START.set(std::time::Instant::now());
-    rerank_async(0, 0, "きょうはいしゃにいく", &candidates);
+    rerank_async(0, 0, "きょうはいしゃにいく", "", &candidates);
     unsafe {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};

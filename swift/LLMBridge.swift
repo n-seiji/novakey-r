@@ -105,12 +105,14 @@ private func deliver(_ id: UInt64, _ gen: UInt64, _ status: Int32, _ text: Strin
     }
 }
 
-private func buildRequest(_ creds: Credentials, reading: String, candidates: [String]) throws -> URLRequest {
+private func buildRequest(_ creds: Credentials, context: String, reading: String, candidates: [String]) throws -> URLRequest {
     var criteria: [String: String] = [:]
     for (i, c) in candidates.enumerated() { criteria[String(i)] = c }
+    var state: [String: String] = ["reading": reading]
+    if !context.isEmpty { state["context"] = context }
     let body: [String: Any] = [
         "model": "clef-flash",
-        "state": ["reading": reading],
+        "state": state,
         "questions": [
             "rank": [
                 "type": "choice",
@@ -128,8 +130,8 @@ private func buildRequest(_ creds: Credentials, reading: String, candidates: [St
     return request
 }
 
-private func fetchChoice(_ creds: Credentials, reading: String, candidates: [String]) async throws -> Int {
-    let request = try buildRequest(creds, reading: reading, candidates: candidates)
+private func fetchChoice(_ creds: Credentials, context: String, reading: String, candidates: [String]) async throws -> Int {
+    let request = try buildRequest(creds, context: context, reading: reading, candidates: candidates)
     let (data, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
         throw RerankFailure.invalidResponse
@@ -149,8 +151,10 @@ private func fetchChoice(_ creds: Credentials, reading: String, candidates: [Str
 public func novakey_llm_rerank(
     _ controllerId: UInt64, _ generation: UInt64,
     _ readingPtr: UnsafePointer<UInt8>, _ readingLen: Int,
-    _ candsPtr: UnsafePointer<UInt8>, _ candsLen: Int
+    _ candsPtr: UnsafePointer<UInt8>, _ candsLen: Int,
+    _ ctxPtr: UnsafePointer<UInt8>?, _ ctxLen: Int
 ) {
+    let context = ctxPtr.map { String(decoding: UnsafeBufferPointer(start: $0, count: ctxLen), as: UTF8.self) } ?? ""
     let reading = String(decoding: UnsafeBufferPointer(start: readingPtr, count: readingLen), as: UTF8.self)
     let joined = String(decoding: UnsafeBufferPointer(start: candsPtr, count: candsLen), as: UTF8.self)
     let candidates = joined.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
@@ -159,7 +163,7 @@ public func novakey_llm_rerank(
         registerLatest(controllerId, generation)
         let task = Task {
             do {
-                let index = try await fetchChoice(creds, reading: reading, candidates: candidates)
+                let index = try await fetchChoice(creds, context: context, reading: reading, candidates: candidates)
                 guard await isLatest(controllerId, generation), !Task.isCancelled else { return }
                 deliver(controllerId, generation, 0, String(index))
             } catch {
