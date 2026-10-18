@@ -42,7 +42,7 @@ static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
         RefCell::new(HashMap::new());
-    static LLM_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static CREDENTIALS_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AI_RERANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -61,19 +61,23 @@ fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &
 pub fn init_llm_dispatch() {
     AI_RERANK.with(|e| e.set(platform::defaults_bool(AI_RERANK_KEY)));
     llm_bridge::set_result_handler(dispatch_llm_result);
-    let avail = llm_bridge::availability();
-    if avail != llm_bridge::Availability::Available {
-        LLM_ENABLED.with(|e| e.set(false));
-        platform::log(&format!("LLM unavailable: {:?}", avail));
-    }
 }
 
 fn ai_rerank_enabled() -> bool {
     AI_RERANK.with(|e| e.get())
 }
 
-fn llm_enabled() -> bool {
-    LLM_ENABLED.with(|e| e.get())
+fn credentials_missing() -> bool {
+    CREDENTIALS_MISSING.with(|e| e.get())
+}
+
+fn set_credentials_missing(missing: bool) {
+    CREDENTIALS_MISSING.with(|e| e.set(missing));
+}
+
+/// 無効時は Keychain に触れる経路(llm_bridge)へ一切進まないための門番。
+fn rerank_allowed(ai_enabled: bool, credentials_missing: bool) -> bool {
+    ai_enabled && !credentials_missing
 }
 
 extern_class!(
@@ -237,7 +241,7 @@ declare_class!(
             } else {
                 "AI並べ替え: オフ"
             };
-            let warning = (ai_rerank_enabled() && !llm_enabled())
+            let warning = (ai_rerank_enabled() && credentials_missing())
                 .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
             platform::build_menu(
                 &[
@@ -253,6 +257,13 @@ declare_class!(
             let enabled = !ai_rerank_enabled();
             AI_RERANK.with(|e| e.set(enabled));
             platform::set_defaults_bool(AI_RERANK_KEY, enabled);
+            if enabled {
+                let avail = llm_bridge::availability();
+                set_credentials_missing(avail != llm_bridge::Availability::Available);
+                if credentials_missing() {
+                    platform::log(&format!("LLM unavailable: {:?}", avail));
+                }
+            }
         }
 
         #[method(toggleConversionMode:)]
@@ -530,7 +541,7 @@ impl NovakeyRInputController {
 
     /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
     fn request_rerank(&self, urgent: bool) {
-        if !ai_rerank_enabled() || !llm_enabled() {
+        if !rerank_allowed(ai_rerank_enabled(), credentials_missing()) {
             return;
         }
         let Some(job) = self.rerank_job() else { return };
@@ -567,6 +578,9 @@ impl NovakeyRInputController {
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
+        if status == llm_bridge::STATUS_CREDENTIALS_MISSING {
+            set_credentials_missing(true);
+        }
         if status != llm_bridge::STATUS_OK {
             platform::log(&format!("LLM rerank error status={}", status));
             return;
@@ -637,7 +651,19 @@ fn japanese_punctuation(text: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::japanese_punctuation;
+    use super::{japanese_punctuation, rerank_allowed};
+
+    #[test]
+    fn rerank_never_runs_when_ai_toggle_is_off() {
+        assert!(!rerank_allowed(false, false));
+        assert!(!rerank_allowed(false, true));
+    }
+
+    #[test]
+    fn rerank_is_blocked_when_credentials_are_missing() {
+        assert!(!rerank_allowed(true, true));
+        assert!(rerank_allowed(true, false));
+    }
 
     #[test]
     fn converts_ascii_punctuation_to_japanese_forms() {

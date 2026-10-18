@@ -32,13 +32,34 @@ private func keychainString(account: String) -> String? {
     return value
 }
 
-// グローバル let は初回アクセス時に一度だけ評価される(lazy once)。
-// Keychain を後から登録した場合は IME の再起動が必要。
-private let credentials: Credentials? = {
-    guard let token = keychainString(account: "api-token"),
-          let account = keychainString(account: "account-id") else { return nil }
-    return Credentials(apiToken: token, accountId: account)
-}()
+// Keychain は AI 並べ替えが実際に必要になるまで触らない。
+// 結果(未登録の nil を含む)をキャッシュし、再読込は availability(トグルON時)だけが行う。
+private let credentialsLock = NSLock()
+private var credentialsLoaded = false
+private var credentialsCache: Credentials?
+private var missingLogged = false
+
+private func loadCredentials(forceReload: Bool) -> Credentials? {
+    credentialsLock.lock()
+    defer { credentialsLock.unlock() }
+    if credentialsLoaded && !(forceReload && credentialsCache == nil) { return credentialsCache }
+    credentialsLoaded = true
+    if let token = keychainString(account: "api-token"),
+       let account = keychainString(account: "account-id") {
+        credentialsCache = Credentials(apiToken: token, accountId: account)
+    } else {
+        credentialsCache = nil
+    }
+    return credentialsCache
+}
+
+private func logMissingOnce() {
+    credentialsLock.lock()
+    defer { credentialsLock.unlock() }
+    guard !missingLogged else { return }
+    missingLogged = true
+    NSLog("Cloudflare認証情報なし")
+}
 
 private let session: URLSession = {
     let config = URLSessionConfiguration.ephemeral
@@ -118,7 +139,7 @@ private func clearInFlightTask(_ id: UInt64, _ gen: UInt64) {
 
 @_cdecl("novakey_llm_availability")
 public func novakey_llm_availability() -> Int32 {
-    credentials == nil ? 4 : 0
+    loadCredentials(forceReload: true) == nil ? 4 : 0
 }
 
 private func deliver(_ id: UInt64, _ gen: UInt64, _ status: Int32, _ text: String) {
@@ -185,7 +206,15 @@ public func novakey_llm_rerank(
     let reading = String(decoding: UnsafeBufferPointer(start: readingPtr, count: readingLen), as: UTF8.self)
     let joined = String(decoding: UnsafeBufferPointer(start: candsPtr, count: candsLen), as: UTF8.self)
     let candidates = joined.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
-    guard candidates.count >= 2, let creds = credentials else { return }
+    guard candidates.count >= 2 else { return }
+    guard let creds = loadCredentials(forceReload: false) else {
+        logMissingOnce()
+        DispatchQueue.main.async {
+            registerLatest(controllerId, generation)
+            deliver(controllerId, generation, 4, "Cloudflare認証情報なし")
+        }
+        return
+    }
     let key = RerankKey(context: context, reading: reading, candidates: candidates)
     DispatchQueue.main.async {
         if let cached = lastResult, cached.key == key {

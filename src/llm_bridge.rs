@@ -12,6 +12,7 @@ pub enum Availability {
 }
 
 pub const STATUS_OK: i32 = 0;
+pub const STATUS_CREDENTIALS_MISSING: i32 = 4;
 
 extern "C" {
     fn novakey_llm_availability() -> i32;
