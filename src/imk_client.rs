@@ -51,6 +51,12 @@ impl Client {
             .unwrap_or_default()
     }
 
+    pub fn bundle_id(&self) -> Option<String> {
+        // SAFETY: IMKTextInput の bundleIdentifier は NSString (nil 可) を返す。
+        let id: Option<Id<NSString>> = unsafe { msg_send_id![&*self.0, bundleIdentifier] };
+        id.map(|s| s.to_string())
+    }
+
     fn anchor(&self) -> Option<usize> {
         // SAFETY: markedRange / selectedRange は引数なしで NSRange を返す。
         let (marked, selected): (NSRange, NSRange) =

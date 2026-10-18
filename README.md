@@ -33,6 +33,15 @@ $ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -
 
 未登録の場合、リランキングは無効になり辞書変換のみで動作します。登録後は IME の再起動が必要です。
 
+#### Cloudflare に送られる情報とガード
+
+リランキングのたびに、変換候補・読み(ひらがな)・直前の文(最大100文字)を Cloudflare Workers AI に送信します。
+次の場合は送信を制限します(`src/outbound.rs`)。
+
+1. セキュア入力中(パスワード欄など)は、リランキング自体を行いません。
+2. パスワードマネージャ・ターミナル系アプリ(1Password、Bitwarden、キーチェーンアクセス、Terminal、iTerm2、Warp、Ghostty、kitty、Alacritty 等)では、リランキング自体を行いません。
+3. 直前の文に API キー、秘密鍵、JWT、メールアドレス、長い数字列、長いトークン風の文字列、「パスワード」などの語が含まれる場合は、直前の文を送らず候補と読みだけで行います。
+
 ### 3. Install
 
 NovakeyR.app を `/Library/Input Methods` 内にコピーします。

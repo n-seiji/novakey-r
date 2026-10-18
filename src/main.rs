@@ -3,6 +3,7 @@ mod imk;
 mod imk_client;
 mod kkc_bridge;
 mod llm_bridge;
+mod outbound;
 mod platform;
 mod romaji_converter;
 

@@ -12,6 +12,11 @@ extern "C" {}
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn IsSecureEventInputEnabled() -> bool;
+}
+
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     fn NSLog(fmt: *mut AnyObject, ...);
@@ -47,6 +52,11 @@ pub fn log(message: &str) {
             &*arg as *const NSString,
         )
     };
+}
+
+pub fn is_secure_input_enabled() -> bool {
+    // SAFETY: Carbon の引数なし C 関数で、状態を読むだけ。
+    unsafe { IsSecureEventInputEnabled() }
 }
 
 /// NSAttributedString (候補パネルが渡す引数) の文字列部分を取り出す。

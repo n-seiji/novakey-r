@@ -14,6 +14,7 @@ use crate::composer::{CandidateEngine, Composer};
 use crate::imk_client::Client;
 use crate::kkc_bridge;
 use crate::llm_bridge;
+use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
 use crate::romaji_converter::RomajiConverter;
 
@@ -392,10 +393,28 @@ impl NovakeyRInputController {
             return;
         }
         let candidates: Vec<String> = composer.candidates().iter().map(|c| c.text.clone()).collect();
-        let context = self
-            .client()
+        let client = self.client();
+        let preceding = client
+            .as_ref()
             .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
             .unwrap_or_default();
+        let bundle_id = client.as_ref().and_then(Client::bundle_id);
+        let snapshot = Snapshot {
+            secure_input: platform::is_secure_input_enabled(),
+            bundle_id: bundle_id.as_deref(),
+            preceding: &preceding,
+        };
+        let context = match outbound::decide(&snapshot) {
+            Outbound::Skip(reason) => {
+                platform::log(&format!("LLM rerank skipped: {}", reason.name()));
+                return;
+            }
+            Outbound::WithoutContext(reason) => {
+                platform::log(&format!("LLM rerank without context: {}", reason.name()));
+                String::new()
+            }
+            Outbound::WithContext(context) => context,
+        };
         llm_bridge::rerank_async(
             self.ivars().controller_id,
             composer.current_generation(),
