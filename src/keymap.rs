@@ -70,6 +70,15 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Literal, Escape) => Revert,
         (P::Literal, Backspace) => DeleteBack,
 
+        (P::Dangling, Space) => Convert,
+        (P::Dangling, Enter) => Commit,
+        (P::Dangling, Control) => CommitThenPassThrough,
+        (P::Dangling, Up | Down) => PassThrough,
+        (P::Dangling, Letter { .. }) => TypeRomaji,
+        (P::Dangling, Digit(_) | Punct | Hyphen | Symbol) => CommitThenInsert,
+        (P::Dangling, Escape) => Revert,
+        (P::Dangling, Backspace) => DeleteBack,
+
         (P::Converting { .. }, Space | Down) => NextCandidate,
         (P::Converting { .. }, Up) => PrevCandidate,
         (P::Composing | P::Reverted, Up | Down) => PassThrough,

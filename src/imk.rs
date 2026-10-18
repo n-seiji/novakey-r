@@ -17,7 +17,7 @@ use crate::kkc_bridge;
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
-use crate::romaji_converter::RomajiConverter;
+use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::trace;
 
 pub struct KkcEngine {
@@ -326,14 +326,20 @@ impl NovakeyRInputController {
 
     /// 未変換のローマ字を確定かなとして composer へ流す。
     fn flush_romaji(&self) {
-        let flushed = self.ivars().converter.borrow_mut().flush();
-        if let Some(kana) = flushed {
-            self.push_input("", &kana);
+        let flush = self.ivars().converter.borrow_mut().flush();
+        let ranks = matches!(flush, Flush::Kana(_));
+        self.ivars().composer.borrow_mut().push_flush(flush);
+        if ranks {
+            self.request_rerank(false);
         }
     }
 
     fn push_input(&self, raw: &str, kana: &str) {
-        self.ivars().composer.borrow_mut().push_input(raw, kana);
+        let carry = self.ivars().converter.borrow().buffer().to_string();
+        self.ivars()
+            .composer
+            .borrow_mut()
+            .push_input(raw, kana, &carry);
         if !kana.is_empty() {
             self.request_rerank(false);
         }
@@ -443,8 +449,11 @@ impl NovakeyRInputController {
                 self.show_typing(client)
             }
             Action::Convert => {
-                let awaiting_rerank = !self.ivars().composer.borrow().has_pending_rerank();
-                if awaiting_rerank {
+                let needs_rerank = {
+                    let composer = self.ivars().composer.borrow();
+                    composer.phase() != Phase::Dangling && !composer.has_pending_rerank()
+                };
+                if needs_rerank {
                     self.request_rerank(true);
                 }
                 self.ivars().composer.borrow_mut().begin_conversion();

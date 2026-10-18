@@ -3,6 +3,16 @@
 // romaji_converter.rs - Romaji to Hiragana conversion logic
 use std::collections::HashMap;
 
+/// バッファを確定した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flush {
+    Empty,
+    /// すべてかなに変換できた。
+    Kana(String),
+    /// 変換できない子音が残った。かな + 残りの ASCII をそのまま持つ(英単語として扱う合図)。
+    Dangling(String),
+}
+
 pub struct RomajiConverter {
     buffer: String,
     romaji_map: HashMap<String, String>,
@@ -136,54 +146,40 @@ impl RomajiConverter {
         None
     }
     
-    pub fn flush(&mut self) -> Option<String> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-        
-        let buffer = self.buffer.clone();
-        self.buffer.clear();
-        
-        if let Some(converted) = self.convert_buffer(&buffer) {
-            Some(converted)
-        } else {
-            Some(buffer)
-        }
-    }
-    
-    fn convert_buffer(&self, text: &str) -> Option<String> {
-        // Try exact match
-        if let Some(hiragana) = self.romaji_map.get(text) {
-            return Some(hiragana.clone());
-        }
-        
-        // Special case: "nn" -> "ん"
-        if text == "nn" {
-            return Some("ん".to_string());
-        }
-        
-        // Try longest prefix match
-        for i in (1..text.len()).rev() {
-            let prefix = &text[..i];
-            if let Some(hiragana) = self.romaji_map.get(prefix) {
-                let mut result = hiragana.clone();
-                if let Some(rest) = self.convert_buffer(&text[i..]) {
-                    result.push_str(&rest);
-                } else {
-                    result.push_str(&text[i..]);
-                }
-                return Some(result);
+    /// 残りのバッファを確定する。変換しきれない子音の残り(`enter` の `r` など)があれば Dangling。
+    pub fn flush(&mut self) -> Flush {
+        let buffer = std::mem::take(&mut self.buffer);
+        let (mut kana, tail) = self.convert_buffer(&buffer);
+        match (kana.is_empty(), tail.is_empty()) {
+            (true, true) => Flush::Empty,
+            (_, true) => Flush::Kana(kana),
+            _ => {
+                kana.push_str(tail);
+                Flush::Dangling(kana)
             }
         }
-        
-        // Special case: single 'n' at the end
-        if text == "n" {
-            return Some("ん".to_string());
-        }
-        
-        None
     }
-    
+
+    /// text を (変換できたかな, 変換できずに残った末尾) に分ける。
+    fn convert_buffer<'a>(&self, text: &'a str) -> (String, &'a str) {
+        if text.is_empty() {
+            return (String::new(), "");
+        }
+        if let Some(hiragana) = self.romaji_map.get(text) {
+            return (hiragana.clone(), "");
+        }
+        if text == "nn" || text == "n" {
+            return ("ん".to_string(), "");
+        }
+        for i in (1..text.len()).rev() {
+            if let Some(hiragana) = self.romaji_map.get(&text[..i]) {
+                let (rest, tail) = self.convert_buffer(&text[i..]);
+                return (format!("{hiragana}{rest}"), tail);
+            }
+        }
+        (String::new(), text)
+    }
+
     pub fn handle_backspace(&mut self) {
         // Remove the last character from the buffer if it exists
         self.buffer.pop();
@@ -395,7 +391,7 @@ mod tests {
             }
         }
         
-        if let Some(output) = converter.flush() {
+        if let Flush::Kana(output) | Flush::Dangling(output) = converter.flush() {
             result.push_str(&output);
         }
         

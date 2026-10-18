@@ -4,6 +4,8 @@
 // 候補は {text, engine_index} で持ち、リランキング後も学習には元 index を渡す。
 // ローマ字そのまま(raw)の候補は engine_index を持たず、確定しても学習しない。
 
+use crate::romaji_converter::Flush;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub text: String,
@@ -28,6 +30,8 @@ pub enum Phase {
     Converting { selected: usize, window: bool },
     /// 英単語をそのまま入力中(かな変換しない)。
     Literal,
+    /// ローマ字の末尾が変換しきれず、組成全体を英単語として扱う局面。確定は raw、変換は raw が第 1 候補。
+    Dangling,
 }
 
 /// 1 回の入力で生まれた (打鍵, かな) の組。部分削除後は raw をかなで置き換える。
@@ -137,14 +141,38 @@ impl<E: CandidateEngine> Composer<E> {
         }
     }
 
+    /// ローマ字バッファの確定結果を取り込む。Dangling なら局面を Dangling にする。
+    pub fn push_flush(&mut self, flush: Flush) {
+        match flush {
+            Flush::Empty => {}
+            Flush::Kana(kana) | Flush::Dangling(kana) => self.push_input("", &kana, ""),
+        }
+        if self.phase == Phase::Composing && self.has_ascii_kana() {
+            self.phase = Phase::Dangling;
+        }
+    }
+
+    /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。
+    fn has_ascii_kana(&self) -> bool {
+        self.units
+            .iter()
+            .any(|u| u.kana.chars().any(|c| c.is_ascii_alphabetic()))
+    }
+
     /// 打鍵 raw と、それで確定したかな kana を追加する。kana が空なら raw は次のかなに持ち越す。
-    pub fn push_input(&mut self, raw: &str, kana: &str) {
+    /// carry はローマ字バッファに残っている未確定の打鍵で、確定した単位には含めず持ち越す。
+    pub fn push_input(&mut self, raw: &str, kana: &str, carry: &str) {
         self.pending_raw.push_str(raw);
         if kana.is_empty() {
             return;
         }
+        let split = self
+            .pending_raw
+            .strip_suffix(carry)
+            .map_or(self.pending_raw.len(), str::len);
+        let carried = self.pending_raw.split_off(split);
         self.units.push(Unit {
-            raw: std::mem::take(&mut self.pending_raw),
+            raw: std::mem::replace(&mut self.pending_raw, carried),
             kana: kana.to_string(),
         });
         self.refresh();
@@ -194,7 +222,10 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 最初の変換。保留中のリランキングを反映し、raw 候補を第 1 候補の直後に入れて先頭を選ぶ。
     pub fn begin_conversion(&mut self) -> bool {
-        if !matches!(self.phase, Phase::Composing | Phase::Reverted) {
+        if !matches!(
+            self.phase,
+            Phase::Composing | Phase::Reverted | Phase::Dangling
+        ) {
             return false;
         }
         if let Some(index) = self.pending_rerank.take() {
@@ -260,7 +291,10 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     pub fn commit(&mut self) -> String {
-        let out = self.display().to_string();
+        let out = match self.phase {
+            Phase::Dangling => self.raw(),
+            _ => self.display().to_string(),
+        };
         let learned = match self.phase {
             Phase::Converting { selected, .. } => self.candidates[selected].engine_index,
             Phase::Composing if self.live => self.candidates.first().and_then(|c| c.engine_index),
@@ -339,7 +373,10 @@ impl<E: CandidateEngine> Composer<E> {
         if raw.is_empty() || self.candidates.iter().any(|c| c.text == raw) {
             return;
         }
-        let position = self.candidates.len().min(1);
+        let position = match self.phase {
+            Phase::Dangling => 0,
+            _ => self.candidates.len().min(1),
+        };
         self.candidates.insert(
             position,
             Candidate {
@@ -390,6 +427,12 @@ mod tests {
         }
     }
 
+    impl Composer<MockEngine> {
+        fn engine_cancels(&self) -> std::cell::Ref<'_, usize> {
+            self.engine.log.cancels.borrow()
+        }
+    }
+
     fn composer() -> (Composer<MockEngine>, Log) {
         let log = Log::default();
         let engine = MockEngine {
@@ -403,9 +446,9 @@ mod tests {
     }
 
     fn type_kyou(c: &mut Composer<MockEngine>) {
-        c.push_input("k", "");
-        c.push_input("yo", "きょ");
-        c.push_input("u", "う");
+        c.push_input("k", "", "");
+        c.push_input("yo", "きょ", "");
+        c.push_input("u", "う", "");
     }
 
     fn texts(c: &Composer<MockEngine>) -> Vec<&str> {
@@ -531,7 +574,7 @@ mod tests {
             table: vec![("ぎっとはぶ".to_string(), vec!["github".to_string()])],
         };
         let mut c = Composer::new(engine);
-        c.push_input("github", "ぎっとはぶ");
+        c.push_input("github", "ぎっとはぶ", "");
         c.begin_conversion();
         assert_eq!(texts(&c), vec!["github"]);
         assert_eq!(c.candidates()[0].engine_index, Some(0));
@@ -545,7 +588,7 @@ mod tests {
             table: vec![("ぎ".to_string(), vec![])],
         };
         let mut c = Composer::new(engine);
-        c.push_input("gi", "ぎ");
+        c.push_input("gi", "ぎ", "");
         assert!(c.begin_conversion());
         assert_eq!(c.display(), "gi");
     }
@@ -553,8 +596,8 @@ mod tests {
     #[test]
     fn 打鍵のみで未変換のローマ字もrawに含まれる() {
         let (mut c, _) = composer();
-        c.push_input("gi", "ぎ");
-        c.push_input("b", "");
+        c.push_input("gi", "ぎ", "");
+        c.push_input("b", "", "");
         assert_eq!(c.raw(), "gib");
         c.pop_pending_raw();
         assert_eq!(c.raw(), "gi");
@@ -566,7 +609,7 @@ mod tests {
         type_kyou(&mut c);
         c.begin_conversion();
         c.advance();
-        c.push_input("ha", "は");
+        c.push_input("ha", "は", "");
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(c.display(), "きょうは");
         assert_eq!(log.converts.borrow().last().unwrap().1, "きょうは");
@@ -610,8 +653,8 @@ mod tests {
     #[test]
     fn backspaceで単位ごと消えたかなの打鍵もrawから消える() {
         let (mut c, _) = composer();
-        c.push_input("ka", "か");
-        c.push_input("n", "ん");
+        c.push_input("ka", "か", "");
+        c.push_input("n", "ん", "");
         c.backspace();
         assert_eq!(c.raw(), "ka");
     }
@@ -636,7 +679,7 @@ mod tests {
         c.revert();
         assert_eq!(c.phase(), Phase::Reverted);
         assert_eq!(c.display(), "きょう");
-        c.push_input("ha", "は");
+        c.push_input("ha", "は", "");
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(c.display(), "きょうはK1");
     }
@@ -776,7 +819,7 @@ mod tests {
         type_kyou(&mut c);
         let gen = c.current_generation();
         c.apply_rerank(gen, 1);
-        c.push_input("ha", "は");
+        c.push_input("ha", "は", "");
         c.begin_conversion();
         assert_eq!(c.display(), "きょうはK1");
     }
@@ -828,7 +871,7 @@ mod tests {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let old = c.current_generation();
-        c.push_input("ha", "は");
+        c.push_input("ha", "は", "");
         c.begin_conversion();
         assert_eq!(c.apply_rerank(old, 1), None);
 
@@ -860,7 +903,7 @@ mod tests {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let old = c.current_generation();
-        c.push_input("ha", "は");
+        c.push_input("ha", "は", "");
         assert_eq!(c.apply_rerank(old, 1), None);
 
         let (mut c2, _) = composer();
@@ -880,5 +923,88 @@ mod tests {
         let gen = c.current_generation();
         c.revert();
         assert_eq!(c.apply_rerank(gen, 1), None);
+    }
+
+    use crate::keymap::{action_for, Action, Key};
+    use crate::romaji_converter::RomajiConverter;
+
+    fn type_word(c: &mut Composer<MockEngine>, conv: &mut RomajiConverter, word: &str) {
+        for ch in word.chars() {
+            let kana: String = conv.process_input(ch).unwrap_or_default();
+            c.push_input(&ch.to_string(), &kana, conv.buffer());
+        }
+    }
+
+    fn typed_and_flushed(word: &str) -> Composer<MockEngine> {
+        let (mut c, _) = composer();
+        let mut conv = RomajiConverter::new();
+        type_word(&mut c, &mut conv, word);
+        c.push_flush(conv.flush());
+        c
+    }
+
+    #[test]
+    fn 変換しきれない子音が残る語はenterでrawのまま確定する() {
+        let mut c = typed_and_flushed("enter");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(c.commit(), "enter");
+    }
+
+    #[test]
+    fn 変換しきれない子音が残る語はspaceでrawが第1候補になりかな候補が続く() {
+        let mut c = typed_and_flushed("github");
+        assert!(c.begin_conversion());
+        assert_eq!(c.phase(), Phase::Converting { selected: 0, window: false });
+        assert_eq!(c.display(), "github");
+        assert_eq!(texts(&c)[0], "github");
+        assert!(texts(&c).len() >= 2);
+        assert_eq!(c.commit(), "github");
+        assert_eq!(*c.engine_cancels(), 1);
+    }
+
+    #[test]
+    fn 末尾のnはかなのまま確定する() {
+        let mut c = typed_and_flushed("kan");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.commit(), "かん");
+    }
+
+    #[test]
+    fn 全部かなになる語はrawが2番目の候補のまま() {
+        let mut c = typed_and_flushed("kyou");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c)[1], "kyou");
+        assert_eq!(c.display(), "今日");
+    }
+
+    #[test]
+    fn ローマ字として解釈できない文字を含む語もrawが第1候補() {
+        let mut c = typed_and_flushed("hello");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert!(c.begin_conversion());
+        assert_eq!(c.display(), "hello");
+    }
+
+    #[test]
+    fn 変換しきれない語に続く句読点はrawを確定してからasciiで入る() {
+        let mut c = typed_and_flushed("enter");
+        assert_eq!(
+            action_for(c.phase(), Key::Punct),
+            Action::CommitThenInsert
+        );
+        assert_eq!(format!("{}{}", c.commit(), "."), "enter.");
+    }
+
+    #[test]
+    fn 子音が残る語のbackspace後も残りがあれば英単語のまま() {
+        let (mut c, _) = composer();
+        let mut conv = RomajiConverter::new();
+        type_word(&mut c, &mut conv, "enterr");
+        conv.handle_backspace();
+        c.pop_pending_raw();
+        c.push_flush(conv.flush());
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(c.commit(), "enter");
     }
 }
