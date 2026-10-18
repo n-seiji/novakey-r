@@ -7,6 +7,8 @@ use crate::composer::Phase;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Space,
+    /// Shift を押したスペース。変換中は前候補、それ以外は Space と同じ。
+    ShiftSpace,
     Digit(u8),
     Letter { upper: bool },
     /// 日本語入力では句読点などに置き換わる記号 (. , ! ? [ ])。
@@ -55,13 +57,13 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
     use Key::*;
     use Phase as P;
     match (phase, key) {
-        (P::Empty, Space) => InsertSpace,
+        (P::Empty, Space | ShiftSpace) => InsertSpace,
         (P::Empty, Letter { upper: true }) => StartLiteral,
         (P::Empty, Letter { upper: false }) => TypeRomaji,
         (P::Empty, Digit(_) | Punct | Hyphen | Symbol) => InsertDirect,
         (P::Empty, Enter | Escape | Backspace | Control | Up | Down) => PassThrough,
 
-        (P::Literal, Space) => CommitThenSpace,
+        (P::Literal, Space | ShiftSpace) => CommitThenSpace,
         (P::Literal, Letter { .. } | Digit(_) | Hyphen | Symbol) => TypeLiteral,
         (P::Literal, Punct) => CommitThenInsert,
         (P::Literal, Enter) => Commit,
@@ -70,7 +72,7 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Literal, Escape) => Revert,
         (P::Literal, Backspace) => DeleteBack,
 
-        (P::Dangling, Space) => Convert,
+        (P::Dangling, Space | ShiftSpace) => Convert,
         (P::Dangling, Enter) => Commit,
         (P::Dangling, Control) => CommitThenPassThrough,
         (P::Dangling, Up | Down) => PassThrough,
@@ -80,10 +82,10 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Dangling, Backspace) => DeleteBack,
 
         (P::Converting { .. }, Space | Down) => NextCandidate,
-        (P::Converting { .. }, Up) => PrevCandidate,
+        (P::Converting { .. }, Up | ShiftSpace) => PrevCandidate,
         (P::Composing | P::Reverted, Up | Down) => PassThrough,
         (P::Composing | P::Reverted | P::Converting { .. }, Control) => CommitThenPassThrough,
-        (P::Composing | P::Reverted, Space) => Convert,
+        (P::Composing | P::Reverted, Space | ShiftSpace) => Convert,
         (P::Converting { window: true, .. }, Digit(n @ 1..=9)) => PickCandidate(n),
         (P::Composing | P::Reverted | P::Converting { .. }, Letter { .. }) => TypeRomaji,
         (
@@ -107,12 +109,13 @@ pub enum Stroke {
 }
 
 /// keyCode と characters から打鍵を解釈する。特殊キーは keyCode で、それ以外は文字で分類する。
-pub fn stroke(key_code: u16, characters: &str) -> Stroke {
+pub fn stroke(key_code: u16, characters: &str, shift: bool) -> Stroke {
     let special = match key_code {
         36 | 76 => Some(Key::Enter),
         53 => Some(Key::Escape),
         51 => Some(Key::Backspace),
         48 => Some(Key::Control),
+        49 if shift => Some(Key::ShiftSpace),
         49 => Some(Key::Space),
         125 => Some(Key::Down),
         126 => Some(Key::Up),
@@ -139,6 +142,7 @@ impl Key {
     pub fn name(self) -> &'static str {
         match self {
             Key::Space => "Space",
+            Key::ShiftSpace => "ShiftSpace",
             Key::Digit(_) => "Digit",
             Key::Letter { upper: true } => "Letter(upper)",
             Key::Letter { upper: false } => "Letter",
@@ -218,6 +222,24 @@ mod tests {
     #[test]
     fn 未確定文が無いスペースは常に半角スペース() {
         assert_eq!(action_for(Phase::Empty, Space), InsertSpace);
+    }
+
+    #[test]
+    fn シフトスペースは変換中のみ前候補_それ以外はスペースと同じ() {
+        assert_eq!(action_for(Phase::Empty, ShiftSpace), InsertSpace);
+        assert_eq!(action_for(Phase::Literal, ShiftSpace), CommitThenSpace);
+        assert_eq!(action_for(Phase::Dangling, ShiftSpace), Convert);
+        assert_eq!(action_for(Phase::Composing, ShiftSpace), Convert);
+        assert_eq!(action_for(Phase::Reverted, ShiftSpace), Convert);
+        assert_eq!(action_for(CONVERTING, ShiftSpace), PrevCandidate);
+        assert_eq!(action_for(WINDOW, ShiftSpace), PrevCandidate);
+    }
+
+    #[test]
+    fn シフトはスペースだけを区別し_エンターとタブは変えない() {
+        assert_eq!(stroke(49, " ", true), Stroke::Keys(vec![(ShiftSpace, String::new())]));
+        assert_eq!(stroke(36, "\r", true), Stroke::Keys(vec![(Enter, String::new())]));
+        assert_eq!(stroke(48, "\u{19}", true), Stroke::Keys(vec![(Control, String::new())]));
     }
 
     #[test]
@@ -322,24 +344,24 @@ mod tests {
 
     #[test]
     fn 特殊キーはkeycodeで_それ以外は文字で解釈する() {
-        assert_eq!(stroke(49, " "), Stroke::Keys(vec![(Space, String::new())]));
-        assert_eq!(stroke(36, "\r"), Stroke::Keys(vec![(Enter, String::new())]));
-        assert_eq!(stroke(76, "\u{3}"), Stroke::Keys(vec![(Enter, String::new())]));
-        assert_eq!(stroke(125, "\u{F701}"), Stroke::Keys(vec![(Down, String::new())]));
-        assert_eq!(stroke(126, "\u{F700}"), Stroke::Keys(vec![(Up, String::new())]));
-        assert_eq!(stroke(51, "\u{7f}"), Stroke::Keys(vec![(Backspace, String::new())]));
-        assert_eq!(stroke(48, "\t"), Stroke::Keys(vec![(Control, String::new())]));
-        assert_eq!(stroke(53, "\u{1b}"), Stroke::Keys(vec![(Escape, String::new())]));
-        assert_eq!(stroke(0, "A"), Stroke::Keys(vec![(Letter { upper: true }, "A".to_string())]));
-        assert_eq!(stroke(18, "1"), Stroke::Keys(vec![(Digit(1), "1".to_string())]));
+        assert_eq!(stroke(49, " ", false), Stroke::Keys(vec![(Space, String::new())]));
+        assert_eq!(stroke(36, "\r", false), Stroke::Keys(vec![(Enter, String::new())]));
+        assert_eq!(stroke(76, "\u{3}", false), Stroke::Keys(vec![(Enter, String::new())]));
+        assert_eq!(stroke(125, "\u{F701}", false), Stroke::Keys(vec![(Down, String::new())]));
+        assert_eq!(stroke(126, "\u{F700}", false), Stroke::Keys(vec![(Up, String::new())]));
+        assert_eq!(stroke(51, "\u{7f}", false), Stroke::Keys(vec![(Backspace, String::new())]));
+        assert_eq!(stroke(48, "\t", false), Stroke::Keys(vec![(Control, String::new())]));
+        assert_eq!(stroke(53, "\u{1b}", false), Stroke::Keys(vec![(Escape, String::new())]));
+        assert_eq!(stroke(0, "A", false), Stroke::Keys(vec![(Letter { upper: true }, "A".to_string())]));
+        assert_eq!(stroke(18, "1", false), Stroke::Keys(vec![(Digit(1), "1".to_string())]));
     }
 
     #[test]
     fn 左右キーと機能キーと文字なしの打鍵は移動扱い() {
-        assert_eq!(stroke(123, "\u{F702}"), Stroke::Navigation);
-        assert_eq!(stroke(124, "\u{F703}"), Stroke::Navigation);
-        assert_eq!(stroke(117, "\u{F728}"), Stroke::Navigation);
-        assert_eq!(stroke(104, ""), Stroke::Navigation);
+        assert_eq!(stroke(123, "\u{F702}", false), Stroke::Navigation);
+        assert_eq!(stroke(124, "\u{F703}", false), Stroke::Navigation);
+        assert_eq!(stroke(117, "\u{F728}", false), Stroke::Navigation);
+        assert_eq!(stroke(104, "", false), Stroke::Navigation);
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
 
 const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
 pub const NS_EVENT_MASK_KEY_DOWN: usize = 1 << NS_EVENT_TYPE_KEY_DOWN;
+const SHIFT_MODIFIER: usize = 1 << 17;
 const SHORTCUT_MODIFIERS: usize = (1 << 18) | (1 << 19) | (1 << 20);
 
 /// keyDown の NSEvent から取り出した値。
@@ -88,6 +89,7 @@ pub struct KeyEvent {
     pub characters: String,
     /// Command / Control / Option のいずれかが押されている。
     pub is_shortcut: bool,
+    pub is_shift: bool,
 }
 
 /// NSEvent が keyDown なら中身を返す。
@@ -106,6 +108,7 @@ pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
             key_code,
             characters: characters.map(|s| s.to_string()).unwrap_or_default(),
             is_shortcut: modifiers & SHORTCUT_MODIFIERS != 0,
+            is_shift: modifiers & SHIFT_MODIFIER != 0,
         })
     }
 }

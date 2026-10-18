@@ -167,7 +167,7 @@ declare_class!(
             }
             let client = Client::new(client);
             *self.ivars().last_client.borrow_mut() = Some(client.clone());
-            let handled = match keymap::stroke(event.key_code, &event.characters) {
+            let handled = match keymap::stroke(event.key_code, &event.characters, event.is_shift) {
                 Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
                     self.dispatch(*key, text, &client) || handled
                 }),
@@ -383,6 +383,7 @@ impl NovakeyRInputController {
         let flushes = matches!(
             key,
             Key::Space
+                | Key::ShiftSpace
                 | Key::Digit(_)
                 | Key::Punct
                 | Key::Hyphen
