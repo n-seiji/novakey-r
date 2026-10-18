@@ -285,7 +285,7 @@ impl NovakeyRInputController {
     fn push_input(&self, raw: &str, kana: &str) {
         self.ivars().composer.borrow_mut().push_input(raw, kana);
         if !kana.is_empty() {
-            self.request_rerank();
+            self.request_rerank(false);
         }
     }
 
@@ -376,6 +376,10 @@ impl NovakeyRInputController {
                 self.show_typing(client)
             }
             Action::Convert => {
+                let awaiting_rerank = !self.ivars().composer.borrow().has_pending_rerank();
+                if awaiting_rerank {
+                    self.request_rerank(true);
+                }
                 self.ivars().composer.borrow_mut().begin_conversion();
                 self.refresh_marked(client);
                 true
@@ -418,7 +422,7 @@ impl NovakeyRInputController {
             Action::DeleteBack => {
                 let deleted = self.ivars().composer.borrow_mut().backspace();
                 if deleted {
-                    self.request_rerank();
+                    self.request_rerank(false);
                     self.show_typing(client);
                 }
                 deleted
@@ -444,7 +448,8 @@ impl NovakeyRInputController {
         })
     }
 
-    fn request_rerank(&self) {
+    /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
+    fn request_rerank(&self, urgent: bool) {
         if !llm_enabled() {
             return;
         }
@@ -477,6 +482,7 @@ impl NovakeyRInputController {
             &job.hiragana,
             &context,
             &job.candidates,
+            urgent,
         );
     }
 

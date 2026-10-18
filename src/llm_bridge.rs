@@ -24,6 +24,7 @@ extern "C" {
         cands_len: usize,
         ctx_ptr: *const u8,
         ctx_len: usize,
+        urgent: bool,
     );
 }
 
@@ -36,7 +37,15 @@ pub fn availability() -> Availability {
     }
 }
 
-pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, context: &str, candidates: &[String]) {
+/// urgent は Swift 側のデバウンス待ちを飛ばして直ちに送る(送信済み・キャッシュ命中なら何もしない)。
+pub fn rerank_async(
+    controller_id: u64,
+    generation: u64,
+    reading: &str,
+    context: &str,
+    candidates: &[String],
+    urgent: bool,
+) {
     if candidates.len() < 2 {
         return;
     }
@@ -52,6 +61,7 @@ pub fn rerank_async(controller_id: u64, generation: u64, reading: &str, context:
             joined.len(),
             context.as_ptr(),
             context.len(),
+            urgent,
         );
     }
 }
@@ -107,6 +117,6 @@ pub fn smoke_test() {
         "今日歯医者に行く".to_string(),
     ];
     let _ = SMOKE_START.set(std::time::Instant::now());
-    rerank_async(0, 0, "きょうはいしゃにいく", "", &candidates);
+    rerank_async(0, 0, "きょうはいしゃにいく", "", &candidates, true);
     crate::platform::run_main_run_loop();
 }

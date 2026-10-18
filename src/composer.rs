@@ -268,23 +268,51 @@ impl<E: CandidateEngine> Composer<E> {
         out
     }
 
-    /// LLM が選んだ表示位置 display_index を先頭へ昇格する。
+    /// LLM が選んだ表示位置 display_index を先頭へ昇格する。display_index は要求時の候補列(raw なし)での位置。
     /// live なら即反映して新しい表示を返す。非 live では保留し、最初の変換時に反映する。
+    /// 変換済みでも、まだ送りも選択もしていない(先頭選択でウィンドウなし)間は反映する。
     pub fn apply_rerank(&mut self, generation: u64, display_index: usize) -> Option<String> {
-        if generation != self.generation
-            || self.phase != Phase::Composing
-            || display_index == 0
-            || display_index >= self.candidates.len()
-        {
+        if generation != self.generation || display_index == 0 {
             return None;
         }
-        if self.live {
-            self.promote(display_index);
-            Some(self.display().to_string())
-        } else {
-            self.pending_rerank = Some(display_index);
-            None
+        match self.phase {
+            Phase::Composing if display_index < self.candidates.len() => {
+                if self.live {
+                    self.promote(display_index);
+                    Some(self.display().to_string())
+                } else {
+                    self.pending_rerank = Some(display_index);
+                    None
+                }
+            }
+            Phase::Converting {
+                selected: 0,
+                window: false,
+            } => self.promote_converting(display_index),
+            _ => None,
         }
+    }
+
+    pub fn has_pending_rerank(&self) -> bool {
+        self.pending_rerank.is_some()
+    }
+
+    /// 変換済み候補列から raw を一旦外して display_index 番目を先頭へ昇格し、raw を第 1 候補の直後へ戻す。
+    fn promote_converting(&mut self, display_index: usize) -> Option<String> {
+        let raw_at = self.candidates.iter().position(|c| c.engine_index.is_none());
+        let raw = raw_at.map(|i| self.candidates.remove(i));
+        if display_index >= self.candidates.len() {
+            if let (Some(raw), Some(i)) = (raw, raw_at) {
+                self.candidates.insert(i, raw);
+            }
+            return None;
+        }
+        self.promote(display_index);
+        if let Some(raw) = raw {
+            let position = self.candidates.len().min(1);
+            self.candidates.insert(position, raw);
+        }
+        Some(self.display().to_string())
     }
 
     fn promote(&mut self, display_index: usize) {
@@ -713,17 +741,63 @@ mod tests {
     }
 
     #[test]
-    fn 変換を始めた後のリランキングは並べ替えない() {
+    fn 変換直後で未操作ならリランキング結果を先頭へ反映しrawは直後に残す() {
+        let (mut c, log) = composer();
+        type_kyou(&mut c);
+        let gen = c.current_generation();
+        c.begin_conversion();
+        assert_eq!(c.apply_rerank(gen, 2), Some("教".to_string()));
+        assert_eq!(texts(&c), vec!["教", "kyou", "今日", "京"]);
+        assert_eq!(
+            c.phase(),
+            Phase::Converting {
+                selected: 0,
+                window: false
+            }
+        );
+        assert_eq!(c.commit(), "教");
+        assert_eq!(log.selects.borrow().last().unwrap().1, 2);
+    }
+
+    #[test]
+    fn 送りの後はリランキングで並べ替えない() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let gen = c.current_generation();
         c.begin_conversion();
-        assert_eq!(c.apply_rerank(gen, 1), None);
-        c.begin_conversion();
-        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
         c.advance();
         assert_eq!(c.apply_rerank(gen, 2), None);
         assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
+    }
+
+    #[test]
+    fn 候補ウィンドウ表示中や候補選択後はリランキングで並べ替えない() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        let gen = c.current_generation();
+        c.begin_conversion();
+        assert!(c.select_candidate(2));
+        assert_eq!(c.apply_rerank(gen, 1), None);
+        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
+        assert_eq!(c.display(), "京");
+    }
+
+    #[test]
+    fn 変換直後でも旧世代や範囲外のリランキングは無効() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        let old = c.current_generation();
+        c.push_input("ha", "は");
+        c.begin_conversion();
+        assert_eq!(c.apply_rerank(old, 1), None);
+
+        let (mut c2, _) = composer();
+        type_kyou(&mut c2);
+        let gen2 = c2.current_generation();
+        c2.begin_conversion();
+        assert_eq!(c2.apply_rerank(gen2, 99), None);
+        assert_eq!(c2.apply_rerank(gen2, 0), None);
+        assert_eq!(texts(&c2), vec!["今日", "kyou", "京", "教"]);
     }
 
     #[test]

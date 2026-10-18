@@ -9,6 +9,7 @@ func novakey_llm_on_result(
 private let keychainService = "me.sijis.inputmethod.NovakeyR.cloudflare"
 private let rankInstructions = "読みに対して最も自然なかな漢字変換候補を選べ"
 private let requestTimeout: TimeInterval = 3
+private let debounceMilliseconds = 250
 
 private struct Credentials {
     let apiToken: String
@@ -62,8 +63,33 @@ private enum RerankFailure: Error {
     case invalidResponse
 }
 
+private struct RerankKey: Equatable {
+    let context: String
+    let reading: String
+    let candidates: [String]
+}
+
 private var latestGenerations: [UInt64: UInt64] = [:]
 private var inFlightTasks: [UInt64: Task<Void, Never>] = [:]
+// 送信を始めた(または結果を配信した)世代。urgent の重複送信を防ぐ。
+private var sentGenerations: [UInt64: UInt64] = [:]
+// 直近 1 件の成功結果。同一リクエストは HTTP を送らずこれを返す。
+private var lastResult: (key: RerankKey, index: Int)?
+private var requestCount = 0
+
+@MainActor
+private func beginSend(_ id: UInt64, _ gen: UInt64) -> Bool {
+    guard latestGenerations[id] == gen, !Task.isCancelled else { return false }
+    sentGenerations[id] = gen
+    requestCount += 1
+    NSLog("%@", "Clef requests sent: \(requestCount)")
+    return true
+}
+
+@MainActor
+private func storeResult(_ key: RerankKey, _ index: Int) {
+    lastResult = (key, index)
+}
 
 @MainActor
 private func registerLatest(_ id: UInt64, _ gen: UInt64) {
@@ -152,18 +178,35 @@ public func novakey_llm_rerank(
     _ controllerId: UInt64, _ generation: UInt64,
     _ readingPtr: UnsafePointer<UInt8>, _ readingLen: Int,
     _ candsPtr: UnsafePointer<UInt8>, _ candsLen: Int,
-    _ ctxPtr: UnsafePointer<UInt8>?, _ ctxLen: Int
+    _ ctxPtr: UnsafePointer<UInt8>?, _ ctxLen: Int,
+    _ urgent: Bool
 ) {
     let context = ctxPtr.map { String(decoding: UnsafeBufferPointer(start: $0, count: ctxLen), as: UTF8.self) } ?? ""
     let reading = String(decoding: UnsafeBufferPointer(start: readingPtr, count: readingLen), as: UTF8.self)
     let joined = String(decoding: UnsafeBufferPointer(start: candsPtr, count: candsLen), as: UTF8.self)
     let candidates = joined.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
     guard candidates.count >= 2, let creds = credentials else { return }
+    let key = RerankKey(context: context, reading: reading, candidates: candidates)
     DispatchQueue.main.async {
+        if let cached = lastResult, cached.key == key {
+            registerLatest(controllerId, generation)
+            sentGenerations[controllerId] = generation
+            deliver(controllerId, generation, 0, String(cached.index))
+            return
+        }
+        if urgent, sentGenerations[controllerId] == generation, latestGenerations[controllerId] == generation {
+            return
+        }
         registerLatest(controllerId, generation)
+        let delay = urgent ? 0 : debounceMilliseconds
         let task = Task {
+            if delay > 0 {
+                do { try await Task.sleep(for: .milliseconds(delay)) } catch { return }
+            }
+            guard await beginSend(controllerId, generation) else { return }
             do {
                 let index = try await fetchChoice(creds, context: context, reading: reading, candidates: candidates)
+                await storeResult(key, index)
                 guard await isLatest(controllerId, generation), !Task.isCancelled else { return }
                 deliver(controllerId, generation, 0, String(index))
             } catch {
