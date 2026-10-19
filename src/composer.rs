@@ -1069,10 +1069,10 @@ mod tests {
 
     #[test]
     fn ローマ字として解釈できない文字を含む語もrawが第1候補() {
-        let mut c = typed_and_flushed("hello");
+        let mut c = typed_and_flushed("world");
         assert_eq!(c.phase(), Phase::Dangling);
         assert!(c.begin_conversion());
-        assert_eq!(c.display(), "hello");
+        assert_eq!(c.display(), "world");
     }
 
     #[test]
@@ -1089,7 +1089,7 @@ mod tests {
     fn 子音が残る語のbackspace後も残りがあれば英単語のまま() {
         let (mut c, _) = composer();
         let mut conv = RomajiConverter::new();
-        type_word(&mut c, &mut conv, "enterr");
+        type_word(&mut c, &mut conv, "entery");
         conv.handle_backspace();
         c.pop_pending_raw();
         c.push_flush(conv.flush());
@@ -1193,10 +1193,10 @@ mod tests {
 
     #[test]
     fn 記号は英単語入力の英字とは混ざらない() {
-        let mut c = typed_and_flushed("hello");
+        let mut c = typed_and_flushed("world");
         assert_eq!(c.phase(), Phase::Dangling);
         assert!(!c.is_symbol());
-        assert_eq!(c.commit(), "hello");
+        assert_eq!(c.commit(), "world");
     }
 
     #[test]
@@ -1318,6 +1318,22 @@ mod tests {
         assert_eq!(c.display(), "desktop");
         assert_eq!(c.commit(), "desktop");
         assert!(c.engine.log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn 小書きのかなを含む語もrawとカタカナ語の候補を持つ() {
+        let engine = MockEngine {
+            log: Log::default(),
+            table: vec![("うぃんど".to_string(), vec!["ウィンド".to_string()])],
+        };
+        let mut c = Composer::new(engine).with_english(|k| {
+            if k == "ウィンド" { vec!["wind".to_string()] } else { Vec::new() }
+        });
+        let mut conv = RomajiConverter::new();
+        type_word(&mut c, &mut conv, "uxinndo");
+        c.push_flush(conv.flush());
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["ウィンド", "wind", "uxinndo"]);
     }
 
     #[test]

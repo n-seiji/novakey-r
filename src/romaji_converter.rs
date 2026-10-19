@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
-// romaji_converter.rs - Romaji to Hiragana conversion logic
-use std::collections::HashMap;
+// romaji_converter.rs - ローマ字→ひらがな変換。表は Google 日本語入力(Mozc)と同じ。
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 /// バッファを確定した結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,171 +14,95 @@ pub enum Flush {
     Dangling(String),
 }
 
+/// 変換表の出力と、出力後にバッファへ持ち越す文字(`tt` → っ + `t`)。
+type Rule = (&'static str, &'static str);
+
+struct Table {
+    rules: HashMap<&'static str, Rule>,
+    /// いずれかのキーの「真の前方部分」になっている文字列(続きを待つ判断に使う)。
+    prefixes: HashSet<&'static str>,
+}
+
+static TABLE: LazyLock<Table> = LazyLock::new(|| parse_table(include_str!("romaji_table.tsv")));
+
+/// `input<TAB>output[<TAB>pending]` の行を読む。`#` 始まりと空行は読み飛ばす。
+fn parse_table(tsv: &'static str) -> Table {
+    let rules: HashMap<&'static str, Rule> = tsv
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            Some((cols.next()?, (cols.next()?, cols.next().unwrap_or(""))))
+        })
+        .collect();
+    let prefixes = rules
+        .keys()
+        .flat_map(|key| (1..key.len()).map(|n| &key[..n]))
+        .collect();
+    Table { rules, prefixes }
+}
+
 pub struct RomajiConverter {
     buffer: String,
-    romaji_map: HashMap<String, String>,
 }
 
 impl RomajiConverter {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
-            romaji_map: create_romaji_map(),
         }
     }
-    
+
+    /// 1 文字を足す。確定したかながあれば返す(続きを待つ間は None)。
     pub fn process_input(&mut self, input: char) -> Option<String> {
+        let table = &*TABLE;
         self.buffer.push(input);
-        
-        // Don't convert single 'n' immediately - wait for next character
-        if self.buffer == "n" {
-            return None;
-        }
-        
-        // Also don't convert "nn" immediately - wait to see if it's "nni", "nna", etc.
-        if self.buffer == "nn" {
-            return None;
-        }
-        
-        // Check for exact match
-        if let Some(hiragana) = self.romaji_map.get(&self.buffer) {
-            // Check if this could be part of a longer pattern
-            let has_longer_match = self.romaji_map.keys()
-                .any(|k| k.starts_with(&self.buffer) && k != &self.buffer);
-
-            if !has_longer_match || self.buffer.len() > 4 {
-                let result = hiragana.clone();
-                self.buffer.clear();
-                return Some(result);
+        let mut out = String::new();
+        while !self.buffer.is_empty() && !table.prefixes.contains(self.buffer.as_str()) {
+            if let Some((kana, pending)) = table.rules.get(self.buffer.as_str()) {
+                out.push_str(kana);
+                self.buffer = pending.to_string();
+                continue;
             }
-        }
-        
-        // Check if buffer has no possible matches
-        let has_potential = self.romaji_map.keys()
-            .any(|k| k.starts_with(&self.buffer));
-        
-        if !has_potential {
-            // No potential matches - need to handle the buffer
-            if self.buffer.len() > 1 {
-                // FIRST: Check for 'nnu', 'nni', 'nna', etc. patterns
-                if self.buffer.len() >= 3 && self.buffer.starts_with("nn") {
-                    if let Some(third_char) = self.buffer.chars().nth(2) {
-
-                    // Special case: "nnu" should be "nn" + "u", not "n" + "nu"
-                    if third_char == 'u' {
-                        // Convert "nn" to ん, keep "u"
-                        self.buffer = self.buffer[2..].to_string();
-                        return Some("ん".to_string());
-                    }
-
-                    // For other vowels after "nn", check if we can form "n" + syllable
-                    // "nni" -> "n" + "ni", "nna" -> "n" + "na", etc.
-                    if third_char == 'a' || third_char == 'i' ||
-                       third_char == 'e' || third_char == 'o' || third_char == 'y' {
-                        // Check if "n" + third_char forms a valid syllable
-                        let potential_syllable = format!("n{}", third_char);
-                        if self.romaji_map.contains_key(&potential_syllable) {
-                            self.buffer = self.buffer[1..].to_string(); // Remove first 'n', keep "ni", "na", etc.
-                            return Some("ん".to_string());
-                        }
-                    }
-
-                        // Otherwise "nn" followed by consonant -> convert "nn" to ん
-                        self.buffer = self.buffer[2..].to_string();
-                        return Some("ん".to_string());
-                    }
+            // buffer は表に続かない。新しい文字を除いた手前側を先に確定して再試行する。
+            let split = self.buffer.len() - input.len_utf8();
+            let (old, _) = self.buffer.split_at(split);
+            let resolved = (1..=old.len())
+                .rev()
+                .filter(|&n| old.is_char_boundary(n))
+                .find_map(|n| table.rules.get(&old[..n]).map(|rule| (n, rule)));
+            match resolved {
+                Some((n, (kana, pending))) => {
+                    out.push_str(kana);
+                    self.buffer = format!("{pending}{}", &self.buffer[n..]);
                 }
-
-                // Handle standalone "nn" at end of buffer
-                if self.buffer == "nn" {
-                    self.buffer.clear();
-                    return Some("ん".to_string());
-                }
-
-                // Try to find the longest valid prefix - but start from the end that has a match
-                // This will prioritize converting complete patterns like "ga" before falling back
-                for i in (1..self.buffer.len()).rev() {
-                    let prefix = &self.buffer[..i];
-
-                    // Special case for "n" - check if it should be ん or part of na/ni/nu/ne/no
-                    if prefix == "n" && i < self.buffer.len() {
-                        if let Some(next_char) = self.buffer.chars().nth(i) {
-                            // If next char can form a valid n-syllable, skip this prefix
-                            if next_char == 'a' || next_char == 'i' || next_char == 'u' ||
-                               next_char == 'e' || next_char == 'o' || next_char == 'y' || next_char == 'n' {
-                                continue;
-                            }
-                            // Otherwise, convert 'n' to ん
-                            self.buffer = self.buffer[i..].to_string();
-                            return Some("ん".to_string());
-                        }
-                    }
-
-                    if let Some(hiragana) = self.romaji_map.get(prefix) {
-                        let result = hiragana.clone();
-                        self.buffer = self.buffer[i..].to_string();
-                        return Some(result);
-                    }
-                }
-
-                // Try single character conversion as fallback
-                let first_char = self.buffer.chars().next().unwrap().to_string();
-                if let Some(hiragana) = self.romaji_map.get(&first_char) {
-                    let result = hiragana.clone();
-                    self.buffer = self.buffer[1..].to_string();
-                    return Some(result);
-                } else {
-                    // Can't convert - output the raw character and continue
-                    self.buffer = self.buffer[1..].to_string();
-                    return Some(first_char);
-                }
-            } else if self.buffer.len() == 1 {
-                // Single character that has no potential - try to convert or output as is
-                let ch = self.buffer.clone();
-                self.buffer.clear();
-                if let Some(hiragana) = self.romaji_map.get(&ch) {
-                    return Some(hiragana.clone());
-                } else {
-                    return Some(ch);
+                None => {
+                    // 変換できない文字はそのまま出す
+                    let first = self.buffer.remove(0);
+                    out.push(first);
                 }
             }
         }
-        
-        None
+        (!out.is_empty()).then_some(out)
     }
-    
+
     /// 残りのバッファを確定する。変換しきれない子音の残り(`enter` の `r` など)があれば Dangling。
     pub fn flush(&mut self) -> Flush {
-        let buffer = std::mem::take(&mut self.buffer);
-        let (mut kana, tail) = self.convert_buffer(&buffer);
-        match (kana.is_empty(), tail.is_empty()) {
+        let table = &*TABLE;
+        let mut rest = std::mem::take(&mut self.buffer);
+        let mut kana = String::new();
+        while let Some((out, pending)) = table.rules.get(rest.as_str()) {
+            kana.push_str(out);
+            rest = pending.to_string();
+        }
+        match (kana.is_empty(), rest.is_empty()) {
             (true, true) => Flush::Empty,
             (_, true) => Flush::Kana(kana),
             _ => {
-                kana.push_str(tail);
+                kana.push_str(&rest);
                 Flush::Dangling(kana)
             }
         }
-    }
-
-    /// text を (変換できたかな, 変換できずに残った末尾) に分ける。
-    fn convert_buffer<'a>(&self, text: &'a str) -> (String, &'a str) {
-        if text.is_empty() {
-            return (String::new(), "");
-        }
-        if let Some(hiragana) = self.romaji_map.get(text) {
-            return (hiragana.clone(), "");
-        }
-        if text == "nn" || text == "n" {
-            return ("ん".to_string(), "");
-        }
-        for i in (1..text.len()).rev() {
-            if let Some(hiragana) = self.romaji_map.get(&text[..i]) {
-                let (rest, tail) = self.convert_buffer(&text[i..]);
-                return (format!("{hiragana}{rest}"), tail);
-            }
-        }
-        (String::new(), text)
     }
 
     pub fn handle_backspace(&mut self) {
@@ -190,12 +115,9 @@ impl RomajiConverter {
         &self.buffer
     }
 
-    /// マーク文字列に出す未確定ローマ字。先頭の "nn" は確定すれば ん になるので ん で見せる。
+    /// マーク文字列に出す未確定ローマ字。
     pub fn pending_display(&self) -> String {
-        match self.buffer.strip_prefix("nn") {
-            Some(rest) => format!("ん{rest}"),
-            None => self.buffer.clone(),
-        }
+        self.buffer.clone()
     }
 
     pub fn clear(&mut self) {
@@ -203,209 +125,27 @@ impl RomajiConverter {
     }
 }
 
-fn create_romaji_map() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    
-    // Vowels
-    map.insert("a".to_string(), "あ".to_string());
-    map.insert("i".to_string(), "い".to_string());
-    map.insert("u".to_string(), "う".to_string());
-    map.insert("e".to_string(), "え".to_string());
-    map.insert("o".to_string(), "お".to_string());
-    
-    // K row
-    map.insert("ka".to_string(), "か".to_string());
-    map.insert("ki".to_string(), "き".to_string());
-    map.insert("ku".to_string(), "く".to_string());
-    map.insert("ke".to_string(), "け".to_string());
-    map.insert("ko".to_string(), "こ".to_string());
-    
-    // G row
-    map.insert("ga".to_string(), "が".to_string());
-    map.insert("gi".to_string(), "ぎ".to_string());
-    map.insert("gu".to_string(), "ぐ".to_string());
-    map.insert("ge".to_string(), "げ".to_string());
-    map.insert("go".to_string(), "ご".to_string());
-    
-    // S row
-    map.insert("sa".to_string(), "さ".to_string());
-    map.insert("shi".to_string(), "し".to_string());
-    map.insert("si".to_string(), "し".to_string());
-    map.insert("su".to_string(), "す".to_string());
-    map.insert("se".to_string(), "せ".to_string());
-    map.insert("so".to_string(), "そ".to_string());
-    
-    // Z row
-    map.insert("za".to_string(), "ざ".to_string());
-    map.insert("zi".to_string(), "じ".to_string());
-    map.insert("ji".to_string(), "じ".to_string());
-    map.insert("zu".to_string(), "ず".to_string());
-    map.insert("ze".to_string(), "ぜ".to_string());
-    map.insert("zo".to_string(), "ぞ".to_string());
-    
-    // T row
-    map.insert("ta".to_string(), "た".to_string());
-    map.insert("chi".to_string(), "ち".to_string());
-    map.insert("ti".to_string(), "ち".to_string());
-    map.insert("tsu".to_string(), "つ".to_string());
-    map.insert("tu".to_string(), "つ".to_string());
-    map.insert("te".to_string(), "て".to_string());
-    map.insert("to".to_string(), "と".to_string());
-    
-    // D row
-    map.insert("da".to_string(), "だ".to_string());
-    map.insert("di".to_string(), "ぢ".to_string());
-    map.insert("du".to_string(), "づ".to_string());
-    map.insert("de".to_string(), "で".to_string());
-    map.insert("do".to_string(), "ど".to_string());
-    
-    // N row
-    map.insert("na".to_string(), "な".to_string());
-    map.insert("ni".to_string(), "に".to_string());
-    map.insert("nu".to_string(), "ぬ".to_string());
-    map.insert("ne".to_string(), "ね".to_string());
-    map.insert("no".to_string(), "の".to_string());
-    
-    // H row
-    map.insert("ha".to_string(), "は".to_string());
-    map.insert("hi".to_string(), "ひ".to_string());
-    map.insert("fu".to_string(), "ふ".to_string());
-    map.insert("hu".to_string(), "ふ".to_string());
-    map.insert("he".to_string(), "へ".to_string());
-    map.insert("ho".to_string(), "ほ".to_string());
-    
-    // B row
-    map.insert("ba".to_string(), "ば".to_string());
-    map.insert("bi".to_string(), "び".to_string());
-    map.insert("bu".to_string(), "ぶ".to_string());
-    map.insert("be".to_string(), "べ".to_string());
-    map.insert("bo".to_string(), "ぼ".to_string());
-    
-    // P row
-    map.insert("pa".to_string(), "ぱ".to_string());
-    map.insert("pi".to_string(), "ぴ".to_string());
-    map.insert("pu".to_string(), "ぷ".to_string());
-    map.insert("pe".to_string(), "ぺ".to_string());
-    map.insert("po".to_string(), "ぽ".to_string());
-    
-    // M row
-    map.insert("ma".to_string(), "ま".to_string());
-    map.insert("mi".to_string(), "み".to_string());
-    map.insert("mu".to_string(), "む".to_string());
-    map.insert("me".to_string(), "め".to_string());
-    map.insert("mo".to_string(), "も".to_string());
-    
-    // Y row
-    map.insert("ya".to_string(), "や".to_string());
-    map.insert("yu".to_string(), "ゆ".to_string());
-    map.insert("yo".to_string(), "よ".to_string());
-    
-    // R row
-    map.insert("ra".to_string(), "ら".to_string());
-    map.insert("ri".to_string(), "り".to_string());
-    map.insert("ru".to_string(), "る".to_string());
-    map.insert("re".to_string(), "れ".to_string());
-    map.insert("ro".to_string(), "ろ".to_string());
-    
-    // W row
-    map.insert("wa".to_string(), "わ".to_string());
-    map.insert("wi".to_string(), "ゐ".to_string());
-    map.insert("we".to_string(), "ゑ".to_string());
-    map.insert("wo".to_string(), "を".to_string());
-    // Note: 'n' is handled specially, not in the map directly
-    
-    // Small kana (拗音)
-    map.insert("kya".to_string(), "きゃ".to_string());
-    map.insert("kyu".to_string(), "きゅ".to_string());
-    map.insert("kyo".to_string(), "きょ".to_string());
-    map.insert("sha".to_string(), "しゃ".to_string());
-    map.insert("shu".to_string(), "しゅ".to_string());
-    map.insert("sho".to_string(), "しょ".to_string());
-    map.insert("sya".to_string(), "しゃ".to_string());
-    map.insert("syu".to_string(), "しゅ".to_string());
-    map.insert("syo".to_string(), "しょ".to_string());
-    map.insert("cha".to_string(), "ちゃ".to_string());
-    map.insert("chu".to_string(), "ちゅ".to_string());
-    map.insert("cho".to_string(), "ちょ".to_string());
-    map.insert("tya".to_string(), "ちゃ".to_string());
-    map.insert("tyu".to_string(), "ちゅ".to_string());
-    map.insert("tyo".to_string(), "ちょ".to_string());
-    map.insert("nya".to_string(), "にゃ".to_string());
-    map.insert("nyu".to_string(), "にゅ".to_string());
-    map.insert("nyo".to_string(), "にょ".to_string());
-    map.insert("hya".to_string(), "ひゃ".to_string());
-    map.insert("hyu".to_string(), "ひゅ".to_string());
-    map.insert("hyo".to_string(), "ひょ".to_string());
-    map.insert("mya".to_string(), "みゃ".to_string());
-    map.insert("myu".to_string(), "みゅ".to_string());
-    map.insert("myo".to_string(), "みょ".to_string());
-    map.insert("rya".to_string(), "りゃ".to_string());
-    map.insert("ryu".to_string(), "りゅ".to_string());
-    map.insert("ryo".to_string(), "りょ".to_string());
-    map.insert("gya".to_string(), "ぎゃ".to_string());
-    map.insert("gyu".to_string(), "ぎゅ".to_string());
-    map.insert("gyo".to_string(), "ぎょ".to_string());
-    map.insert("ja".to_string(), "じゃ".to_string());
-    map.insert("ju".to_string(), "じゅ".to_string());
-    map.insert("jo".to_string(), "じょ".to_string());
-    map.insert("zya".to_string(), "じゃ".to_string());
-    map.insert("zyu".to_string(), "じゅ".to_string());
-    map.insert("zyo".to_string(), "じょ".to_string());
-    map.insert("bya".to_string(), "びゃ".to_string());
-    map.insert("byu".to_string(), "びゅ".to_string());
-    map.insert("byo".to_string(), "びょ".to_string());
-    map.insert("pya".to_string(), "ぴゃ".to_string());
-    map.insert("pyu".to_string(), "ぴゅ".to_string());
-    map.insert("pyo".to_string(), "ぴょ".to_string());
-    
-    // Double consonants (促音)
-    map.insert("tta".to_string(), "った".to_string());
-    map.insert("tte".to_string(), "って".to_string());
-    map.insert("tto".to_string(), "っと".to_string());
-    map.insert("kka".to_string(), "っか".to_string());
-    map.insert("kki".to_string(), "っき".to_string());
-    map.insert("kku".to_string(), "っく".to_string());
-    map.insert("kke".to_string(), "っけ".to_string());
-    map.insert("kko".to_string(), "っこ".to_string());
-    map.insert("ssa".to_string(), "っさ".to_string());
-    map.insert("ssi".to_string(), "っし".to_string());
-    map.insert("ssu".to_string(), "っす".to_string());
-    map.insert("sse".to_string(), "っせ".to_string());
-    map.insert("sso".to_string(), "っそ".to_string());
-    map.insert("sshi".to_string(), "っし".to_string());
-    map.insert("ppa".to_string(), "っぱ".to_string());
-    map.insert("ppi".to_string(), "っぴ".to_string());
-    map.insert("ppu".to_string(), "っぷ".to_string());
-    map.insert("ppe".to_string(), "っぺ".to_string());
-    map.insert("ppo".to_string(), "っぽ".to_string());
-    
-    // Special patterns
-    map.insert("n'".to_string(), "ん".to_string());
-    
-    map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn convert_string(input: &str) -> String {
         let mut converter = RomajiConverter::new();
         let mut result = String::new();
-        
+
         for ch in input.chars() {
             if let Some(output) = converter.process_input(ch) {
                 result.push_str(&output);
             }
         }
-        
+
         if let Flush::Kana(output) | Flush::Dangling(output) = converter.flush() {
             result.push_str(&output);
         }
-        
+
         result
     }
-    
+
     fn pending_after(input: &str) -> String {
         let mut converter = RomajiConverter::new();
         input.chars().for_each(|ch| {
@@ -414,134 +154,134 @@ mod tests {
         converter.pending_display()
     }
 
+    /// 入力中に確定したかなと、最後の flush の結果。
+    fn run(input: &str) -> (String, Flush) {
+        let mut converter = RomajiConverter::new();
+        let done = input
+            .chars()
+            .filter_map(|ch| converter.process_input(ch))
+            .collect();
+        (done, converter.flush())
+    }
+
+    fn assert_table(cases: &[(&str, &str)]) {
+        for (input, want) in cases {
+            assert_eq!(convert_string(input), *want, "input {input:?}");
+        }
+    }
+
     #[test]
-    fn 未確定のnnはんと表示し_単独のnはそのまま() {
+    fn 表の行数が読み込める() {
+        assert!(TABLE.rules.len() >= 300);
+    }
+
+    #[test]
+    fn 母音と基本の音() {
+        assert_table(&[
+            ("a", "あ"), ("i", "い"), ("u", "う"), ("e", "え"), ("o", "お"),
+            ("ka", "か"), ("ki", "き"), ("ku", "く"), ("ke", "け"), ("ko", "こ"),
+            ("si", "し"), ("shi", "し"), ("ti", "ち"), ("chi", "ち"),
+            ("tu", "つ"), ("tsu", "つ"), ("hu", "ふ"), ("fu", "ふ"),
+            ("ga", "が"), ("gya", "ぎゃ"), ("tokyo", "ときょ"), ("shinjuku", "しんじゅく"),
+        ]);
+    }
+
+    #[test]
+    fn 小書きのかな() {
+        assert_table(&[
+            ("xa", "ぁ"), ("xi", "ぃ"), ("xu", "ぅ"), ("xe", "ぇ"), ("xo", "ぉ"),
+            ("la", "ぁ"), ("li", "ぃ"), ("lu", "ぅ"), ("le", "ぇ"), ("lo", "ぉ"),
+            ("xtu", "っ"), ("ltu", "っ"), ("xtsu", "っ"), ("ltsu", "っ"),
+            ("xya", "ゃ"), ("xyu", "ゅ"), ("xyo", "ょ"), ("lya", "ゃ"),
+            ("xwa", "ゎ"), ("lwa", "ゎ"),
+        ]);
+    }
+
+    #[test]
+    fn 外来語の音() {
+        assert_table(&[
+            ("fa", "ふぁ"), ("fi", "ふぃ"), ("fe", "ふぇ"), ("fo", "ふぉ"),
+            ("thi", "てぃ"), ("dhi", "でぃ"), ("dhu", "でゅ"), ("twu", "とぅ"),
+            ("she", "しぇ"), ("je", "じぇ"), ("che", "ちぇ"),
+            ("ye", "いぇ"), ("wi", "うぃ"), ("we", "うぇ"), ("wo", "を"),
+            ("va", "ゔぁ"), ("vi", "ゔぃ"), ("vu", "ゔ"), ("ve", "ゔぇ"), ("vo", "ゔぉ"),
+            ("kwa", "くぁ"), ("tsa", "つぁ"), ("qa", "くぁ"),
+        ]);
+    }
+
+    #[test]
+    fn うぃんどが打てる() {
+        assert_eq!(convert_string("uxinndo"), "うぃんど");
+        assert_eq!(convert_string("uxindo"), "うぃんど");
+    }
+
+    #[test]
+    fn 促音は子音を重ねる() {
+        assert_table(&[
+            ("kka", "っか"), ("cchi", "っち"), ("ssha", "っしゃ"), ("jja", "っじゃ"),
+            ("ggo", "っご"), ("dde", "っで"), ("ppo", "っぽ"), ("bba", "っば"),
+            ("zzu", "っず"), ("hha", "っは"), ("ffa", "っふぁ"), ("tta", "った"),
+            ("rra", "っら"), ("yya", "っや"), ("wwa", "っわ"), ("vvu", "っゔ"),
+            ("gakkou", "がっこう"), ("kitte", "きって"), ("motto", "もっと"),
+            ("ippai", "いっぱい"), ("matcha", "まっちゃ"),
+        ]);
+    }
+
+    #[test]
+    fn nの扱いはmozcと同じ() {
+        assert_table(&[
+            ("n", "ん"), ("nn", "ん"), ("n'", "ん"), ("na", "な"), ("nya", "にゃ"),
+            ("nni", "んい"), ("nna", "んあ"), ("nnn", "んん"),
+            ("kanji", "かんじ"), ("kan", "かん"), ("nihon", "にほん"),
+            ("konnichiha", "こんいちは"), ("konnnichiha", "こんにちは"),
+            ("kon'nichiha", "こんにちは"), ("ten'in", "てんいん"),
+            ("shinbun", "しんぶん"), ("zennzenn", "ぜんぜん"), ("onnna", "おんな"), ("onna", "おんあ"),
+            ("sannnin", "さんにん"), ("sannin", "さんいん"), ("hon", "ほん"),
+        ]);
+    }
+
+    #[test]
+    fn nの確定タイミング() {
         assert_eq!(pending_after("n"), "n");
-        assert_eq!(pending_after("nn"), "ん");
         assert_eq!(pending_after("kon"), "n");
-        assert_eq!(pending_after("konn"), "ん");
+        assert_eq!(pending_after("nn"), "");
+        assert_eq!(pending_after("konn"), "");
         assert_eq!(pending_after("ka"), "");
+        assert_eq!(pending_after("kk"), "k");
+        assert_eq!(run("kan"), ("か".to_string(), Flush::Kana("ん".to_string())));
     }
 
     #[test]
-    fn nnの表示を変えても確定結果は変わらない() {
-        assert_eq!(convert_string("konnichiha"), "こんにちは");
-        assert_eq!(convert_string("konnnichiha"), "こんにちは");
-        assert_eq!(convert_string("kanji"), "かんじ");
-        assert_eq!(convert_string("sannin"), "さんにん");
-        assert_eq!(convert_string("onna"), "おんな");
-        assert_eq!(convert_string("hon"), "ほん");
-        assert_eq!(pending_after("nnn"), "n");
+    fn 変換できない子音はdanglingで返す() {
+        assert_eq!(run("enter"), ("えんて".to_string(), Flush::Dangling("r".to_string())));
+        assert_eq!(run("sh"), (String::new(), Flush::Dangling("sh".to_string())));
+        assert_eq!(run(""), (String::new(), Flush::Empty));
+        assert_eq!(run("ka"), ("か".to_string(), Flush::Empty));
     }
 
     #[test]
-    fn test_basic_vowels() {
-        assert_eq!(convert_string("a"), "あ");
-        assert_eq!(convert_string("i"), "い");
-        assert_eq!(convert_string("u"), "う");
-        assert_eq!(convert_string("e"), "え");
-        assert_eq!(convert_string("o"), "お");
-    }
-    
-    #[test]
-    fn test_basic_syllables() {
-        assert_eq!(convert_string("ka"), "か");
-        assert_eq!(convert_string("ki"), "き");
-        assert_eq!(convert_string("ku"), "く");
-        assert_eq!(convert_string("ke"), "け");
-        assert_eq!(convert_string("ko"), "こ");
-    }
-    
-    #[test]
-    fn test_words() {
-        assert_eq!(convert_string("arigatou"), "ありがとう");
-        assert_eq!(convert_string("konnichiha"), "こんにちは"); // Correct Japanese
-        assert_eq!(convert_string("sayounara"), "さようなら");
-        assert_eq!(convert_string("ohayou"), "おはよう");
-        assert_eq!(convert_string("sumimasen"), "すみません");
-    }
-    
-    #[test] 
-    fn test_konnichiwa_edge_case() {
-        // konnichiwa is tricky because "nn" + "ichi" + "wa"
-        // The current algorithm may produce "こんいちわ"
-        let result = convert_string("konnichiwa");
-        assert!(result == "こんにちわ" || result == "こんいちわ", 
-                "konnichiwa converts to: {}", result);
-    }
-    
-    #[test]
-    fn test_n_handling() {
-        assert_eq!(convert_string("n"), "ん");
-        assert_eq!(convert_string("nn"), "ん");
-        assert_eq!(convert_string("kan"), "かん");
-        assert_eq!(convert_string("kana"), "かな");
-        assert_eq!(convert_string("kanai"), "かない");
-        assert_eq!(convert_string("nihon"), "にほん");
-        assert_eq!(convert_string("nihongo"), "にほんご");
-    }
-    
-    #[test]
-    fn test_double_consonants() {
-        assert_eq!(convert_string("gakkou"), "がっこう");
-        assert_eq!(convert_string("kitte"), "きって");
-        assert_eq!(convert_string("motto"), "もっと");
-        assert_eq!(convert_string("ippai"), "いっぱい");
-    }
-    
-    #[test]
-    fn test_small_kana() {
-        assert_eq!(convert_string("tokyo"), "ときょ");
-        assert_eq!(convert_string("kyoto"), "きょと");
-        assert_eq!(convert_string("shinjuku"), "しんじゅく");
-        assert_eq!(convert_string("shibuya"), "しぶや");
-    }
-    
-    #[test]
-    fn test_complex_sentence() {
-        assert_eq!(
-            convert_string("korededoukanatteomottakedozennzennumakuikanai"),
-            "これでどうかなっておもったけどぜんぜんうまくいかない"
-        );
-    }
-    
-    #[test]
-    fn test_sequential_n() {
-        assert_eq!(convert_string("zenzen"), "ぜんぜん");
-        assert_eq!(convert_string("zennzenn"), "ぜんぜん");
-        assert_eq!(convert_string("kanntan"), "かんたん");
-    }
-    
-    #[test]
-    fn test_alternates() {
-        assert_eq!(convert_string("si"), "し");
-        assert_eq!(convert_string("shi"), "し");
-        assert_eq!(convert_string("ti"), "ち");
-        assert_eq!(convert_string("chi"), "ち");
-        assert_eq!(convert_string("tu"), "つ");
-        assert_eq!(convert_string("tsu"), "つ");
-        assert_eq!(convert_string("hu"), "ふ");
-        assert_eq!(convert_string("fu"), "ふ");
-    }
-    
-    #[test]
-    fn test_mixed_patterns() {
-        assert_eq!(convert_string("watashiha"), "わたしは");
-        assert_eq!(convert_string("gakusei"), "がくせい");
-        assert_eq!(convert_string("sensei"), "せんせい");
-        assert_eq!(convert_string("daigaku"), "だいがく");
-        assert_eq!(convert_string("benkyou"), "べんきょう");
+    fn 表にない文字はそのまま出る() {
+        assert_eq!(convert_string("k1"), "k1");
+        assert_eq!(convert_string("kyk"), "kyk");
     }
 
     #[test]
-    fn test_ga_patterns() {
-        // Test that "ga" converts properly
-        assert_eq!(convert_string("ga"), "が");
-        assert_eq!(convert_string("gakkou"), "がっこう");
-        assert_eq!(convert_string("ganbatte"), "がんばって");
+    fn 単語と文() {
+        assert_table(&[
+            ("arigatou", "ありがとう"), ("sayounara", "さようなら"), ("sumimasen", "すみません"),
+            ("watashiha", "わたしは"), ("ganbatte", "がんばって"), ("benkyou", "べんきょう"),
+            ("korededoukanatteomottakedozennzennumakuikanai",
+             "これでどうかなっておもったけどぜんぜんうまくいかない"),
+        ]);
+    }
 
-        // Test gya patterns too
-        assert_eq!(convert_string("gya"), "ぎゃ");
-        assert_eq!(convert_string("gyaku"), "ぎゃく");
+    #[test]
+    fn バックスペースで未確定の末尾が消える() {
+        let mut converter = RomajiConverter::new();
+        "ky".chars().for_each(|ch| {
+            converter.process_input(ch);
+        });
+        converter.handle_backspace();
+        assert_eq!(converter.buffer(), "k");
     }
 }
