@@ -58,6 +58,8 @@ pub struct Composer<E: CandidateEngine> {
     translit: String,
     /// 字種変換に入る前の局面。スペースで変換に戻るときに使う。
     base: Phase,
+    /// カタカナ語に対応する英単語を引く関数。テストでは差し替える。
+    english_for: fn(&str) -> Vec<String>,
 }
 
 impl<E: CandidateEngine> Composer<E> {
@@ -74,7 +76,14 @@ impl<E: CandidateEngine> Composer<E> {
             pending_rerank: None,
             translit: String::new(),
             base: Phase::Empty,
+            english_for: |_| Vec::new(),
         }
+    }
+
+    /// カタカナ語の英単語候補 (desktop など) を引く関数を差し込む。
+    pub fn with_english(mut self, english_for: fn(&str) -> Vec<String>) -> Self {
+        self.english_for = english_for;
+        self
     }
 
     pub fn set_live(&mut self, live: bool) {
@@ -290,7 +299,9 @@ impl<E: CandidateEngine> Composer<E> {
         if let Some(index) = self.pending_rerank.take() {
             self.promote(index);
         }
+        // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
         self.insert_raw_candidate();
+        self.insert_english_candidates();
         if self.candidates.is_empty() {
             return false;
         }
@@ -402,21 +413,22 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_rerank.is_some()
     }
 
-    /// 変換済み候補列から raw を一旦外して display_index 番目を先頭へ昇格し、raw を第 1 候補の直後へ戻す。
+    /// 変換済み候補列から raw・英単語(engine_index なし)を一旦外して display_index 番目を先頭へ昇格し、第 1 候補の直後へ戻す。
     fn promote_converting(&mut self, display_index: usize) -> Option<String> {
-        let raw_at = self.candidates.iter().position(|c| c.engine_index.is_none());
-        let raw = raw_at.map(|i| self.candidates.remove(i));
-        if display_index >= self.candidates.len() {
-            if let (Some(raw), Some(i)) = (raw, raw_at) {
-                self.candidates.insert(i, raw);
-            }
+        let (engine, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut self.candidates)
+            .into_iter()
+            .partition(|c| c.engine_index.is_some());
+        if display_index >= engine.len() {
+            // 外す前の並びは復元できないので、第 1 候補の直後へ戻す。
+            self.candidates = engine;
+            let position = self.candidates.len().min(1);
+            self.candidates.splice(position..position, extras);
             return None;
         }
+        self.candidates = engine;
         self.promote(display_index);
-        if let Some(raw) = raw {
-            let position = self.candidates.len().min(1);
-            self.candidates.insert(position, raw);
-        }
+        let position = self.candidates.len().min(1);
+        self.candidates.splice(position..position, extras);
         Some(self.display().to_string())
     }
 
@@ -425,6 +437,24 @@ impl<E: CandidateEngine> Composer<E> {
             let chosen = self.candidates.remove(display_index);
             self.candidates.insert(0, chosen);
         }
+    }
+
+    /// 組成全体がカタカナ語として引ける場合、英単語を第 1 候補の直後に入れる (raw はその後ろ)。
+    fn insert_english_candidates(&mut self) {
+        if self.phase == Phase::Dangling || self.is_symbol() {
+            return;
+        }
+        let words = (self.english_for)(&translit::to_katakana(&self.hiragana));
+        let fresh: Vec<Candidate> = words
+            .into_iter()
+            .filter(|w| !self.candidates.iter().any(|c| &c.text == w))
+            .map(|text| Candidate {
+                text,
+                engine_index: None,
+            })
+            .collect();
+        let position = self.candidates.len().min(1);
+        self.candidates.splice(position..position, fresh);
     }
 
     fn insert_raw_candidate(&mut self) {
@@ -1245,5 +1275,102 @@ mod tests {
         let (mut c, _) = composer();
         assert!(!c.transliterate(Form::Katakana));
         assert_eq!(c.phase(), Phase::Empty);
+    }
+
+    fn loanwords(katakana: &str) -> Vec<String> {
+        match katakana {
+            "デスクトップ" => vec!["desktop".to_string()],
+            "エンター" => vec!["enter".to_string()],
+            "ライト" => vec!["light".to_string(), "right".to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn loan_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine> {
+        let engine = MockEngine {
+            log: Log::default(),
+            table: vec![(
+                reading.to_string(),
+                candidates.iter().map(|s| s.to_string()).collect(),
+            )],
+        };
+        Composer::new(engine).with_english(loanwords)
+    }
+
+    #[test]
+    fn カタカナ語は英単語が第1候補とrawの間に入る() {
+        let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ"]);
+        c.push_input("desukutoppu", "ですくとっぷ", "");
+        c.begin_conversion();
+        assert_eq!(
+            texts(&c),
+            vec!["デスクトップ", "desktop", "desukutoppu", "デス区トップ"]
+        );
+        assert_eq!(c.candidates()[1].engine_index, None);
+    }
+
+    #[test]
+    fn 英単語候補を選んで確定するとその文字列が出て学習しない() {
+        let mut c = loan_composer("ですくとっぷ", &["デスクトップ"]);
+        c.push_input("desukutoppu", "ですくとっぷ", "");
+        c.begin_conversion();
+        assert!(c.advance());
+        assert_eq!(c.display(), "desktop");
+        assert_eq!(c.commit(), "desktop");
+        assert!(c.engine.log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn 複数の英単語は表の順に並ぶ() {
+        let mut c = loan_composer("らいと", &["ライト"]);
+        c.push_input("raito", "らいと", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["ライト", "light", "right", "raito"]);
+    }
+
+    #[test]
+    fn 表に無い語は候補が増えない() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
+    }
+
+    #[test]
+    fn 末尾の子音が残るDanglingでは英単語を引かない() {
+        let mut c = loan_composer("ですくとっぷ", &["デスクトップ"]);
+        c.push_input("desukutoppu", "ですくとっぷ", "");
+        c.push_flush(Flush::Dangling("r".to_string()));
+        assert_eq!(c.phase(), Phase::Dangling);
+        c.begin_conversion();
+        assert!(!texts(&c).contains(&"desktop"));
+    }
+
+    #[test]
+    fn 文の一部だけがカタカナ語でも引かない() {
+        let mut c = loan_composer("ですくとっぷをみる", &["デスクトップを見る"]);
+        c.push_input("desukutoppuwomiru", "ですくとっぷをみる", "");
+        c.begin_conversion();
+        assert!(!texts(&c).contains(&"desktop"));
+    }
+
+    #[test]
+    fn 英単語がrawと同じなら一度だけ入る() {
+        let mut c = loan_composer("えんたー", &["エンター"]);
+        c.push_input("enter", "えんたー", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["エンター", "enter"]);
+    }
+
+    #[test]
+    fn リランキング後も英単語とrawは第1候補の直後に並ぶ() {
+        let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ"]);
+        c.push_input("desukutoppu", "ですくとっぷ", "");
+        c.begin_conversion();
+        assert_eq!(c.apply_rerank(c.current_generation(), 1).as_deref(), Some("デス区トップ"));
+        assert_eq!(
+            texts(&c),
+            vec!["デス区トップ", "desktop", "desukutoppu", "デスクトップ"]
+        );
     }
 }

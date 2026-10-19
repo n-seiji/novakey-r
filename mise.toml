@@ -15,7 +15,7 @@ description = "LLM候補リランキングのスモークテスト"
 run = "cargo run --release -- --test-llm"
 
 [tasks.test-kkc]
-description = "辞書かな漢字変換の1回変換スモークテスト"
+description = "辞書かな漢字変換の1回変換スモークテスト (読み指定可: mise run test-kkc -- ですくとっぷ)"
 run = "cargo run --release -- --test-kkc"
 
 [tasks.reset-memory]

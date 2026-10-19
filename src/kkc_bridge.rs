@@ -47,16 +47,23 @@ pub fn cancel(controller_id: u64) {
     unsafe { novakey_kkc_cancel(controller_id) };
 }
 
-pub fn smoke_test() {
+/// 読みを省略するとスモーク用の既定の文で、変換結果のアサートまで行う。読みを渡したときは候補を表示するだけ。
+pub fn smoke_test(reading: Option<&str>) {
     let memory_dir = std::env::temp_dir()
         .join(format!("novakey-r-kkc-smoke-{}", std::process::id()));
     std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
     std::env::set_var("NOVAKEY_MEMORY_DIR", &memory_dir);
 
-    let candidates = convert(0, 1, "きょうはいいてんきですね");
+    let default = reading.is_none();
+    let reading = reading.unwrap_or("きょうはいいてんきですね");
+    let candidates = convert(0, 1, reading);
     println!("candidates: {}", candidates.len());
     for (i, c) in candidates.iter().enumerate() {
         println!("{}: {}", i, c);
+    }
+    if !default {
+        cancel(0);
+        return;
     }
     assert!(select(0, 1, 0), "select が revision 一致で失敗");
     let again = convert(0, 2, "きょう");

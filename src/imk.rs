@@ -134,7 +134,7 @@ declare_class!(
             let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
             let this = this.set_ivars(Ivars {
                 converter: RefCell::new(RomajiConverter::new()),
-                composer: RefCell::new(Composer::new(KkcEngine { controller_id })),
+                composer: RefCell::new(Composer::new(KkcEngine { controller_id }).with_english(crate::loanword::english_for)),
                 mode: RefCell::new(ConversionMode::Space),
                 controller_id,
                 last_client: RefCell::new(None),

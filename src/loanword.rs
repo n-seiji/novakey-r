@@ -1,0 +1,92 @@
+#![forbid(unsafe_code)]
+
+// loanword.rs - カタカナ語 -> 英単語の表 (resources/loanwords.tsv, JMdict 由来)。
+// 表は初回参照時に一度だけ読み、ファイルが無ければ空の表として扱う。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
+type Table = HashMap<String, Vec<String>>;
+
+/// `カタカナ\t英単語[\t英単語...]` の行を表にする。`#` 始まりと空行は読み飛ばす。
+pub fn parse(tsv: &str) -> Table {
+    tsv.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut cols = l.split('\t');
+            let key = cols.next()?;
+            let words: Vec<String> = cols.filter(|w| !w.is_empty()).map(str::to_string).collect();
+            (!words.is_empty()).then(|| (key.to_string(), words))
+        })
+        .collect()
+}
+
+/// 完全一致を優先し、無ければ末尾の長音 (サーバ <-> サーバー) を足し引きして引く。
+pub fn lookup<'a>(table: &'a Table, katakana: &str) -> &'a [String] {
+    let variant = match katakana.strip_suffix('ー') {
+        Some(stem) => stem.to_string(),
+        None => format!("{katakana}ー"),
+    };
+    let found = table.get(katakana).or_else(|| table.get(&variant));
+    found.map_or(&[], Vec::as_slice)
+}
+
+fn table_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("NOVAKEY_LOANWORDS") {
+        return Some(path.into());
+    }
+    // Contents/MacOS/novakey_r から見た Contents/Resources/
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.parent()?.join("Resources/loanwords.tsv"))
+}
+
+static TABLE: LazyLock<Table> = LazyLock::new(|| {
+    table_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| parse(&s))
+        .unwrap_or_default()
+});
+
+/// カタカナ語に対応する英単語 (最大 3 件)。表に無ければ空。
+pub fn english_for(katakana: &str) -> Vec<String> {
+    lookup(&TABLE, katakana).to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> Table {
+        parse("# header\n\nサーバー\tserver\nライト\tlight\tright\nデスクトップ\tdesktop\n")
+    }
+
+    #[test]
+    fn コメントと空行は読み飛ばし複数の語は順に持つ() {
+        let t = table();
+        assert_eq!(t.len(), 3);
+        assert_eq!(lookup(&t, "ライト"), ["light", "right"]);
+    }
+
+    #[test]
+    fn 完全一致で引ける() {
+        assert_eq!(lookup(&table(), "デスクトップ"), ["desktop"]);
+    }
+
+    #[test]
+    fn 表に無い語は空() {
+        assert!(lookup(&table(), "ウナギ").is_empty());
+    }
+
+    #[test]
+    fn 末尾の長音は有無どちらでも引ける() {
+        let t = table();
+        assert_eq!(lookup(&t, "サーバ"), ["server"]);
+        assert_eq!(lookup(&t, "ライトー"), ["light", "right"]);
+    }
+
+    #[test]
+    fn 語の無い行は捨てる() {
+        assert!(parse("ア\t\nイ\n").is_empty());
+    }
+}
