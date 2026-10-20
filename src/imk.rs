@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 
 use objc2::rc::{Allocated, Id};
@@ -11,7 +11,7 @@ use objc2_foundation::{NSArray, NSObject, NSString};
 use crate::composer::{Composer, Phase};
 use crate::imk_client::Client;
 use crate::keymap::{self, Key, Stroke};
-use crate::kkc::RustEngine;
+use crate::kkc::{self, RustEngine};
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
@@ -96,6 +96,8 @@ pub struct Ivars {
     syncing: Cell<bool>,
     /// 候補パネルがハイライトしている行。パネルの行番号 API は使えないので、こちらで追跡する。
     panel_line: Cell<usize>,
+    /// クライアントの bundle id。コントローラは 1 つのクライアントに付くので、最初に取れたものを使い回す。
+    bundle_id: OnceCell<Option<String>>,
 }
 
 declare_class!(
@@ -131,6 +133,7 @@ declare_class!(
                 last_client: RefCell::new(None),
                 syncing: Cell::new(false),
                 panel_line: Cell::new(0),
+                bundle_id: OnceCell::new(),
             });
             // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
             let this: Option<Id<Self>> = unsafe {
@@ -239,6 +242,7 @@ declare_class!(
                 return;
             };
             trace::record("candidateSelected", &format!("phase={:?}", self.phase()));
+            self.sync_learning_flag(Some(&client));
             let effects = self.ivars().session.borrow_mut().commit_selected(&text);
             self.run(effects, Some(&client));
         }
@@ -306,6 +310,7 @@ declare_class!(
         fn commit_composition(&self, client: Option<&AnyObject>) {
             let client = client.map(Client::new);
             self.sync_rerank_flag();
+            self.sync_learning_flag(client.as_ref());
             let effects = self.ivars().session.borrow_mut().commit_composition();
             self.run(effects, client.as_ref());
         }
@@ -327,9 +332,22 @@ impl NovakeyRInputController {
             rerank_allowed(ai_rerank_enabled(), credentials_missing());
     }
 
+    /// 確定が起きうる処理の前に、学習してよい場面かを kkc に伝える。
+    fn sync_learning_flag(&self, client: Option<&Client>) {
+        let bundle_id = match self.ivars().bundle_id.get() {
+            Some(known) => known.as_deref(),
+            None => match client.or(self.ivars().last_client.borrow().as_ref()) {
+                Some(client) => self.ivars().bundle_id.get_or_init(|| client.bundle_id()).as_deref(),
+                None => None,
+            },
+        };
+        kkc::set_learning_allowed(outbound::learning_allowed(platform::is_secure_input_enabled(), bundle_id));
+    }
+
     /// キー処理の入口。session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &Client) -> bool {
         self.sync_rerank_flag();
+        self.sync_learning_flag(Some(client));
         // session の借用はここで外れる。以降の Cocoa 呼び出しは composer を再借用してよい。
         let outcome = self.ivars().session.borrow_mut().handle(key, text);
         let Outcome { handled, action, phase, effects } = outcome;

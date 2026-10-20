@@ -35,6 +35,16 @@ pub struct Snapshot<'a> {
     pub preceding: &'a str,
 }
 
+/// パスワードを扱うアプリ。外への送信も、学習も止める。
+const PASSWORD_MANAGERS: &[&str] = &[
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.bitwarden.desktop",
+    "com.apple.keychainaccess",
+    "com.apple.Passwords",
+];
+
+/// 外へ送らないアプリ (パスワード管理 + ターミナル)。ターミナルは学習は止めない。
 const DENIED_APPS: &[&str] = &[
     "com.1password.1password",
     "com.agilebits.onepassword7",
@@ -121,6 +131,11 @@ fn find_secret(text: &str) -> Option<&'static str> {
         .map(|(p, _)| p.name)
 }
 
+/// 確定を学習してよいか。セキュア入力中・パスワード管理アプリでは学習しない (ファイルに入力が残るため)。
+pub fn learning_allowed(secure_input: bool, bundle_id: Option<&str>) -> bool {
+    !secure_input && !bundle_id.is_some_and(|id| PASSWORD_MANAGERS.contains(&id))
+}
+
 pub fn decide(s: &Snapshot) -> Outbound {
     if s.secure_input {
         return Outbound::Skip(Reason::SecureInput);
@@ -165,6 +180,23 @@ mod tests {
             let s = Snapshot { secure_input: false, bundle_id: Some(id), preceding: "こんにちは" };
             assert_eq!(decide(&s), Outbound::Skip(Reason::DeniedApp), "bundle_id={id}");
         });
+    }
+
+    #[test]
+    fn password_managers_are_a_subset_of_denied_apps() {
+        assert!(PASSWORD_MANAGERS.iter().all(|id| DENIED_APPS.contains(id)));
+    }
+
+    #[test]
+    fn learning_is_blocked_for_secure_input_and_password_managers_only() {
+        assert!(learning_allowed(false, Some("com.apple.TextEdit")));
+        assert!(learning_allowed(false, None));
+        assert!(!learning_allowed(true, Some("com.apple.TextEdit")));
+        assert!(!learning_allowed(true, None));
+        for id in PASSWORD_MANAGERS {
+            assert!(!learning_allowed(false, Some(id)), "{id}");
+        }
+        assert!(learning_allowed(false, Some("com.apple.Terminal")), "ターミナルでは学習する");
     }
 
     #[test]

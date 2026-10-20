@@ -78,7 +78,17 @@ impl KkcCore {
 }
 
 thread_local! {
+    static LEARNING_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CORE: RefCell<Option<Rc<KkcCore>>> = const { RefCell::new(None) };
+}
+
+/// 確定を学習してよいか (セキュア入力中・パスワード管理アプリでは false)。IME 側がキーごとに設定する。
+pub fn set_learning_allowed(allowed: bool) {
+    LEARNING_ALLOWED.with(|c| c.set(allowed));
+}
+
+fn learning_allowed() -> bool {
+    LEARNING_ALLOWED.with(std::cell::Cell::get)
 }
 
 /// スレッドごとの共有コア。開けなかったときはエラーを 1 度表示して `None`。
@@ -144,7 +154,9 @@ impl CandidateEngine for RustEngine {
         };
         match candidates.get(engine_index) {
             Some(data) if r == revision => {
-                core.learn(data);
+                if learning_allowed() {
+                    core.learn(data);
+                }
                 true
             }
             _ => false,
@@ -188,6 +200,19 @@ mod tests {
         assert!(e.select(1, index_of(&before, "幹事")));
         let after = e.convert(2, "かんじをかく");
         assert!(after[0].starts_with("幹事"), "{after:?}");
+    }
+
+    #[test]
+    fn nothing_is_learned_while_learning_is_not_allowed() {
+        let mut e = engine(Learning::in_memory());
+        let cands = e.convert(1, "かんじ");
+        set_learning_allowed(false);
+        assert!(e.select(1, index_of(&cands, "幹事")), "候補としては選べる");
+        assert!(e.core.as_ref().unwrap().learning().borrow().is_empty());
+        set_learning_allowed(true);
+        e.convert(2, "かんじ");
+        assert!(e.select(2, index_of(&cands, "幹事")));
+        assert!(!e.core.as_ref().unwrap().learning().borrow().is_empty());
     }
 
     #[test]
