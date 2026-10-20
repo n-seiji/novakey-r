@@ -208,6 +208,7 @@ mod tests {
         let mut e = engine(Learning::open(&dir));
         let before = e.convert(1, "かんじ");
         assert!(e.select(1, index_of(&before, "幹事")));
+        e.core.as_ref().unwrap().learning().borrow().flush();
         let mut e2 = engine(Learning::open(&dir));
         assert_eq!(e2.convert(1, "かんじ")[0], "幹事");
         let _ = std::fs::remove_dir_all(&dir);

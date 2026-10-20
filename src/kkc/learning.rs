@@ -2,7 +2,8 @@
 //!
 //! 確定した候補を、単語ごと・第 1+第 2 文節の複合・候補全体の 3 種のエントリとして覚え、
 //! 次の変換でラティスに辞書と同じように加える。Swift 版の LOUDS 形式は読まず、ruby でソートした
-//! 1 つの TSV (`learning.tsv`) に書く。確定のたびに一時記憶を経ずに保存する (IME は即確定なので不要)。
+//! 1 つの TSV (`learning.tsv`) に書く。確定は一時記憶を経ずに即メモリへ反映し (IME は即確定なので不要)、
+//! ファイルへの書き出しは背景スレッドが持つ写しに差分を流して、まとめて (最短 `FLUSH_INTERVAL` ごとに 1 回) 行う。
 //!
 //! Swift 版との違い:
 //! - Swift は書き出すときに `lastUpdatedDay := lastUsedDay` にしてしまい、32 日ごとの半減が次の保存の
@@ -15,7 +16,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::elem::{count_graphemes, include_mm_value_calculation, is_clause, Elem};
 use super::lattice::Found;
@@ -25,6 +28,8 @@ pub const MAX_MEMORY_COUNT: usize = 65536;
 const HEADER: &str = "# novakey-r learning v1";
 const FILE_NAME: &str = "learning.tsv";
 const DIR_NAME: &str = "rust-learning";
+/// 最初の未保存の変更から、この時間だけ待ってまとめて書く。
+const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// 学習エントリ 1 件。`ruby` は呼び出し側 (マップのキー) が持つ。
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +117,100 @@ impl Piece {
     }
 }
 
+/// 学習エントリの一意キー (読み, 表層, lcid, rcid)。
+type EntryKey = (String, String, usize, usize);
+
+/// 背景スレッドに流す差分。メイン側と同じ操作を同じ順序で流すので、写しはメインの記憶と常に同じ内容になる。
+enum Msg {
+    /// 1 件を丸ごと入れ替える (なければ追加)
+    Upsert(String, MemEntry),
+    Prune(u16),
+    Remove(Vec<EntryKey>),
+    /// ここまでの変更を書き終えたら返事をする
+    Flush(Sender<()>),
+}
+
+/// ファイルへの書き出しを受け持つ背景スレッド。落とす (drop) と、未保存の分を書いてから止まる。
+struct Writer {
+    tx: Option<Sender<Msg>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Writer {
+    fn spawn(path: PathBuf, entries: HashMap<String, Vec<MemEntry>>, interval: Duration) -> Option<Self> {
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("novakey-learning".into())
+            .spawn(move || writer_loop(&rx, &path, entries, interval))
+            .ok()?;
+        Some(Self { tx: Some(tx), handle: Some(handle) })
+    }
+
+    fn send(&self, msg: Msg) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn writer_loop(rx: &mpsc::Receiver<Msg>, path: &Path, mut entries: HashMap<String, Vec<MemEntry>>, interval: Duration) {
+    let mut dirty_since: Option<Instant> = None;
+    loop {
+        let received = match dirty_since {
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(since) => rx.recv_timeout(interval.saturating_sub(since.elapsed())),
+        };
+        match received {
+            Ok(Msg::Flush(reply)) => {
+                if dirty_since.take().is_some() {
+                    write_file(path, &entries);
+                }
+                let _ = reply.send(());
+            }
+            Ok(msg) => {
+                apply(&mut entries, msg);
+                dirty_since.get_or_insert_with(Instant::now);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                dirty_since = None;
+                write_file(path, &entries);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if dirty_since.is_some() {
+                    write_file(path, &entries);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn apply(entries: &mut HashMap<String, Vec<MemEntry>>, msg: Msg) {
+    match msg {
+        Msg::Upsert(ruby, entry) => {
+            let list = entries.entry(ruby).or_default();
+            match list.iter_mut().find(|m| m.word == entry.word && m.lcid == entry.lcid && m.rcid == entry.rcid) {
+                Some(slot) => *slot = entry,
+                None => list.push(entry),
+            }
+        }
+        Msg::Prune(today) => {
+            prune_entries(entries, today);
+        }
+        Msg::Remove(keys) => remove_keys(entries, &keys),
+        Msg::Flush(_) => {}
+    }
+}
+
 pub struct Learning {
     /// `None` なら無効 (読み書きしない)
     enabled: bool,
@@ -121,12 +220,25 @@ pub struct Learning {
     len: usize,
     clock: Box<dyn Fn() -> u16>,
     cap: usize,
+    /// 最後に `prune` した日。同じ日の確定では整理し直さない (整理は全件を舐めるので)。
+    last_pruned: Option<u16>,
+    /// 保存先があるときだけ。
+    writer: Option<Writer>,
 }
 
 impl Learning {
     /// 読み書きしない学習。
     pub fn disabled() -> Self {
-        Self { enabled: false, path: None, entries: HashMap::new(), len: 0, clock: Box::new(system_today), cap: MAX_MEMORY_COUNT }
+        Self {
+            enabled: false,
+            path: None,
+            entries: HashMap::new(),
+            len: 0,
+            clock: Box::new(system_today),
+            cap: MAX_MEMORY_COUNT,
+            last_pruned: None,
+            writer: None,
+        }
     }
 
     /// 環境変数 (`NOVAKEY_DISABLE_LEARNING=1` で無効、`NOVAKEY_MEMORY_DIR`) に従って開く。
@@ -143,9 +255,39 @@ impl Learning {
     /// `dir` の `learning.tsv` を読んで開く。無いときは空、壊れているときは空にして
     /// 元のファイルを `learning.tsv.corrupt` に退避する (panic しない)。
     pub fn open(dir: &Path) -> Self {
-        let mut me = Self { enabled: true, path: Some(dir.join(FILE_NAME)), ..Self::disabled() };
+        Self::open_with(dir, Box::new(system_today), FLUSH_INTERVAL)
+    }
+
+    /// 時計を差し替えて開く (テスト用)。
+    #[cfg(test)]
+    fn open_at(dir: &Path, clock: impl Fn() -> u16 + 'static) -> Self {
+        Self::open_with(dir, Box::new(clock), FLUSH_INTERVAL)
+    }
+
+    /// 読み込んだら、古いものの整理と上限の適用を先に済ませる (確定のたびではなく、ここと日付が変わったとき)。
+    fn open_with(dir: &Path, clock: Box<dyn Fn() -> u16>, interval: Duration) -> Self {
+        let path = dir.join(FILE_NAME);
+        let mut me = Self { enabled: true, path: Some(path.clone()), clock, ..Self::disabled() };
         me.load();
+        let today = (me.clock)();
+        prune_entries(&mut me.entries, today);
+        me.last_pruned = Some(today);
+        me.len = me.entries.values().map(Vec::len).sum();
+        me.enforce_cap(&HashSet::new());
+        me.writer = Writer::spawn(path, me.entries.clone(), interval);
+        if me.writer.is_none() {
+            crate::platform::log("learning writer unavailable; learning stays in memory");
+        }
         me
+    }
+
+    /// 未保存の変更を書き終えるまで待つ (テスト用。通常は背景スレッドが間隔を空けて書く)。
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        let Some(writer) = &self.writer else { return };
+        let (tx, rx) = mpsc::channel();
+        writer.send(Msg::Flush(tx));
+        let _ = rx.recv_timeout(Duration::from_secs(10));
     }
 
     /// 保存しない有効な学習 (単体テスト用)。
@@ -226,9 +368,11 @@ impl Learning {
             return;
         }
         let today = (self.clock)();
-        let mut touched: HashSet<(String, String, usize, usize)> = HashSet::new();
-        // 保存済みのものを先に整理する (merge の「古いデータの選別」)
-        self.prune(today);
+        let mut touched: HashSet<EntryKey> = HashSet::new();
+        // 保存済みのものを先に整理する (merge の「古いデータの選別」)。日付が変わったときだけ。
+        if self.last_pruned != Some(today) {
+            self.prune(today);
+        }
         let mut memorize = |me: &mut Self, p: &Piece| {
             if p.ruby.is_empty() || !p.ruby.chars().all(known) {
                 return;
@@ -279,8 +423,33 @@ impl Learning {
             };
             memorize(self, &whole);
         }
-        self.enforce_cap(&touched);
-        self.save();
+        self.send_upserts(&touched);
+        let removed = self.enforce_cap(&touched);
+        if !removed.is_empty() {
+            self.emit(Msg::Remove(removed));
+        }
+    }
+
+    fn emit(&self, msg: Msg) {
+        if let Some(writer) = &self.writer {
+            writer.send(msg);
+        }
+    }
+
+    /// 今回触れたエントリの最終状態を写しに流す。
+    fn send_upserts(&self, touched: &HashSet<EntryKey>) {
+        if self.writer.is_none() {
+            return;
+        }
+        for (ruby, word, lcid, rcid) in touched {
+            let found = self
+                .entries
+                .get(ruby)
+                .and_then(|list| list.iter().find(|m| m.word == *word && m.lcid == *lcid && m.rcid == *rcid));
+            if let Some(m) = found {
+                self.emit(Msg::Upsert(ruby.clone(), m.clone()));
+            }
+        }
     }
 
     /// 1 件を覚える。同じ (読み, 表層, lcid, rcid) があれば出現数を足す。
@@ -298,39 +467,16 @@ impl Learning {
 
     /// 未来の日付のリセット・128 日以上使っていないものの削除・32 日ごとの半減。
     pub fn prune(&mut self, today: u16) {
-        let today = i32::from(today);
-        let mut removed = 0;
-        self.entries.retain(|_, list| {
-            list.retain_mut(|m| {
-                if today < i32::from(m.last_updated) || today < i32::from(m.last_used) {
-                    // 変なデータは入れ直す
-                    m.count = 1;
-                    m.last_used = today as u16;
-                    m.last_updated = today as u16;
-                }
-                if today - i32::from(m.last_used) >= 128 {
-                    removed += 1;
-                    return false;
-                }
-                while today - i32::from(m.last_updated) > 32 {
-                    m.count >>= 1;
-                    m.last_updated += 32;
-                }
-                if m.count == 0 {
-                    removed += 1;
-                    return false;
-                }
-                true
-            });
-            !list.is_empty()
-        });
-        self.len -= removed;
+        self.len -= prune_entries(&mut self.entries, today);
+        self.last_pruned = Some(today);
+        self.emit(Msg::Prune(today));
     }
 
-    /// 上限を超えた分を、読みの長いものから捨てる (今回触れたものは残す)。
-    fn enforce_cap(&mut self, touched: &HashSet<(String, String, usize, usize)>) {
-        if self.len <= self.cap {
-            return;
+    /// 上限を超えた分を、読みの長いものから捨てる (今回触れたものは残す)。捨てたキーを返す。
+    /// 全件を並べ替えるので、上限ちょうどからは毎回ではなく、上限の 1/16 を超えたときにまとめて上限まで減らす。
+    fn enforce_cap(&mut self, touched: &HashSet<EntryKey>) -> Vec<EntryKey> {
+        if self.len <= self.cap + self.cap / 16 {
+            return Vec::new();
         }
         let mut keys: Vec<(usize, String, String, usize, usize)> = self
             .entries
@@ -340,35 +486,68 @@ impl Learning {
             .collect();
         // 長い順 (同じ長さなら読み・表層の降順) に並べて先頭から捨てる
         keys.sort_by(|a, b| b.cmp(a));
-        for (_, ruby, word, lcid, rcid) in keys {
-            if self.len <= self.cap {
-                break;
+        let excess = self.len - self.cap;
+        let removed: Vec<EntryKey> = keys.into_iter().take(excess).map(|(_, ruby, word, l, r)| (ruby, word, l, r)).collect();
+        remove_keys(&mut self.entries, &removed);
+        self.len = self.entries.values().map(Vec::len).sum();
+        removed
+    }
+}
+
+/// 整理して、消した件数を返す。
+fn prune_entries(entries: &mut HashMap<String, Vec<MemEntry>>, today: u16) -> usize {
+    let today = i32::from(today);
+    let mut removed = 0;
+    entries.retain(|_, list| {
+        list.retain_mut(|m| {
+            if today < i32::from(m.last_updated) || today < i32::from(m.last_used) {
+                // 変なデータは入れ直す
+                m.count = 1;
+                m.last_used = today as u16;
+                m.last_updated = today as u16;
             }
-            if let Some(list) = self.entries.get_mut(&ruby) {
-                let before = list.len();
-                list.retain(|m| !(m.word == word && m.lcid == lcid && m.rcid == rcid));
-                self.len -= before - list.len();
-                if list.is_empty() {
-                    self.entries.remove(&ruby);
-                }
+            if today - i32::from(m.last_used) >= 128 {
+                removed += 1;
+                return false;
+            }
+            while today - i32::from(m.last_updated) > 32 {
+                m.count >>= 1;
+                m.last_updated += 32;
+            }
+            if m.count == 0 {
+                removed += 1;
+                return false;
+            }
+            true
+        });
+        !list.is_empty()
+    });
+    removed
+}
+
+fn remove_keys(entries: &mut HashMap<String, Vec<MemEntry>>, keys: &[EntryKey]) {
+    for (ruby, word, lcid, rcid) in keys {
+        if let Some(list) = entries.get_mut(ruby) {
+            list.retain(|m| !(m.word == *word && m.lcid == *lcid && m.rcid == *rcid));
+            if list.is_empty() {
+                entries.remove(ruby);
             }
         }
     }
+}
 
-    /// `learning.tsv` に書く (一時ファイルに書いてから rename)。
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
-        let result = (|| -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("tsv.tmp");
-            std::fs::write(&tmp, serialize(&self.entries))?;
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = result {
-            eprintln!("novakey_r: 学習データを保存できませんでした ({}): {e}", path.display());
+/// `learning.tsv` に書く (一時ファイルに書いてから rename)。背景スレッドから呼ぶ。
+fn write_file(path: &Path, entries: &HashMap<String, Vec<MemEntry>>) {
+    let result = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        let tmp = path.with_extension("tsv.tmp");
+        std::fs::write(&tmp, serialize(entries))?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        eprintln!("novakey_r: 学習データを保存できませんでした ({}): {e}", path.display());
     }
 }
 
@@ -667,14 +846,14 @@ mod tests {
         let dir = tmp_dir("roundtrip");
         let day = Rc::new(Cell::new(1000u16));
         {
-            let mut l = Learning::open(&dir).with_clock(clock(&day));
+            let mut l = Learning::open_at(&dir, clock(&day));
             l.learn(&[el("幹\t事", "カ\\ンジ", 1288, 1288, 501, -7.0)], &known);
             l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
             l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
         }
         assert!(dir.join("learning.tsv").exists());
         assert!(!dir.join("learning.tsv.tmp").exists(), "一時ファイルは rename で消える");
-        let l = Learning::open(&dir);
+        let l = Learning::open_at(&dir, clock(&day));
         assert_eq!(l.len(), 2);
         assert_eq!(l.entries_for("カンジ")[0].count, 2);
         assert_eq!(l.entries_for("カ\\ンジ")[0].word, "幹\t事");
@@ -714,6 +893,7 @@ mod tests {
             assert!(dir.join("learning.tsv.corrupt").exists(), "{name}: 退避される");
             // その後も普通に学習できる
             l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+            drop(l);
             assert_eq!(Learning::open(&dir).len(), 1, "{name}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -724,5 +904,87 @@ mod tests {
         let dir = tmp_dir("missing");
         assert!(Learning::open(&dir).is_empty());
         assert!(!dir.exists(), "読むだけでは作らない");
+    }
+
+    #[test]
+    fn writes_are_coalesced_and_the_file_matches_memory() {
+        let dir = tmp_dir("coalesce");
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::open_with(&dir, Box::new(clock(&day)), Duration::from_secs(3600));
+        for i in 0..20 {
+            l.learn(&[el(&format!("語{i}"), &format!("ゴ{i}"), 1288, 1288, 501, -7.0)], &known);
+        }
+        assert!(!dir.join("learning.tsv").exists(), "間隔内では書かない");
+        l.flush();
+        assert_eq!(serialize(&l.entries), std::fs::read_to_string(dir.join("learning.tsv")).unwrap());
+        // 日付が変わった整理も写しに届く
+        day.set(1100);
+        l.learn(&[el("新", "シン", 1288, 1288, 501, -7.0)], &known);
+        l.flush();
+        assert_eq!(l.len(), 1);
+        assert_eq!(serialize(&l.entries), std::fs::read_to_string(dir.join("learning.tsv")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_file_follows_cap_evictions() {
+        let dir = tmp_dir("cap-mirror");
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::open_with(&dir, Box::new(clock(&day)), Duration::from_secs(3600)).with_cap(3);
+        for ruby in ["ア", "イイ", "ウウウ", "エエエエ", "オ"] {
+            l.learn(&[el(ruby, ruby, 1288, 1288, 501, -7.0)], &known);
+        }
+        l.flush();
+        assert_eq!(l.len(), 3);
+        assert_eq!(serialize(&l.entries), std::fs::read_to_string(dir.join("learning.tsv")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_flushes_pending_changes() {
+        let dir = tmp_dir("drop-flush");
+        let mut l = Learning::open_with(&dir, Box::new(system_today), Duration::from_secs(3600));
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        drop(l);
+        assert_eq!(Learning::open(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_interval_timer_writes_without_a_flush() {
+        let dir = tmp_dir("timer");
+        let mut l = Learning::open_with(&dir, Box::new(system_today), Duration::from_millis(50));
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("learning.tsv").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.join("learning.tsv").exists());
+        drop(l);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手元計測用 (`LEARNING_BENCH_DIR=<learning.tsv のあるディレクトリ> cargo test --release bench_commit_cost -- --ignored --nocapture`)。
+    /// 読み込み済みの大きな記憶に 1 件ずつ確定したときの、メインスレッドの 1 回あたりの時間を出す。
+    #[test]
+    #[ignore]
+    fn bench_commit_cost() {
+        let Some(src) = std::env::var_os("LEARNING_BENCH_DIR") else { return };
+        let dir = tmp_dir("bench");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(Path::new(&src).join("learning.tsv"), dir.join("learning.tsv")).unwrap();
+        let mut l = Learning::open(&dir);
+        println!("entries={}", l.len());
+        let mut times = Vec::new();
+        for i in 0..40 {
+            let d = [el(&format!("新語{i}"), &format!("シンゴ{i}"), 1288, 1288, 501, -7.0)];
+            let t = std::time::Instant::now();
+            l.learn(&d, &known);
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        println!("learn() ms: min={:.2} median={:.2} p90={:.2} max={:.2}", times[0], times[times.len() / 2], times[times.len() * 9 / 10], times[times.len() - 1]);
+        drop(l);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
