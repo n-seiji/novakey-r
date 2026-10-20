@@ -278,9 +278,16 @@ impl<S: CredentialStore> State<S> {
     }
 
     /// 時刻が来た送信を取り出す。取り出した時点で「送信済み」として数える。
+    #[cfg(test)]
     pub fn take_due(&mut self, now: Instant) -> Vec<InFlight> {
+        self.take_due_up_to(now, usize::MAX)
+    }
+
+    /// 取り出す件数に上限をつけた版。残りは待機に残り、次の呼び出しで取り出す。
+    pub fn take_due_up_to(&mut self, now: Instant, max: usize) -> Vec<InFlight> {
         let mut ids: Vec<u64> = self.pending.iter().filter(|(_, p)| p.due <= now).map(|(id, _)| *id).collect();
         ids.sort_unstable();
+        ids.truncate(max);
         let mut out = Vec::new();
         for id in ids {
             let Some(p) = self.pending.remove(&id) else { continue };
@@ -298,6 +305,13 @@ impl<S: CredentialStore> State<S> {
             });
         }
         out
+    }
+
+    /// 待機中のジョブと世代の記録を全部捨てる (ワーカーが使えなくなったとき)。
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.latest.clear();
+        self.sent.clear();
     }
 
     /// 通信の結果を受ける。その間に新しい世代が来ていれば捨てる (最新だけ採用)。
@@ -501,6 +515,19 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].generation, 2);
         assert_eq!(due[0].request_number, 1, "捨てた世代は数えない");
+    }
+
+    #[test]
+    fn take_due_up_to_leaves_the_rest_waiting() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        for id in 1..=3 {
+            s.submit(t0, job(id, 1, "あ", true));
+        }
+        assert_eq!(s.take_due_up_to(t0, 2).len(), 2);
+        let rest = s.take_due_up_to(t0, 2);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].controller_id, 3);
     }
 
     #[test]
