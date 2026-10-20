@@ -14,8 +14,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -332,13 +334,22 @@ impl Learning {
             }
         };
         match parse(&bytes) {
-            Some(entries) => {
-                self.len = entries.values().map(Vec::len).sum();
-                self.entries = entries;
+            Some(parsed) => {
+                self.len = parsed.entries.values().map(Vec::len).sum();
+                self.entries = parsed.entries;
+                if parsed.skipped > 0 {
+                    // 次の保存で壊れた行が消えるので、元のファイルは写しを残す。
+                    crate::platform::log(&format!("learning file: skipped {} unreadable line(s)", parsed.skipped));
+                    if let Err(e) = backup(&path, false) {
+                        eprintln!("novakey_r: 学習データの退避に失敗しました: {e}");
+                    }
+                }
             }
             None => {
-                eprintln!("novakey_r: 学習データが壊れています。空として扱います ({})", path.display());
-                let _ = std::fs::rename(&path, path.with_extension("tsv.corrupt"));
+                crate::platform::log("learning file unreadable; starting empty");
+                if let Err(e) = backup(&path, true) {
+                    eprintln!("novakey_r: 学習データの退避に失敗しました: {e}");
+                }
             }
         }
     }
@@ -536,18 +547,49 @@ fn remove_keys(entries: &mut HashMap<String, Vec<MemEntry>>, keys: &[EntryKey]) 
     }
 }
 
-/// `learning.tsv` に書く (一時ファイルに書いてから rename)。背景スレッドから呼ぶ。
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `learning.tsv` に書く。pid と通し番号で一意にした一時ファイルへ書き、`sync_all` してから rename する
+/// (電源断でも、半端なファイルが本物に置き換わらない)。背景スレッドから呼ぶ。
+/// IME プロセスが同時に複数いると後から書いたものが勝つ (last-writer-wins) が、通常は 1 つなので許容する。
 fn write_file(path: &Path, entries: &HashMap<String, Vec<MemEntry>>) {
     let result = (|| -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("tsv.tmp");
-        std::fs::write(&tmp, serialize(entries))?;
-        std::fs::rename(&tmp, path)
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tsv.tmp-{}-{n}", std::process::id()));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(serialize(entries).as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     })();
     if let Err(e) = result {
         eprintln!("novakey_r: 学習データを保存できませんでした ({}): {e}", path.display());
+    }
+}
+
+/// 壊れたファイルを `<name>.corrupt-<unix 秒>` に残す。同名があれば `-1`, `-2` ... を付けて、前の退避は上書きしない。
+/// `rename` が false なら写しを取る (元のファイルは次の保存で置き換わる)。
+fn backup(path: &Path, rename: bool) -> std::io::Result<()> {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let name = path.file_name().map_or_else(|| FILE_NAME.into(), |n| n.to_string_lossy().into_owned());
+    let mut target = path.with_file_name(format!("{name}.corrupt-{secs}"));
+    let mut n = 0;
+    while target.exists() {
+        n += 1;
+        target = path.with_file_name(format!("{name}.corrupt-{secs}-{n}"));
+    }
+    if rename {
+        std::fs::rename(path, target)
+    } else {
+        std::fs::copy(path, target).map(|_| ())
     }
 }
 
@@ -610,39 +652,58 @@ fn serialize(entries: &HashMap<String, Vec<MemEntry>>) -> String {
     out
 }
 
-/// 壊れていたら `None`。
-fn parse(bytes: &[u8]) -> Option<HashMap<String, Vec<MemEntry>>> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut lines = text.lines();
-    if lines.next()? != HEADER {
+struct Parsed {
+    entries: HashMap<String, Vec<MemEntry>>,
+    /// 読めずに飛ばした行数 (空行は数えない)
+    skipped: usize,
+}
+
+/// 1 行ずつ読み、読めない行・重複する行は飛ばして数える。ヘッダが違う (別のファイル・壊れている) ときだけ `None`。
+fn parse(bytes: &[u8]) -> Option<Parsed> {
+    let mut lines = bytes.split(|&b| b == b'\n');
+    let header = std::str::from_utf8(lines.next()?).ok()?;
+    if header.trim_end_matches('\r') != HEADER {
         return None;
     }
     let mut entries: HashMap<String, Vec<MemEntry>> = HashMap::new();
-    for line in lines {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 8 {
-            return None;
+    let mut skipped = 0;
+    for raw in lines {
+        if raw.is_empty() {
+            continue;
         }
-        let ruby = unescape(f[0])?;
-        if ruby.is_empty() {
-            return None;
-        }
-        let m = MemEntry {
-            word: unescape(f[1])?,
-            lcid: f[2].parse().ok()?,
-            rcid: f[3].parse().ok()?,
-            mid: f[4].parse().ok()?,
-            count: f[5].parse().ok()?,
-            last_used: f[6].parse().ok()?,
-            last_updated: f[7].parse().ok()?,
+        let Some((ruby, m)) = std::str::from_utf8(raw).ok().and_then(|line| parse_line(line.trim_end_matches('\r'))) else {
+            skipped += 1;
+            continue;
         };
         let list = entries.entry(ruby).or_default();
         if list.iter().any(|x| x.word == m.word && x.lcid == m.lcid && x.rcid == m.rcid) {
-            return None;
+            skipped += 1;
+            continue;
         }
         list.push(m);
     }
-    Some(entries)
+    Some(Parsed { entries, skipped })
+}
+
+fn parse_line(line: &str) -> Option<(String, MemEntry)> {
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() != 8 {
+        return None;
+    }
+    let ruby = unescape(f[0])?;
+    if ruby.is_empty() {
+        return None;
+    }
+    let m = MemEntry {
+        word: unescape(f[1])?,
+        lcid: f[2].parse().ok()?,
+        rcid: f[3].parse().ok()?,
+        mid: f[4].parse().ok()?,
+        count: f[5].parse().ok()?,
+        last_used: f[6].parse().ok()?,
+        last_updated: f[7].parse().ok()?,
+    };
+    Some((ruby, m))
 }
 
 #[cfg(test)]
@@ -874,29 +935,96 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(".corrupt-")))
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
-    fn corrupted_file_is_treated_as_empty() {
+    fn unreadable_file_is_backed_up_and_treated_as_empty() {
         for (name, content) in [
             ("garbage", b"\xff\xfe\x00 not a tsv".to_vec()),
             ("header", "# other\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\n".as_bytes().to_vec()),
-            ("fields", format!("{HEADER}\nカンジ\t幹事\t1\n").into_bytes()),
-            ("number", format!("{HEADER}\nカンジ\t幹事\tx\t1\t1\t1\t1\t1\n").into_bytes()),
-            ("range", format!("{HEADER}\nカンジ\t幹事\t1\t1\t1\t999\t1\t1\n").into_bytes()),
-            ("escape", format!("{HEADER}\nカンジ\t幹\\q\t1\t1\t1\t1\t1\t1\n").into_bytes()),
-            ("dup", format!("{HEADER}\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\n").into_bytes()),
         ] {
             let dir = tmp_dir(name);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("learning.tsv"), content).unwrap();
+            std::fs::write(dir.join("learning.tsv"), &content).unwrap();
             let mut l = Learning::open(&dir);
             assert!(l.is_empty(), "{name}");
-            assert!(dir.join("learning.tsv.corrupt").exists(), "{name}: 退避される");
+            let saved = backups(&dir);
+            assert_eq!(saved.len(), 1, "{name}: 退避される");
+            assert_eq!(std::fs::read(&saved[0]).unwrap(), content, "{name}: 中身はそのまま");
+            assert!(!dir.join("learning.tsv").exists(), "{name}");
             // その後も普通に学習できる
             l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
             drop(l);
             assert_eq!(Learning::open(&dir).len(), 1, "{name}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn bad_lines_are_skipped_without_losing_the_good_ones() {
+        let good = "ゴ\t語\t1288\t1288\t501\t2\t1700\t1700";
+        for (name, bad) in [
+            ("fields", "カンジ\t幹事\t1".to_string()),
+            ("number", "カンジ\t幹事\tx\t1\t1\t1\t1\t1".to_string()),
+            ("range", "カンジ\t幹事\t1\t1\t1\t999\t1\t1".to_string()),
+            ("escape", "カンジ\t幹\\q\t1\t1\t1\t1\t1\t1".to_string()),
+            ("dup", good.to_string()),
+            ("empty ruby", "\t幹事\t1\t1\t1\t1\t1\t1".to_string()),
+        ] {
+            let dir = tmp_dir(&format!("skip-{}", name.replace(' ', "-")));
+            std::fs::create_dir_all(&dir).unwrap();
+            let original = format!("{HEADER}\n{good}\n{bad}\n");
+            std::fs::write(dir.join("learning.tsv"), &original).unwrap();
+            let day = Rc::new(Cell::new(1700u16));
+            let l = Learning::open_at(&dir, clock(&day));
+            assert_eq!(l.len(), 1, "{name}");
+            assert_eq!(l.entries_for("ゴ")[0].count, 2, "{name}");
+            let saved = backups(&dir);
+            assert_eq!(saved.len(), 1, "{name}: 壊れた行があれば元のファイルの写しを残す");
+            assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), original, "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn earlier_backups_are_never_overwritten() {
+        let dir = tmp_dir("backups");
+        std::fs::create_dir_all(&dir).unwrap();
+        for round in 0..3 {
+            std::fs::write(dir.join("learning.tsv"), format!("broken {round}")).unwrap();
+            drop(Learning::open(&dir));
+        }
+        let saved = backups(&dir);
+        assert_eq!(saved.len(), 3);
+        let mut bodies: Vec<String> = saved.iter().map(|p| std::fs::read_to_string(p).unwrap()).collect();
+        bodies.sort();
+        assert_eq!(bodies, ["broken 0", "broken 1", "broken 2"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_files_have_unique_names_and_are_synced_then_renamed() {
+        let dir = tmp_dir("tmpnames");
+        let mut entries = HashMap::new();
+        entries.insert("ア".to_string(), vec![MemEntry { word: "亜".into(), lcid: 1, rcid: 1, mid: 1, count: 1, last_used: 1, last_updated: 1 }]);
+        let path = dir.join("learning.tsv");
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| (0..10).for_each(|_| write_file(&path, &entries)));
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), serialize(&entries));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name() != "learning.tsv").collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
