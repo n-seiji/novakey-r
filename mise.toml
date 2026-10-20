@@ -18,6 +18,14 @@ run = "cargo run --release -- --test-llm"
 description = "辞書かな漢字変換の1回変換スモークテスト (読み指定可: mise run test-kkc -- ですくとっぷ)"
 run = "cargo run --release -- --test-kkc"
 
+[tasks.simulate]
+description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
+run = "cargo run --release -- --simulate"
+
+[tasks.scenarios]
+description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
+run = "cargo run --release -- --simulate-file tools/scenarios.txt"
+
 [tasks.reset-memory]
 description = "変換学習データを全消去する"
 run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"
