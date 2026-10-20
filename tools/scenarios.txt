@@ -1,0 +1,384 @@
+# 期待付きシナリオ: `mise run scenarios` で流す。形式: キー列<TAB>確定される文字列 (期待が無い行は表示のみ)。
+# キー表記は src/simulate.rs を参照。IME が処理せずアプリに素通しした Enter は改行として確定文字列に入る。
+# 変換結果は azooKey の辞書と順位に依存する (学習は無効)。辞書を更新したら差分を目で見て更新する。
+# 判断保留の挙動 (変換後の続けて入力、変換中の Backspace、組成中の Esc など) は現状を記録しているだけで、望ましいと決めたものではない。
+kin'en<enter>	きんえん
+n'a<enter>	んあ
+t'i<enter>	てぃ
+a'<enter>	あ'
+kyouhaishaniiku<space><enter>	強廃車に行く
+watashihagakuseidesu<space><enter>	私は学生です
+konnnichiha<enter>	こんにちは
+konnichiha<space><enter>	艮一は
+arigatougozaimasu<space><enter>	ありがとうございます
+kitte<enter>	きって
+matcha<enter>	まっちゃ
+uxinndo<enter>	うぃんど
+fairu<enter>	ふぁいる
+thi-<enter>	てぃー
+shinbun<enter>	しんぶん
+kanna<enter>	かんあ
+onnna<enter>	おんな
+onna<enter>	おんあ
+enter<space><enter>	enter
+enter<enter>	enter
+hello<space><enter>	へっォ
+hello<space><space><enter>	hello
+world<space><enter>	world
+git<space><enter>	git
+commit<space><enter>	commit
+ok<space><enter>	ok
+iPhone<enter>	iPhone
+iPhone<space><enter>	iPhone
+google<space><enter>	google
+desukutoppu<space><space><enter>	desktop
+desukutoppu<space><space><space><enter>	desukutoppu
+uxinndou<space><enter>	ウィンドウ
+uxinndou<space><space><enter>	window
+123<enter>	123\n
+kyou123<enter>	きょう123
+kyou123<space><enter>	共123
+kyou<space>1
+kyou<space>2
+1<enter>	1\n
+5	5
+0	0
+l
+kyou,<enter>	きょう、
+kyou.<enter>	きょう。
+kyou!<enter>	きょう！
+kyou?<enter>	きょう？
+kyou-<enter>	きょうー
+ko-hi-<space><enter>	コーヒー
+,<enter>	、
+.<enter>	。
+!<enter>	！
+?<enter>	？
+(<enter>	（
+(<space><enter>	（
+(<space><space><enter>	(
+(<space><space><space><enter>	【
+[<enter>	「
+[<space><enter>	「
+[<space><space><enter>	『
+]<space><enter>	」
+~<enter>	〜
+~<space><space><enter>	～
+/<enter>	・
+/<space><enter>	・
+:<enter>	：
+;<space><enter>	；
+{<space><enter>	｛
+-<enter>	ー
+-<space><enter>	ー
+kyou<bs><bs><enter>	き
+kyou<bs><bs><bs><bs><bs><enter>	\n
+kyo<bs>u<enter>	きう
+kyou<space><bs><enter>	きょ
+kyou<space><space><bs><enter>	きょ
+kyou<space><space><bs><bs><enter>	き
+kyou<space><esc><enter>	きょう
+kyou<space><space><esc><enter>	きょう
+kyou<space><esc><esc><enter>	きょう
+kyou<esc><enter>	きょう
+kyou<esc><esc>
+kyou<space><S-space><S-space><enter>	興
+kyou<S-space><enter>	強
+<S-space>	 
+<space>	 
+<enter>	\n
+<tab>	\t
+<bs>	
+<esc>	
+a<tab>	あ\t
+kyou<tab>x
+kyou<space><tab>	強\t
+kyou<space><up><enter>	巨
+kyou<space><down><enter>	kyou
+kyou<up><enter>	きょう
+kyou<space><space>3	今日
+kyou<space><space>9	興
+kyou<space><space>0
+kyou<space><space>1	強
+kyou<space>a
+kyou<space>a<enter>	きょうあ
+kyou<space>.<enter>	きょう。
+kyou<space>-<enter>	きょうー
+kyou<space>(<enter>	きょう（
+kyou<space>A
+kyou<space><space>a
+kyou<space><enter>kyou<space><enter>	強強
+kyou<enter>kyou<enter>	きょうきょう
+Tokyo<enter>	Tokyo
+Tokyo<space><enter>	Tokyo \n
+Tokyo<bs><bs><enter>	Tok
+IPhone<enter>	IPhone
+iPhone<bs><enter>	iPho
+Tokyo.<enter>	Tokyo.\n
+Tokyo1<enter>	Tokyo1
+Tokyo-san<enter>	Tokyo-san
+Tokyo(<enter>	Tokyo(
+kyouTokyo<enter>	きょうときょ
+kyouT<enter>	kyouT
+hello<bs><bs><bs><bs><bs><bs>	
+hello<bs><bs>
+nn<bs>	
+k<enter>	k
+k<space><enter>	k
+k<bs>	
+k<esc>	
+kk<enter>	kk
+kyou<left>
+<left>	
+<up>	
+kyou<C-k><enter>	キョウ
+kyou<C-l><enter>	ｋｙｏｕ
+kyou<F7><enter>	キョウ
+kyou<F7><space><enter>	強
+kyou<F7>a<enter>	きょうあ
+kyou<F7><bs><enter>	きょ
+kyou<F7><esc><enter>	きょう
+kyou<F7><F7><enter>	キョウ
+kyou<F8><enter>	ｷｮｳ
+kyou<F9><F9><F9><enter>	Ｋｙｏｕ
+kyou<F10><enter>	kyou
+kyou<F6><enter>	きょう
+kyou<C-j><enter>	きょう
+kyou<space><C-k><enter>	キョウ
+kyou<space><space><C-k><enter>	キョウ
+<C-k>	
+<F7>	
+<C-a>	
+kyou<C-a>
+kyou<C-;><enter>	ｷｮｳ
+kyou<C-:><enter>	kyou
+kyonn<enter>	きょん
+kyon<enter>	きょん
+kyon<space><enter>	きょん
+nihongo<space><enter>	日本語
+nihongo<space><space><enter>	nihongo
+githubwo<space><enter>	githubwo
+githubwo<space><space><enter>	ぎてゅbを
+git<space><space><enter>	義t
+git<space><space><space><enter>	魏t
+git<bs><space><enter>	偽
+gi<space><enter>	偽
+gi<space><space><enter>	gi
+test<space><enter>	test
+test<space><space><enter>	手st
+test<space><space><space><enter>	てst
+iPhone<space><space><enter>	異p骨
+google<space><space><enter>	ごおgぇ
+chrome<space><enter>	chrome
+Chrome<space><enter>	Chrome \n
+kyouhaiitenkidesune<space><enter>	強はいい天気ですね
+kyouhaiitenkidesune<space><space><space><enter>	今日はいい天気ですね
+bokuhasushiwotabetai<space><enter>	僕は寿司を食べたい
+oosaka<space><enter>	大阪
+oosakajou<space><enter>	大坂城
+puroguramingu<space><enter>	プログラミング
+puroguramingu<space><space><enter>	programming
+konpyu-ta<space><enter>	コンピュータ
+konpyu-ta<space><space><enter>	computer
+kompyu-ta<space><space><enter>	kompyu-ta
+sa-ba-<space><space><enter>	server
+meiru<space><space><enter>	email
+sofutowea<space><space><enter>	sofutowea
+appuru<space><space><enter>	appuru
+kiibo-do<space><space><enter>	kiibo-do
+masu<space><space><space><enter>	masu
+sukurin<space><enter>	スクリん
+ie<enter>	いえ
+wo<enter>	を
+wi<enter>	うぃ
+we<enter>	うぇ
+va<enter>	ゔぁ
+vu<enter>	ゔ
+tsu<enter>	つ
+ltu<enter>	っ
+xtu<enter>	っ
+xa<enter>	ぁ
+la<enter>	ぁ
+kya<enter>	きゃ
+sha<enter>	しゃ
+cha<enter>	ちゃ
+tya<enter>	ちゃ
+jya<enter>	じゃ
+dhi<enter>	でぃ
+whi<enter>	うぃ
+qa<enter>	くぁ
+fi<enter>	ふぃ
+ti<enter>	ち
+tti<enter>	っち
+nya<enter>	にゃ
+nnya<enter>	んや
+n'a<enter>	んあ
+n'<enter>	ん
+nn<enter>	ん
+n<enter>	ん
+nk<enter>	nk
+nka<enter>	んか
+kanji<space><enter>	感じ
+zzz<enter>	zzz
+zz<enter>	zz
+1+1=2<enter>	1+1=2\n
+kyou1<enter>	きょう1
+kyou1<space><enter>	今日1
+kyou1gatsu<space><enter>	今日1ガツ
+2024nen<space><enter>	2024念
+2024nen<space><space><enter>	2024nen
+sen<space><enter>	戦
+iti<space><enter>	一
+ichi<space><enter>	一
+ni<space><enter>	に
+san<space><enter>	山
+123<space><enter>	123 \n
+12<space>	12 
+kyou@<enter>	きょう@
+kyou@
+@	@
+$	$
+%	%
+&	&
+*	*
++	+
+=	=
+'	'
+"	"
+\	\\
+|	|
+^	^
+_	_
+`	`
+kyou"<enter>	きょう"
+kyou'<enter>	きょう'
+kyou<space>"
+Tokyo<esc><enter>	Tokyo
+Tokyo<esc>
+Tokyo<tab>	Tokyo\t
+Tokyo<S-space>x
+Tokyo<up>
+enter<esc><enter>	えんて
+enter<esc><esc>
+enter<esc>a<enter>	えんてあ
+enter<bs><bs><enter>	えん
+enter<space><esc><enter>	えんてr
+enter<space><space><esc><enter>	えんてr
+enter<space><bs><enter>	えんて
+enter1<enter>	enter1\n
+enter,<enter>	enter,\n
+enter-<enter>	enter-\n
+enter(<enter>	enter(\n
+enter<space>1
+enter<space>x<enter>	enterx
+enter<space><space>1	enter
+kyou<space><space>2	kyou
+git<space>1
+git<space><space>2	義t
+(<space><space><space><space><space><space><space><space><space><space><space><space><enter>	『
+(<S-space><enter>	（
+(<space><S-space><S-space><enter>	〔
+(<bs><enter>	\n
+(<esc><enter>	（
+(<space><esc><enter>	（
+(<space><bs><enter>	\n
+(<space><space><bs><enter>	\n
+(a<enter>	（あ
+(kyou<space><enter>	（強
+()<enter>	（）
+(kyou)<space><enter>	（強）
+(kyou)<enter>	（きょう）
+[kyou]<space><enter>	「強」
+[kyou]<enter>	「きょう」
+kyou[<space><enter>	強「
+kyou[<enter>	きょう「
+kyou,<space><enter>	今日、
+kyou,<space><space><enter>	kyou,
+kyou,a<enter>	きょう、あ
+kyou.<space>
+kyou!<bs><enter>	きょう
+kyou?<space><enter>	強？
+,,<enter>	、、
+,,<space><enter>	、、
+..<space><enter>	。。
+...<enter>	。。。
+...<space><space><enter>	...
+!?<enter>	！？
+!?<space><enter>	！？
+kyou<C-k>a<enter>	きょうあ
+kyou<C-k><C-j><enter>	きょう
+kyou<C-k><C-l><enter>	ｋｙｏｕ
+kyou<C-l><C-l><enter>	ＫＹＯＵ
+kyou<C-l><C-l><C-l><enter>	Ｋｙｏｕ
+kyou<F10><F10><F10><enter>	Kyou
+kyou<F10><space><enter>	強
+kyou<F9><space><enter>	強
+kyou<F7><F6><enter>	きょう
+kyou<F7><space><space><enter>	kyou
+kyou<F7><S-space><enter>	強
+kyou<F7><tab>	キョウ\t
+kyou<F7>1<enter>	きょう1
+kyou<F7>.<enter>	きょう。
+kyou<F7>(<enter>	きょう（
+kyou<F7><up>
+kyou<F7><down>
+kyou<F7><bs><bs><bs><bs><enter>	\n
+kyou<F7><esc><esc>
+Tokyo<F7><enter>	Tokyo
+Tokyo<F9><enter>	ｔｏｋｙｏ
+enter<F7><enter>	エンテr
+enter<F10><enter>	enter
+enter<F9><enter>	ｅｎｔｅｒ
+enter<C-k><enter>	エンテr
+(<F7><enter>	（
+(<F9><enter>	（
+,<F7><enter>	、
+1<F7>	1
+kyou1<F7><enter>	キョウ1
+kyou1<F9><enter>	ｋｙｏｕ１
+kyou-<F7><enter>	キョウー
+ko-hi-<F7><enter>	コーヒー
+ko-hi-<F10><enter>	ko-hi-
+n<F7><enter>	ン
+nn<F7><enter>	ン
+k<F7><enter>	k
+k<F10><enter>	k
+kyon<F9><enter>	ｋｙｏｎ
+kon<space><enter>	今
+kon<enter>	こん
+kyoun<bs><enter>	きょう
+kyoun<esc><enter>	きょう
+kyoun<esc>
+kyoun<bs><bs><enter>	きょ
+kyo<esc><enter>	きょ
+kyou<space>k<bs><enter>	強
+kyou<space>k<enter>	kyouk
+kyou<space>k<space><enter>	kyouk
+kyou<space><space>k<esc><enter>	きょう
+kyou<space>k<esc><enter>	きょう
+kyou<space>n<enter>	きょうん
+ky<bs><enter>	k
+ky<enter>	ky
+ky<space><enter>	ky
+n<space><enter>	ん
+nn<space><enter>	ん
+nnn<enter>	んん
+nnnn<enter>	んん
+anna<enter>	あんあ
+anna<space><enter>	あんあ
+tsuki<space><enter>	月
+lltu<enter>	っっ
+xxtu<enter>	っっ
+kk<bs><enter>	っ
+kka<enter>	っか
+kkk<enter>	kkk
+sshi<enter>	っし
+ppu<enter>	っぷ
+ccha<enter>	っちゃ
+tchi<enter>	っち
+cchi<enter>	っち
+mmo<enter>	っも
+yyo<enter>	っよ
+wwa<enter>	っわ
+hhi<enter>	っひ
+ddo<enter>	っど

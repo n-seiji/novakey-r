@@ -270,6 +270,25 @@ pub fn simulate(keys: &str) {
     }
 }
 
+/// 期待値の `\n` `\t` `\\` を実際の文字にする (1 行に収めるため)。
+fn unescape(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match (ch, chars.clone().next()) {
+            ('\\', Some('n')) => out.push('\n'),
+            ('\\', Some('t')) => out.push('\t'),
+            ('\\', Some('\\')) => out.push('\\'),
+            _ => {
+                out.push(ch);
+                continue;
+            }
+        }
+        chars.next();
+    }
+    out
+}
+
 /// `--simulate-file path`: 1 行 1 シナリオ。`キー列<TAB>期待する確定文字列` なら一致を検査し、
 /// 期待が無ければ結果を表示するだけ。`#` 始まりと空行は読み飛ばす。不一致があれば終了コード 1。
 pub fn simulate_file(path: &str) {
@@ -282,7 +301,7 @@ pub fn simulate_file(path: &str) {
     let scenarios = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#'));
     for (i, line) in scenarios.enumerate() {
         let (keys, expected) = match line.split_once('\t') {
-            Some((keys, expected)) => (keys, Some(expected)),
+            Some((keys, expected)) => (keys, Some(unescape(expected))),
             None => (line, None),
         };
         let result = run_keys(keys, 1000 + i as u64, false);
@@ -292,13 +311,13 @@ pub fn simulate_file(path: &str) {
             Err(err) => format!("ERROR {err}"),
         };
         let stale = result.as_ref().is_ok_and(|run| !run.stale.is_empty());
-        let verdict = match (expected, &result) {
+        let verdict = match (&expected, &result) {
             _ if stale => {
                 failures += 1;
                 "STAL"
             }
             (None, _) => "    ",
-            (Some(want), Ok(run)) if run.marked.is_empty() && run.committed == want => "ok  ",
+            (Some(want), Ok(run)) if run.marked.is_empty() && run.committed == *want => "ok  ",
             _ => {
                 failures += 1;
                 "FAIL"
