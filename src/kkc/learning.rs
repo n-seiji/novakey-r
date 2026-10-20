@@ -329,7 +329,7 @@ impl Learning {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                eprintln!("novakey_r: 学習データを読めませんでした ({}): {e}", path.display());
+                crate::platform::log(&format!("learning file not readable: {e}"));
                 return;
             }
         };
@@ -341,14 +341,14 @@ impl Learning {
                     // 次の保存で壊れた行が消えるので、元のファイルは写しを残す。
                     crate::platform::log(&format!("learning file: skipped {} unreadable line(s)", parsed.skipped));
                     if let Err(e) = backup(&path, false) {
-                        eprintln!("novakey_r: 学習データの退避に失敗しました: {e}");
+                        crate::platform::log(&format!("learning file backup failed: {e}"));
                     }
                 }
             }
             None => {
                 crate::platform::log("learning file unreadable; starting empty");
                 if let Err(e) = backup(&path, true) {
-                    eprintln!("novakey_r: 学習データの退避に失敗しました: {e}");
+                    crate::platform::log(&format!("learning file backup failed: {e}"));
                 }
             }
         }
@@ -571,7 +571,7 @@ fn write_file(path: &Path, entries: &HashMap<String, Vec<MemEntry>>) {
         written
     })();
     if let Err(e) = result {
-        eprintln!("novakey_r: 学習データを保存できませんでした ({}): {e}", path.display());
+        crate::platform::log(&format!("learning file not saved: {e}"));
     }
 }
 

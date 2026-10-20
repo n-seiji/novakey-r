@@ -44,7 +44,11 @@ impl LookupCache {
         let entries = match dict.prefix_entries(substring) {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("novakey_r: 辞書の検索に失敗しました ({substring}): {err}");
+                // 読み (ユーザーの入力) はログに出さない。毎回出ないよう 1 度だけ。
+                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::platform::log(&format!("dictionary lookup failed: {err}"));
+                }
                 Vec::new()
             }
         };
