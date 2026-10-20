@@ -62,6 +62,11 @@ fn rerank_allowed(ai_enabled: bool, credentials_missing: bool) -> bool {
     ai_enabled && !credentials_missing
 }
 
+/// AI をオフにした後に届いた結果は、取り消し前に配信が済んでいたものでも反映しない。
+fn accepts_llm_result(ai_enabled: bool) -> bool {
+    ai_enabled
+}
+
 extern_class!(
     #[derive(Debug, PartialEq, Eq, Hash)]
     pub struct IMKInputController;
@@ -257,6 +262,9 @@ declare_class!(
             let enabled = !ai_rerank_enabled();
             AI_RERANK.with(|e| e.set(enabled));
             platform::set_defaults_bool(AI_RERANK_KEY, enabled);
+            if !enabled {
+                llm_bridge::cancel_all();
+            }
             if enabled {
                 let avail = llm_bridge::availability();
                 set_credentials_missing(avail != llm_bridge::Availability::Available);
@@ -352,6 +360,7 @@ impl NovakeyRInputController {
                 Effect::ShowCandidates { selected } => self.show_candidates(selected),
                 Effect::HideCandidates => platform::hide_candidates(),
                 Effect::RequestRerank { urgent, job } => self.send_rerank(urgent, &job),
+                Effect::CancelRerank => llm_bridge::cancel(self.ivars().controller_id),
             }
         }
     }
@@ -387,6 +396,8 @@ impl NovakeyRInputController {
         let context = match outbound::decide(&snapshot) {
             Outbound::Skip(reason) => {
                 platform::log(&format!("LLM rerank skipped: {}", reason.name()));
+                // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
+                llm_bridge::cancel(self.ivars().controller_id);
                 return;
             }
             Outbound::WithoutContext(reason) => {
@@ -406,6 +417,9 @@ impl NovakeyRInputController {
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
+        if !accepts_llm_result(ai_rerank_enabled()) {
+            return;
+        }
         if status == llm_bridge::STATUS_CREDENTIALS_MISSING {
             set_credentials_missing(true);
         }
@@ -447,7 +461,13 @@ const CONTEXT_MAX_UTF16: usize = 200;
 
 #[cfg(test)]
 mod tests {
-    use super::rerank_allowed;
+    use super::{accepts_llm_result, rerank_allowed};
+
+    #[test]
+    fn results_are_ignored_once_ai_is_turned_off() {
+        assert!(accepts_llm_result(true));
+        assert!(!accepts_llm_result(false));
+    }
 
     #[test]
     fn rerank_never_runs_when_ai_toggle_is_off() {

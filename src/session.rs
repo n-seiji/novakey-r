@@ -30,6 +30,8 @@ pub enum Effect {
     HideCandidates,
     /// urgent は Space 押下時用。デバウンスを待たずに送る。
     RequestRerank { urgent: bool, job: RerankJob },
+    /// 組成が終わった。待機中・送信中の要求を捨てる。
+    CancelRerank,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub struct Session<E: CandidateEngine> {
     pub rerank: bool,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
     pub playful: fn(&str) -> Option<String>,
+    /// RequestRerank を出してから、まだ CancelRerank を出していない。
+    rerank_outstanding: bool,
 }
 
 impl<E: CandidateEngine> Session<E> {
@@ -59,6 +63,7 @@ impl<E: CandidateEngine> Session<E> {
             composer,
             rerank: false,
             playful: playful_convert,
+            rerank_outstanding: false,
         }
     }
 
@@ -87,6 +92,7 @@ impl<E: CandidateEngine> Session<E> {
             _ => key,
         };
         if let Some(handled) = self.prepare(key, &mut fx) {
+            self.finish(&mut fx);
             return Outcome { handled, action: None, phase, effects: fx };
         }
         let phase = self.phase();
@@ -95,9 +101,11 @@ impl<E: CandidateEngine> Session<E> {
             self.commit_and_insert("", &mut fx);
             let restarted = self.handle(key, text);
             fx.extend(restarted.effects);
+            self.finish(&mut fx);
             return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
         }
         let handled = self.perform(action, text, &mut fx);
+        self.finish(&mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
 
@@ -106,6 +114,7 @@ impl<E: CandidateEngine> Session<E> {
         self.composer.select_candidate_text(text);
         let mut fx = Vec::new();
         self.commit_and_insert("", &mut fx);
+        self.finish(&mut fx);
         fx
     }
 
@@ -117,7 +126,16 @@ impl<E: CandidateEngine> Session<E> {
             fx.push(Effect::Insert(self.composer.commit()));
         }
         fx.push(Effect::HideCandidates);
+        self.finish(&mut fx);
         fx
+    }
+
+    /// 組成が空になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
+    fn finish(&mut self, fx: &mut Vec<Effect>) {
+        if self.rerank_outstanding && self.composer.is_empty() && self.converter.buffer().is_empty() {
+            self.rerank_outstanding = false;
+            fx.push(Effect::CancelRerank);
+        }
     }
 
     fn rerank_job(&self) -> Option<RerankJob> {
@@ -132,11 +150,12 @@ impl<E: CandidateEngine> Session<E> {
             })
     }
 
-    fn request_rerank(&self, urgent: bool, fx: &mut Vec<Effect>) {
+    fn request_rerank(&mut self, urgent: bool, fx: &mut Vec<Effect>) {
         if !self.rerank {
             return;
         }
         if let Some(job) = self.rerank_job() {
+            self.rerank_outstanding = true;
             fx.push(Effect::RequestRerank { urgent, job });
         }
     }
@@ -426,5 +445,58 @@ mod tests {
         assert_eq!(typed("kyouTokyo"), "きょうTokyo");
         assert_eq!(typed("Tokyo"), "Tokyo");
         assert_eq!(after("kyouT\u{8}"), (String::new(), "きょう".to_string()));
+    }
+
+    struct TwoEngine;
+    impl CandidateEngine for TwoEngine {
+        fn convert(&mut self, _: u64, hiragana: &str) -> Vec<String> {
+            vec![hiragana.to_string(), "x".to_string()]
+        }
+        fn select(&mut self, _: u64, _: usize) -> bool {
+            false
+        }
+        fn cancel(&mut self) {}
+    }
+
+    fn effects_of(session: &mut Session<TwoEngine>, keys: &str) -> Vec<Effect> {
+        keys.chars()
+            .flat_map(|ch| session.handle(classify(ch), &ch.to_string()).effects)
+            .collect()
+    }
+
+    #[test]
+    fn 確定したらAI要求の取り消しを1度だけ出す() {
+        let mut session = Session::new(Composer::new(TwoEngine));
+        session.rerank = true;
+        let typing = effects_of(&mut session, "kyou");
+        assert!(typing.iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
+        assert!(!typing.contains(&Effect::CancelRerank), "組成中は取り消さない");
+        let commit = effects_of(&mut session, "\r");
+        assert_eq!(commit.iter().filter(|e| **e == Effect::CancelRerank).count(), 1);
+        let again = effects_of(&mut session, "\r");
+        assert!(!again.contains(&Effect::CancelRerank), "取り消しは 1 度だけ");
+    }
+
+    #[test]
+    fn escで組成を捨てても取り消しを出す() {
+        let mut session = Session::new(Composer::new(TwoEngine));
+        session.rerank = true;
+        effects_of(&mut session, "kyou");
+        assert!(effects_of(&mut session, "\u{1b}").contains(&Effect::CancelRerank));
+    }
+
+    #[test]
+    fn commitCompositionでも取り消しを出す() {
+        let mut session = Session::new(Composer::new(TwoEngine));
+        session.rerank = true;
+        effects_of(&mut session, "kyou");
+        assert!(session.commit_composition().contains(&Effect::CancelRerank));
+    }
+
+    #[test]
+    fn AIが無効なら取り消しも出さない() {
+        let mut session = Session::new(Composer::new(TwoEngine));
+        effects_of(&mut session, "kyou");
+        assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));
     }
 }

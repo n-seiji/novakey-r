@@ -123,7 +123,7 @@ impl Sim {
                     self.panel_line = selected;
                 }
                 Effect::HideCandidates => self.panel_visible = false,
-                Effect::RequestRerank { .. } => {}
+                Effect::RequestRerank { .. } | Effect::CancelRerank => {}
             }
         }
     }

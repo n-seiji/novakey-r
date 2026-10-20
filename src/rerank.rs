@@ -307,8 +307,16 @@ impl<S: CredentialStore> State<S> {
         out
     }
 
-    /// 待機中のジョブと世代の記録を全部捨てる (ワーカーが使えなくなったとき)。
-    pub fn clear(&mut self) {
+    /// 1 つのコントローラの待機中の要求を捨て、送信中のものも結果を採用しないようにする
+    /// (世代の記録ごと消すので、組成が終わったコントローラの分も残らない)。
+    pub fn cancel(&mut self, id: u64) {
+        self.pending.remove(&id);
+        self.latest.remove(&id);
+        self.sent.remove(&id);
+    }
+
+    /// 全コントローラぶん `cancel` する (AI をオフにしたとき)。
+    pub fn cancel_all(&mut self) {
         self.pending.clear();
         self.latest.clear();
         self.sent.clear();
@@ -528,6 +536,20 @@ mod tests {
         let rest = s.take_due_up_to(t0, 2);
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].controller_id, 3);
+    }
+
+    #[test]
+    fn cancel_forgets_the_controller_and_drops_its_result() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", false));
+        s.submit(t0, job(2, 1, "い", false));
+        s.cancel(1);
+        let due = s.take_due(ms(t0, 250));
+        assert_eq!(due.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![2]);
+        s.cancel(2);
+        assert_eq!(s.complete(due.into_iter().next().unwrap(), Ok(1)), None);
+        assert!(!s.is_latest(1, 1) && !s.is_latest(2, 1));
     }
 
     #[test]

@@ -170,7 +170,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
         if !self.disabled.swap(true, Ordering::SeqCst) {
             (self.log)(&format!("LLM rerank disabled: {why}"));
         }
-        lock(&self.state).clear();
+        lock(&self.state).cancel_all();
         self.wake.notify_all();
     }
 
@@ -255,6 +255,14 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
         lock(&self.results).pop_front()
     }
 
+    fn cancel(&self, controller_id: u64) {
+        lock(&self.state).cancel(controller_id);
+    }
+
+    fn cancel_all(&self) {
+        lock(&self.state).cancel_all();
+    }
+
     fn submit(&self, job: Job) {
         if self.is_disabled() {
             return;
@@ -280,6 +288,20 @@ fn drain_results() {
         if let Some(handler) = RESULT_HANDLER.get() {
             handler(d.controller_id, d.generation, d.status, &d.text);
         }
+    }
+}
+
+/// 組成が終わった・外へ送れない・AI をオフにした、のいずれかで、そのコントローラの要求を捨てる。
+/// ワーカーをまだ起こしていなければ何もしない。
+pub fn cancel(controller_id: u64) {
+    if let Some(engine) = SHARED.get() {
+        engine.cancel(controller_id);
+    }
+}
+
+pub fn cancel_all() {
+    if let Some(engine) = SHARED.get() {
+        engine.cancel_all();
     }
 }
 
@@ -424,6 +446,39 @@ mod tests {
         let _ = h.release.send(());
         // 古い世代の結果は、返ってきても配信されない。
         std::thread::sleep(Duration::from_millis(200));
+        assert!(h.engine.pop_result().is_none());
+    }
+
+    #[test]
+    fn cancel_drops_queued_and_in_flight_requests() {
+        let h = harness(None);
+        h.engine.submit(job(1, 1, "slow"));
+        h.slow_started.recv_timeout(WAIT).unwrap();
+        h.engine.cancel(1);
+        let _ = h.release.send(());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(h.engine.pop_result().is_none(), "送信中だった要求の結果は採用しない");
+        // デバウンス中 (まだ送っていない) の要求も消える。
+        let mut j = job(2, 1, "fast");
+        j.urgent = false;
+        h.engine.submit(j);
+        h.engine.cancel(2);
+        assert!(lock(&h.engine.state).next_deadline().is_none());
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(h.engine.pop_result().is_none());
+    }
+
+    #[test]
+    fn cancel_all_drops_every_controller() {
+        let h = harness(None);
+        let mut a = job(1, 1, "fast");
+        a.urgent = false;
+        let mut b = job(2, 1, "fast");
+        b.urgent = false;
+        h.engine.submit(a);
+        h.engine.submit(b);
+        h.engine.cancel_all();
+        std::thread::sleep(Duration::from_millis(400));
         assert!(h.engine.pop_result().is_none());
     }
 
