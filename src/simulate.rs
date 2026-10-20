@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::composer::{Composer, Phase};
 use crate::keymap::{self, Key, Stroke};
-use crate::kkc_bridge::{self, KkcEngine};
+use crate::kkc_bridge::{self, AnyEngine};
 use crate::session::{Effect, Session};
 use crate::translit::Form;
 
@@ -81,7 +81,7 @@ fn parse_keys(keys: &str) -> Result<Vec<(String, Event)>, String> {
 
 /// 本物のアプリが持つ状態のうち、キー処理の結果として見えるもの。
 struct Sim {
-    session: Session<KkcEngine>,
+    session: Session<AnyEngine>,
     /// アプリに確定済みの文字列。
     committed: String,
     /// アプリが表示している下線付きの未確定文字列 (最後の SetMarked)。
@@ -94,7 +94,7 @@ struct Sim {
 
 impl Sim {
     fn new(controller_id: u64) -> Self {
-        let engine = KkcEngine::new(controller_id);
+        let engine = AnyEngine::new(controller_id);
         let mut session = Session::new(Composer::new(engine).with_english(crate::loanword::english_for));
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.playful = |text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string());

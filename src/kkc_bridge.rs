@@ -132,3 +132,40 @@ pub fn dump_numbers(out: &str, width_out: &str) -> i32 {
     // SAFETY: 引数は NUL 終端の有効な C 文字列で、呼び出しの間生きている。
     unsafe { novakey_kkc_dump_numbers(out.as_ptr(), width_out.as_ptr()) }
 }
+
+/// 変換エンジン。既定は Swift (azooKey)。環境変数 `NOVAKEY_ENGINE=rust` で Rust 実装に切り替える。
+pub enum AnyEngine {
+    Swift(KkcEngine),
+    Rust(crate::kkc::RustEngine),
+}
+
+impl AnyEngine {
+    pub fn new(controller_id: u64) -> Self {
+        if std::env::var("NOVAKEY_ENGINE").is_ok_and(|v| v == "rust") {
+            AnyEngine::Rust(crate::kkc::RustEngine::new())
+        } else {
+            AnyEngine::Swift(KkcEngine::new(controller_id))
+        }
+    }
+}
+
+impl CandidateEngine for AnyEngine {
+    fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+        match self {
+            AnyEngine::Swift(e) => e.convert(revision, hiragana),
+            AnyEngine::Rust(e) => e.convert(revision, hiragana),
+        }
+    }
+    fn select(&mut self, revision: u64, engine_index: usize) -> bool {
+        match self {
+            AnyEngine::Swift(e) => e.select(revision, engine_index),
+            AnyEngine::Rust(e) => e.select(revision, engine_index),
+        }
+    }
+    fn cancel(&mut self) {
+        match self {
+            AnyEngine::Swift(e) => e.cancel(),
+            AnyEngine::Rust(e) => e.cancel(),
+        }
+    }
+}
