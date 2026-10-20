@@ -88,17 +88,23 @@ struct Sim {
     marked: String,
     panel_visible: bool,
     panel_line: usize,
+    /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
+    stale: Vec<String>,
 }
 
 impl Sim {
     fn new(controller_id: u64) -> Self {
         let engine = KkcEngine::new(controller_id);
+        let mut session = Session::new(Composer::new(engine).with_english(crate::loanword::english_for));
+        // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
+        session.playful = |text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string());
         Self {
-            session: Session::new(Composer::new(engine).with_english(crate::loanword::english_for)),
+            session,
             committed: String::new(),
             marked: String::new(),
             panel_visible: false,
             panel_line: 0,
+            stale: Vec::new(),
         }
     }
 
@@ -121,8 +127,11 @@ impl Sim {
     }
 
     /// IME が処理しなかったキーを、アプリがそのまま受け取った場合の結果。
-    fn pass_through(&mut self, characters: &str) {
-        for ch in characters.chars() {
+    fn pass_through(&mut self, ev: &Event) {
+        if ev.control {
+            return; // Ctrl+文字はアプリ側でショートカットになり、文字は入らない
+        }
+        for ch in ev.characters.chars() {
             match ch {
                 '\r' => self.committed.push('\n'),
                 '\u{7f}' | '\u{8}' => {
@@ -138,7 +147,7 @@ impl Sim {
     fn press(&mut self, ev: &Event) {
         let translit = keymap::translit_form(ev.key_code, ev.control, &ev.characters.to_lowercase());
         if translit.is_none() && ev.control {
-            self.pass_through(&ev.characters);
+            self.pass_through(ev);
             return;
         }
         if let Some(form) = translit {
@@ -155,7 +164,7 @@ impl Sim {
                 let pending =
                     !self.session.converter.buffer().is_empty() || !self.session.composer.is_empty();
                 if !pending {
-                    self.pass_through(&ev.characters);
+                    self.pass_through(ev);
                 }
             }
         }
@@ -165,7 +174,7 @@ impl Sim {
         let outcome = self.session.handle(key, text);
         self.apply(outcome.effects);
         if !outcome.handled {
-            self.pass_through(&ev.characters);
+            self.pass_through(ev);
         }
     }
 
@@ -209,10 +218,20 @@ fn setup_env() {
 }
 
 /// 1 シナリオを最後まで流す。最後に確定した文字列と、未確定のまま残った文字列を返す。
-fn run_keys(keys: &str, controller_id: u64, verbose: bool) -> Result<(String, String), String> {
+struct Run {
+    committed: String,
+    marked: String,
+    /// 下線付き文字列が session の表示とずれた打鍵。空であるべき。
+    stale: Vec<String>,
+}
+
+fn run_keys(keys: &str, controller_id: u64, verbose: bool) -> Result<Run, String> {
     let mut sim = Sim::new(controller_id);
     for (label, ev) in parse_keys(keys)? {
         sim.press(&ev);
+        if sim.marked != sim.session.marked_text() {
+            sim.stale.push(label.clone());
+        }
         if verbose {
             let panel = if sim.panel_visible { format!(" panel@{}", sim.panel_line + 1) } else { String::new() };
             println!(
@@ -228,17 +247,20 @@ fn run_keys(keys: &str, controller_id: u64, verbose: bool) -> Result<(String, St
         }
     }
     kkc_bridge::cancel(controller_id);
-    Ok((sim.committed, sim.marked))
+    Ok(Run { committed: sim.committed, marked: sim.marked, stale: sim.stale })
 }
 
 /// `--simulate '<keys>'`
 pub fn simulate(keys: &str) {
     setup_env();
     match run_keys(keys, 1, true) {
-        Ok((committed, marked)) => {
+        Ok(Run { committed, marked, stale }) => {
             println!("final: {committed:?}");
             if !marked.is_empty() {
                 println!("still composing: {marked:?}");
+            }
+            if !stale.is_empty() {
+                println!("STALE marked text after: {stale:?}");
             }
         }
         Err(err) => {
@@ -265,19 +287,24 @@ pub fn simulate_file(path: &str) {
         };
         let result = run_keys(keys, 1000 + i as u64, false);
         let shown = match &result {
-            Ok((committed, marked)) if marked.is_empty() => format!("{committed:?}"),
-            Ok((committed, marked)) => format!("{committed:?} +composing {marked:?}"),
+            Ok(run) if run.marked.is_empty() => format!("{:?}", run.committed),
+            Ok(run) => format!("{:?} +composing {:?}", run.committed, run.marked),
             Err(err) => format!("ERROR {err}"),
         };
+        let stale = result.as_ref().is_ok_and(|run| !run.stale.is_empty());
         let verdict = match (expected, &result) {
+            _ if stale => {
+                failures += 1;
+                "STAL"
+            }
             (None, _) => "    ",
-            (Some(want), Ok((got, marked))) if marked.is_empty() && got == want => "ok  ",
+            (Some(want), Ok(run)) if run.marked.is_empty() && run.committed == want => "ok  ",
             _ => {
                 failures += 1;
                 "FAIL"
             }
         };
-        let want = expected.filter(|_| verdict == "FAIL").map_or(String::new(), |w| format!("   want {w:?}"));
+        let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
         println!("{verdict} {keys}  =>  {shown}{want}");
     }
     if failures > 0 {

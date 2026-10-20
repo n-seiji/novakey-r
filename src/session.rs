@@ -79,6 +79,13 @@ impl<E: CandidateEngine> Session<E> {
     pub fn handle(&mut self, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
+        // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
+        let key = match text.chars().collect::<Vec<_>>()[..] {
+            [ch] if !ch.is_ascii_alphabetic() && self.converter.accepts(ch) => {
+                Key::Letter { upper: false }
+            }
+            _ => key,
+        };
         if let Some(handled) = self.prepare(key, &mut fx) {
             return Outcome { handled, action: None, phase, effects: fx };
         }
@@ -313,4 +320,48 @@ pub fn playful_convert(text: &str) -> Option<String> {
     let list = PLAYFUL_MAP.get(text)?;
     let i = rand::thread_rng().gen_range(0..list.len());
     Some(list[i].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::classify;
+
+    struct NullEngine;
+    impl CandidateEngine for NullEngine {
+        fn convert(&mut self, _: u64, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn select(&mut self, _: u64, _: usize) -> bool {
+            false
+        }
+        fn cancel(&mut self) {}
+    }
+
+    /// 打鍵列を流して、最後に Enter で確定した文字列を返す。
+    fn typed(keys: &str) -> String {
+        let mut session = Session::new(Composer::new(NullEngine));
+        let mut out = String::new();
+        for ch in keys.chars().chain(['\r']) {
+            let outcome = session.handle(classify(ch), &ch.to_string());
+            for effect in outcome.effects {
+                if let Effect::Insert(text) = effect {
+                    out.push_str(&text);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn アポストロフィでnを確定して次の母音を切り離せる() {
+        assert_eq!(typed("kin'en"), "きんえん");
+        assert_eq!(typed("n'a"), "んあ");
+    }
+
+    #[test]
+    fn 表に続かないアポストロフィは記号として入る() {
+        assert_eq!(typed("a'"), "あ'");
+        assert_eq!(typed("t'i"), "てぃ");
+    }
 }

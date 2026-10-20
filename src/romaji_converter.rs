@@ -105,6 +105,14 @@ impl RomajiConverter {
         }
     }
 
+    /// 記号 1 文字をローマ字の続きとして受け取れるか (`n'` → ん, `t'i` → てぃ)。
+    pub fn accepts(&self, ch: char) -> bool {
+        let table = &*TABLE;
+        let next = format!("{}{ch}", self.buffer);
+        !self.buffer.is_empty()
+            && (table.prefixes.contains(next.as_str()) || table.rules.contains_key(next.as_str()))
+    }
+
     pub fn handle_backspace(&mut self) {
         // Remove the last character from the buffer if it exists
         self.buffer.pop();
