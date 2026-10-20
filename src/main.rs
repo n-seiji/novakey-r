@@ -9,6 +9,7 @@ mod emoji;
 mod loanword;
 mod outbound;
 mod platform;
+mod rerank;
 mod romaji_converter;
 mod session;
 mod simulate;

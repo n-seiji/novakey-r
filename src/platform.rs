@@ -44,16 +44,40 @@ thread_local! {
 }
 
 /// NSLog に文字列を出す。書式文字列は固定の "%@" なので message 内の % は解釈されない。
+/// どのスレッドからでも呼べるよう autorelease pool を張る。
 pub fn log(message: &str) {
-    let fmt = NSString::from_str("%@");
-    let arg = NSString::from_str(message);
-    // SAFETY: fmt と arg は呼び出し中生存する NSString で、"%@" は object 引数をちょうど 1 つ消費する。
-    unsafe {
-        NSLog(
-            &*fmt as *const NSString as *mut AnyObject,
-            &*arg as *const NSString,
-        )
-    };
+    autoreleasepool(|_| {
+        let fmt = NSString::from_str("%@");
+        let arg = NSString::from_str(message);
+        // SAFETY: fmt と arg は呼び出し中生存する NSString で、"%@" は object 引数をちょうど 1 つ消費する。
+        unsafe {
+            NSLog(
+                &*fmt as *const NSString as *mut AnyObject,
+                &*arg as *const NSString,
+            )
+        };
+    });
+}
+
+extern "C" {
+    /// libdispatch (libSystem) のメインキュー本体。`dispatch_get_main_queue()` はこの番地を返すマクロ。
+    static _dispatch_main_q: std::ffi::c_void;
+    fn dispatch_async_f(
+        queue: *const std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
+}
+
+/// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。
+pub fn run_on_main(f: fn()) {
+    extern "C" fn trampoline(context: *mut std::ffi::c_void) {
+        // SAFETY: run_on_main が `fn()` をそのままポインタ値として渡したもの。
+        let f: fn() = unsafe { std::mem::transmute::<*mut std::ffi::c_void, fn()>(context) };
+        f();
+    }
+    // SAFETY: メインキューの番地は常に有効。context は fn ポインタ値で、trampoline が同じ型に戻す。
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, f as *mut std::ffi::c_void, trampoline) };
 }
 
 pub fn is_secure_input_enabled() -> bool {
