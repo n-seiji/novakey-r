@@ -177,8 +177,81 @@ fn additional_candidates(katakana: &str) -> Vec<Cand> {
     ]
 }
 
-/// 特殊候補 (version / calendar / time / email / unicode など)。P3 で provider を足す場所。今は何も出さない。
-fn special_candidates(_reading_katakana: &str) -> Vec<Cand> {
+/// 特殊候補。Swift の `defaultSpecialCandidateProviders` のうち、P0 の測定で上位 9 件に現れた
+/// メールアドレスと Unicode だけを移植する (calendar / version / time / comma は意図的に移植しない)。
+/// 並びは Swift と同じく email -> unicode。
+fn special_candidates(reading_katakana: &str) -> Vec<Cand> {
+    let mut out = email_address_candidates(reading_katakana);
+    out.extend(unicode_candidates(reading_katakana));
+    out
+}
+
+fn special_cand(text: String, ruby: &str, value: f32) -> Cand {
+    let elem = Rc::new(Elem::new(text.clone(), ruby.to_string(), 0, 0, MID_GENERAL, value));
+    Cand::new(text, value, MID_GENERAL, vec![elem], Source::Special)
+}
+
+const EMAIL_DOMAINS: [&str; 21] = [
+    "@gmail.com",
+    "@icloud.com",
+    "@yahoo.co.jp",
+    "@au.com",
+    "@docomo.ne.jp",
+    "@excite.co.jp",
+    "@ezweb.ne.jp",
+    "@googlemail.com",
+    "@hotmail.co.jp",
+    "@hotmail.com",
+    "@i.softbank.jp",
+    "@live.jp",
+    "@me.com",
+    "@mineo.jp",
+    "@nifty.com",
+    "@outlook.com",
+    "@outlook.jp",
+    "@softbank.ne.jp",
+    "@yahoo.ne.jp",
+    "@ybb.ne.jp",
+    "@ymobile.ne.jp",
+];
+
+/// `String.isEnglishSentence`: 空でなく、半角英数と一部の記号だけ
+fn is_english_sentence(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "\n !'_<>[]{}*@`^|~=\"#$%&+(),-./:;?\u{2019}\\".contains(c))
+}
+
+/// `toEmailAddressCandidates`: 最後の `@` より後ろをドメインの前方一致として、メールアドレス風の候補を出す。
+fn email_address_candidates(reading: &str) -> Vec<Cand> {
+    let Some(at) = reading.rfind('@') else {
+        return Vec::new();
+    };
+    let id = &reading[..at];
+    let domain_prefix = &reading[at + 1..];
+    if !(id.is_empty() || is_english_sentence(id)) {
+        return Vec::new();
+    }
+    let base: f32 = if id.is_empty() { -20.0 } else { -13.0 };
+    let wanted = format!("@{domain_prefix}");
+    EMAIL_DOMAINS
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.starts_with(&wanted))
+        .map(|(i, d)| special_cand(format!("{id}{d}"), reading, base - i as f32))
+        .collect()
+}
+
+/// `unicodeCandidates`: `u3042` / `U+3042` などの16進表記を対応する1文字にする。
+/// Swift の `Int(_, radix: 16)` と同じく先頭の `+` / `-` は許し、前置詞は `u`, `U`, `u+`, `U+` の順に試す。
+fn unicode_candidates(reading: &str) -> Vec<Cand> {
+    for prefix in ["u", "U", "u+", "U+"] {
+        let Some(rest) = reading.strip_prefix(prefix) else {
+            continue;
+        };
+        let ch = i64::from_str_radix(rest, 16).ok().and_then(|n| u32::try_from(n).ok()).and_then(char::from_u32);
+        if let Some(ch) = ch {
+            return vec![special_cand(ch.to_string(), reading, -10.0)];
+        }
+    }
     Vec::new()
 }
 
@@ -334,6 +407,71 @@ mod tests {
         assert_eq!(m[0].value, -14.0 * (0.6f32 * 0.6f32));
         let u = additional_candidates("abc");
         assert_eq!(u[2].text, "ABC");
+    }
+
+    fn special_texts(reading: &str) -> Vec<String> {
+        special_candidates(reading).into_iter().map(|c| c.text).collect()
+    }
+
+    #[test]
+    fn email_bare_at_lists_all_domains_in_order() {
+        let c = special_candidates("@");
+        assert_eq!(c.len(), 21);
+        assert_eq!(c[0].text, "@gmail.com");
+        assert_eq!(c[20].text, "@ymobile.ne.jp");
+        assert_eq!(c[0].value, -20.0);
+        assert_eq!(c[3].value, -23.0);
+        assert!(c.iter().all(|x| x.source == Source::Special));
+    }
+
+    #[test]
+    fn email_with_id_and_prefix_filters_domains() {
+        let c = special_candidates("abc@yah");
+        assert_eq!(texts(&c), vec!["abc@yahoo.co.jp", "abc@yahoo.ne.jp"]);
+        assert_eq!(c[0].value, -13.0 - 2.0);
+        assert_eq!(c[1].value, -13.0 - 18.0);
+        assert_eq!(special_texts("a@gmail.com"), vec!["a@gmail.com"]);
+        assert!(special_texts("a@zzz").is_empty());
+    }
+
+    #[test]
+    fn email_uses_last_at_and_rejects_non_english_id() {
+        assert_eq!(special_texts("a@b@me"), vec!["a@b@me.com"]);
+        assert!(special_texts("あ@").is_empty());
+        assert!(special_texts("ア@gmail").is_empty());
+        assert!(special_texts("abc").is_empty());
+    }
+
+    #[test]
+    fn unicode_hex_with_each_prefix() {
+        assert_eq!(special_texts("u3042"), vec!["あ"]);
+        assert_eq!(special_texts("U3042"), vec!["あ"]);
+        assert_eq!(special_texts("u+3042"), vec!["あ"]);
+        assert_eq!(special_texts("U+1F600"), vec!["\u{1F600}"]);
+        let c = special_candidates("u41");
+        assert_eq!(c[0].value, -10.0);
+        assert_eq!(c[0].data[0].ruby, "u41");
+    }
+
+    #[test]
+    fn unicode_rejects_invalid_values() {
+        assert!(special_texts("u").is_empty());
+        assert!(special_texts("u+").is_empty());
+        assert!(special_texts("uzz").is_empty());
+        assert!(special_texts("ud800").is_empty()); // surrogate
+        assert!(special_texts("u110000").is_empty()); // 範囲外
+        assert!(special_texts("u-41").is_empty());
+        assert!(special_texts("あ41").is_empty());
+    }
+
+    #[test]
+    fn special_candidates_are_inserted_after_fifth_word_candidate() {
+        let core = super::super::KkcCore::open().unwrap();
+        let c = core.convert_all("u+3042");
+        let w: Vec<&Cand> = c.main.iter().filter(|x| matches!(x.source, Source::Word | Source::Wise | Source::Additional | Source::Special)).collect();
+        let pos = w.iter().position(|x| x.source == Source::Special).unwrap();
+        assert!(pos <= 5);
+        assert_eq!(w[pos].text, "あ");
     }
 
     #[test]
