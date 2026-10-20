@@ -187,6 +187,26 @@ fn matches_reading(c: &Cand, reading_katakana: &str) -> bool {
     c.ruby() == reading_katakana
 }
 
+/// 3 番目までに最低でも 1 つ、(誤り訂正ではなく) 入力に完全一致する候補が入るようにする。
+/// 4 番目以降にあればそれを 3 番目に上げ、無ければ全文候補の上位 5 件、それも無ければ全文候補全体から探して挟む。
+fn ensure_reading_match(result: &mut Vec<Cand>, best_five: &[Cand], whole_sentence: &[Cand], reading_katakana: &str) {
+    if result.iter().take(3).any(|c| matches_reading(c, reading_katakana)) {
+        return;
+    }
+    let found = result.iter().skip(3).position(|c| matches_reading(c, reading_katakana)).map(|p| p + 3);
+    if let Some(i) = found {
+        let c = result.remove(i);
+        let at = result.len().min(2);
+        result.insert(at, c);
+    } else if let Some(c) = best_five.iter().find(|c| matches_reading(c, reading_katakana)) {
+        let at = result.len().min(2);
+        result.insert(at, c.clone());
+    } else if let Some(c) = whole_sentence.iter().find(|c| matches_reading(c, reading_katakana)) {
+        let at = result.len().min(2);
+        result.insert(at, c.clone());
+    }
+}
+
 /// 変換結果。`main` が `mainResults`、`first_clause` が `firstClauseResults`。
 #[derive(Debug, Default)]
 pub struct Converted {
@@ -242,21 +262,7 @@ pub fn process(dict: &Dictionary, lattice: &Lattice, reading_katakana: &str) -> 
     };
 
     let mut result = full_candidates;
-    // 3 番目までに最低でも 1 つ、入力に完全一致する候補が入るようにする
-    if !result.iter().take(3).any(|c| matches_reading(c, reading_katakana)) {
-        let found = result.iter().skip(3).position(|c| matches_reading(c, reading_katakana)).map(|p| p + 3);
-        if let Some(i) = found {
-            let c = result.remove(i);
-            let at = result.len().min(2);
-            result.insert(at, c);
-        } else if let Some(c) = best_five.iter().find(|c| matches_reading(c, reading_katakana)) {
-            let at = result.len().min(2);
-            result.insert(at, c.clone());
-        } else if let Some(c) = whole_sentence_unique.iter().find(|c| matches_reading(c, reading_katakana)) {
-            let at = result.len().min(2);
-            result.insert(at, c.clone());
-        }
-    }
+    ensure_reading_match(&mut result, &best_five, &whole_sentence_unique, reading_katakana);
     result.extend(first_clause_candidates);
     result.extend(word_candidates);
     Converted { main: result, first_clause: first_clause_results }
@@ -335,6 +341,53 @@ mod tests {
         assert_eq!(katakana_score("アイウ"), 1.0);
         assert_eq!(katakana_score("パ"), 0.7);
         assert_eq!(katakana_score("プ"), 0.5);
+    }
+
+    fn texts(v: &[Cand]) -> Vec<&str> {
+        v.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    #[test]
+    fn reading_match_is_kept_when_already_in_top3() {
+        let mut r = vec![cand("x", "イ", -1.0), cand("y", "アイ", -2.0), cand("z", "ウ", -3.0)];
+        let before = texts(&r).join(",");
+        ensure_reading_match(&mut r, &[], &[], "アイ");
+        assert_eq!(texts(&r).join(","), before);
+    }
+
+    #[test]
+    fn reading_match_in_4th_or_later_moves_to_third() {
+        let mut r = vec![cand("a", "イ", -1.0), cand("b", "イ", -2.0), cand("c", "イ", -3.0), cand("d", "イ", -4.0), cand("e", "アイ", -5.0)];
+        ensure_reading_match(&mut r, &[], &[], "アイ");
+        assert_eq!(texts(&r), vec!["a", "b", "e", "c", "d"]);
+    }
+
+    #[test]
+    fn missing_reading_match_is_taken_from_best_five_then_whole_sentence() {
+        let mut r = vec![cand("a", "イ", -1.0), cand("b", "イ", -2.0), cand("c", "イ", -3.0)];
+        ensure_reading_match(&mut r, &[cand("m", "アイ", -9.0)], &[], "アイ");
+        assert_eq!(texts(&r), vec!["a", "b", "m", "c"]);
+        let mut r = vec![cand("a", "イ", -1.0)];
+        ensure_reading_match(&mut r, &[], &[cand("w", "アイ", -9.0)], "アイ");
+        // 1 件しかないときは末尾 (min(endIndex, 2))
+        assert_eq!(texts(&r), vec!["a", "w"]);
+        // どこにも無ければ何もしない
+        let mut r = vec![cand("a", "イ", -1.0)];
+        ensure_reading_match(&mut r, &[], &[], "アイ");
+        assert_eq!(texts(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn real_dictionary_conversion_matches_swift_golden_top() {
+        let core = super::super::KkcCore::open().unwrap();
+        let c = core.convert_all("きょうはいいてんきですね");
+        // Swift 版 (golden) の 1 位とビット一致
+        assert_eq!(c.main[0].text, "強はいい天気ですね");
+        assert_eq!(c.main[0].value.to_bits(), 0xc21825e3);
+        // 追加候補 (カタカナ・ひらがな) は第 1 文節の候補より後ろにある
+        let pos = |t: &str| c.main.iter().position(|x| x.text == t).unwrap();
+        assert!(pos("今日は") < pos("キョウハイイテンキデスネ"));
+        assert_eq!(c.main[pos("キョウハイイテンキデスネ")].source, Source::Additional);
     }
 
     #[test]

@@ -46,6 +46,11 @@ description = "golden の測定 (fresh と typed の差・決定的ハッシュ�
 depends = ["build"]
 run = "python3 -I tools/golden_stats.py"
 
+[tasks.kkc-compare]
+description = "Rust 版 KKC を Swift 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
+depends = ["build"]
+run = "./target/release/novakey_r --kkc-compare"
+
 [tasks.reset-memory]
 description = "変換学習データを全消去する"
 run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"

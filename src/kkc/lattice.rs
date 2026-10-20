@@ -13,6 +13,8 @@ use super::wise::wise_dicdata;
 
 /// 辞書のエントリの最大長さ (`DicdataStore.maxlength`)
 pub const MAX_LENGTH: usize = 20;
+/// 連接コストの行が無いときの値
+const CC_MISSING: f32 = -25.0;
 
 /// 1 回の辞書引きの結果の 1 件。`ruby_chars` は ruby のスカラー数 (= ノードの長さ)。
 #[derive(Debug, Clone)]
@@ -77,8 +79,20 @@ pub struct Node {
     pub end: usize,
     /// 辞書ではなく `getWiseDicdata` で作ったか
     pub wise: bool,
+    /// `elem.lcid` / `elem.removed` の写し (遷移先の走査で Rc をたどらないため)
+    lcid: usize,
+    removed: bool,
+    /// prevs が N 個そろっているとき、その中の最小の total。そろっていなければ -inf。
+    /// これ以下の値は入れられない。
+    full_min: f32,
     /// このノードに繋がる直前のノード (`RegisteredNode`)。値の降順。
     prevs: Vec<u32>,
+}
+
+impl Node {
+    fn new(elem: Rc<Elem>, start: usize, end: usize, wise: bool) -> Self {
+        Self { lcid: elem.lcid, removed: elem.removed, elem, start, end, wise, full_min: f32::NEG_INFINITY, prevs: Vec::new() }
+    }
 }
 
 /// `RegisteredNode`: `node` を終えた時点の経路。`prev` をたどると始点まで戻れる。
@@ -121,7 +135,7 @@ impl Lattice {
     /// `chars` はカタカナ化済みの読み。
     pub fn build(dict: &Dictionary, cache: &mut LookupCache, chars: &[char]) -> Self {
         let n = chars.len();
-        let mut nodes = vec![Node { elem: Rc::new(Elem::bos()), start: 0, end: 0, wise: false, prevs: Vec::new() }];
+        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, 0, false)];
         let mut ranges = Vec::with_capacity(n);
         for start in 0..n {
             let from = nodes.len();
@@ -133,14 +147,14 @@ impl Lattice {
                 if f.ruby_chars == 0 || start + f.ruby_chars > n {
                     continue;
                 }
-                nodes.push(Node { elem: f.elem.clone(), start, end: start + f.ruby_chars, wise: false, prevs: Vec::new() });
+                nodes.push(Node::new(f.elem.clone(), start, start + f.ruby_chars, false));
             }
             // 機械的に作るエントリ
             let mut segment = String::new();
             for i in start..upper {
                 segment.push(chars[i]);
                 for e in wise_dicdata(&segment, start..i + 1, chars) {
-                    nodes.push(Node { elem: Rc::new(e), start, end: i + 1, wise: true, prevs: Vec::new() });
+                    nodes.push(Node::new(Rc::new(e), start, i + 1, true));
                 }
             }
             ranges.push(from..nodes.len());
@@ -169,10 +183,10 @@ impl Lattice {
                 if self.nodes[idx].prevs.is_empty() {
                     continue;
                 }
-                let elem = self.nodes[idx].elem.clone();
-                if elem.removed {
+                if self.nodes[idx].removed {
                     continue;
                 }
+                let elem = self.nodes[idx].elem.clone();
                 let w_value = elem.value();
                 // 生起確率 (prevs の各要素に対応)
                 let values: Vec<f32> = self.nodes[idx]
@@ -210,12 +224,21 @@ impl Lattice {
     }
 
     /// N-Best を保ちつつ遷移先ノードを更新する (`updateNextNodes`)。
+    ///
+    /// `values` は降順 (prevs が降順で、同じ定数を足すだけなので)。ある値が入れられない (遷移先の N 個が
+    /// すべてそれ以上) なら、それより小さい値も入れられないので、そこで打ち切る (結果は Swift と同じ)。
     fn update_next_nodes(&mut self, dict: &Dictionary, idx: usize, elem: &Elem, values: &[f32], next_start: usize, n_best: usize) {
+        let cc_row = dict.cc_row(elem.rcid);
         for next_idx in self.ranges[next_start].clone() {
-            if self.nodes[next_idx].elem.removed {
+            let next = &self.nodes[next_idx];
+            if next.removed {
                 continue;
             }
-            let cc_value = dict.cc(elem.rcid, self.nodes[next_idx].elem.lcid);
+            let cc_value = cc_row.and_then(|r| r.get(next.lcid).copied()).unwrap_or(CC_MISSING);
+            // 最大の値でも入れられない (遷移先の N 個がすべてそれ以上) なら、このノードは丸ごと飛ばせる
+            if values.first().is_none_or(|&v| cc_value + v <= next.full_min) {
+                continue;
+            }
             for (index, &value) in values.iter().enumerate() {
                 let new_value = cc_value + value;
                 // 追加すべき index: total >= new_value を満たす最後の要素の次
@@ -224,15 +247,20 @@ impl Lattice {
                     prevs.iter().rposition(|&r| self.regs[r as usize].total >= new_value).map_or(0, |p| p + 1)
                 };
                 if lastindex == n_best {
-                    continue;
+                    break;
                 }
                 let prev = self.nodes[idx].prevs[index];
                 let id = self.push_reg(idx, prev, new_value);
-                let prevs = &mut self.nodes[next_idx].prevs;
-                if prevs.len() >= n_best {
-                    prevs.pop();
+                let node = &mut self.nodes[next_idx];
+                if node.prevs.len() >= n_best {
+                    node.prevs.pop();
                 }
-                prevs.insert(lastindex, id);
+                node.prevs.insert(lastindex, id);
+                node.full_min = if node.prevs.len() >= n_best {
+                    node.prevs.last().map_or(f32::NEG_INFINITY, |&r| self.regs[r as usize].total)
+                } else {
+                    f32::NEG_INFINITY
+                };
             }
         }
     }
@@ -306,12 +334,12 @@ mod tests {
 
     /// 辞書を使わない小さなラティス。nodes: (start, end, elem)
     fn manual(n: usize, defs: Vec<(usize, usize, Rc<Elem>)>) -> Lattice {
-        let mut nodes = vec![Node { elem: Rc::new(Elem::bos()), start: 0, end: 0, wise: false, prevs: Vec::new() }];
+        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, 0, false)];
         let mut ranges = Vec::new();
         for start in 0..n {
             let from = nodes.len();
             for (s, e, el) in defs.iter().filter(|d| d.0 == start) {
-                nodes.push(Node { elem: el.clone(), start: *s, end: *e, wise: false, prevs: Vec::new() });
+                nodes.push(Node::new(el.clone(), *s, *e, false));
             }
             ranges.push(from..nodes.len());
         }

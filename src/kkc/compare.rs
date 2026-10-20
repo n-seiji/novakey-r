@@ -672,7 +672,7 @@ pub fn convert_cli(reading: &str, count: usize) -> i32 {
 }
 
 /// `--kkc-bench <reading>`: 読みを 1 文字ずつ伸ばしながら変換した合計時間 (打鍵ごとの変換を模す)。
-pub fn bench_cli(reading: &str) -> i32 {
+pub fn bench_cli(reading: &str, swift: bool) -> i32 {
     let core = match KkcCore::open() {
         Ok(c) => c,
         Err(e) => {
@@ -680,13 +680,22 @@ pub fn bench_cli(reading: &str) -> i32 {
             return 2;
         }
     };
+    if swift {
+        // Swift 版は学習 off・空のメモリで測る
+        std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
+        std::env::set_var("NOVAKEY_MEMORY_DIR", std::env::temp_dir().join(format!("novakey-r-bench-{}", std::process::id())));
+    }
     let chars: Vec<char> = reading.chars().collect();
     let mut worst = 0.0f64;
     let t0 = Instant::now();
     for n in 1..=chars.len() {
         let prefix: String = chars[..n].iter().collect();
         let t = Instant::now();
-        let _ = core.convert_all(&prefix);
+        if swift {
+            let _ = crate::kkc_bridge::convert(0, n as u64, &prefix);
+        } else {
+            let _ = core.convert_all(&prefix);
+        }
         worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
     }
     println!(

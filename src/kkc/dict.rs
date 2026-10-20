@@ -368,6 +368,12 @@ impl Dictionary {
         }
     }
 
+    /// 左の語の rcid の連接コスト行 (`getCCLatter`)。行が無ければ `None` で、呼び出し側は -25 とみなす。
+    pub fn cc_row(&self, rcid: usize) -> Option<&[f32]> {
+        let cell = self.cc_rows.get(rcid)?;
+        cell.get_or_init(|| self.load_cc_row(rcid).ok().flatten()).as_deref()
+    }
+
     /// `cb/{rcid}.binary` = (i32 key, f32 value) の並び。最初が key -1 の行既定値、残りが疎な上書き。
     pub fn load_cc_row(&self, rcid: usize) -> Result<Option<Box<[f32]>>, DictError> {
         let path = self.dir.join(format!("cb/{rcid}.binary"));

@@ -40,7 +40,7 @@ fn main() {
         std::process::exit(kkc::compare::convert_cli(args.get(i + 1).map_or("", String::as_str), args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(30)));
     }
     if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
-        std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
+        std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str), args.iter().any(|a| a == "--swift")));
     }
     if let Some(i) = args.iter().position(|a| a == "--kkc-dump-numbers") {
         let (Some(out), Some(width_out)) = (args.get(i + 1), args.get(i + 2)) else {
