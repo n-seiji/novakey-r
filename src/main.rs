@@ -5,6 +5,7 @@ mod keymap;
 mod kkc;
 mod kkc_bridge;
 mod llm_bridge;
+mod emoji;
 mod loanword;
 mod outbound;
 mod platform;

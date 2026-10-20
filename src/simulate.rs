@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 // simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (keymap::stroke → Session) を headless で動かす。
-// 変換は本物の azooKey、英単語は本物の loanwords.tsv。Cocoa には触れず、AI リランキングも使わない。
+// 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
 //
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
 // <C-k> (Ctrl+文字) <F6>..<F10> <lt> (`<`) <gt> (`>`)。
@@ -95,7 +95,9 @@ struct Sim {
 impl Sim {
     fn new(controller_id: u64) -> Self {
         let engine = AnyEngine::new(controller_id);
-        let mut session = Session::new(Composer::new(engine).with_english(crate::loanword::english_for));
+        let mut session = Session::new(Composer::new(engine)
+                .with_english(crate::loanword::english_for)
+                .with_emoji(crate::emoji::emoji_for));
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.playful = |text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string());
         Self {
@@ -214,6 +216,10 @@ fn setup_env() {
     if std::env::var_os("NOVAKEY_LOANWORDS").is_none() {
         let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/loanwords.tsv");
         std::env::set_var("NOVAKEY_LOANWORDS", repo_table);
+    }
+    if std::env::var_os("NOVAKEY_EMOJI").is_none() {
+        let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/emoji.tsv");
+        std::env::set_var("NOVAKEY_EMOJI", repo_table);
     }
 }
 

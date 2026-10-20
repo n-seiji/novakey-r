@@ -49,6 +49,11 @@ struct Unit {
     literal: bool,
 }
 
+/// 1 回の変換で入れる絵文字の上限
+const EMOJI_LIMIT: usize = 5;
+/// 絵文字より前に並べるエンジン候補の数
+const EMOJI_AFTER_ENGINE: usize = 3;
+
 pub struct Composer<E: CandidateEngine> {
     engine: E,
     units: Vec<Unit>,
@@ -64,6 +69,10 @@ pub struct Composer<E: CandidateEngine> {
     base: Phase,
     /// カタカナ語に対応する英単語を引く関数。テストでは差し替える。
     english_for: fn(&str) -> Vec<String>,
+    /// ひらがなの読み全体に対応する絵文字を引く関数。テストでは差し替える。
+    emoji_for: fn(&str) -> Vec<String>,
+    /// 変換候補に入れた絵文字。リランキングで並べ直すときに見分けるために持つ。
+    emoji_texts: Vec<String>,
 }
 
 impl<E: CandidateEngine> Composer<E> {
@@ -81,12 +90,20 @@ impl<E: CandidateEngine> Composer<E> {
             translit: String::new(),
             base: Phase::Empty,
             english_for: |_| Vec::new(),
+            emoji_for: |_| Vec::new(),
+            emoji_texts: Vec::new(),
         }
     }
 
     /// カタカナ語の英単語候補 (desktop など) を引く関数を差し込む。
     pub fn with_english(mut self, english_for: fn(&str) -> Vec<String>) -> Self {
         self.english_for = english_for;
+        self
+    }
+
+    /// 読みに対応する絵文字を引く関数を差し込む。
+    pub fn with_emoji(mut self, emoji_for: fn(&str) -> Vec<String>) -> Self {
+        self.emoji_for = emoji_for;
         self
     }
 
@@ -164,6 +181,7 @@ impl<E: CandidateEngine> Composer<E> {
     fn reset_candidates(&mut self) {
         self.generation += 1;
         self.candidates.clear();
+        self.emoji_texts.clear();
         self.pending_rerank = None;
     }
 
@@ -322,6 +340,7 @@ impl<E: CandidateEngine> Composer<E> {
         // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
         self.insert_raw_candidate();
         self.insert_english_candidates();
+        self.insert_emoji_candidates();
         if self.candidates.is_empty() {
             return false;
         }
@@ -443,23 +462,25 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_rerank.is_some()
     }
 
-    /// 変換済み候補列から raw・英単語(engine_index なし)を一旦外して display_index 番目を先頭へ昇格し、第 1 候補の直後へ戻す。
+    /// 変換済み候補列から raw・英単語・絵文字(engine_index なし)を一旦外して display_index 番目を先頭へ昇格し、
+    /// raw・英単語は第 1 候補の直後へ、絵文字は元の位置規則どおりに戻す。
     fn promote_converting(&mut self, display_index: usize) -> Option<String> {
         let (engine, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut self.candidates)
             .into_iter()
             .partition(|c| c.engine_index.is_some());
-        if display_index >= engine.len() {
-            // 外す前の並びは復元できないので、第 1 候補の直後へ戻す。
-            self.candidates = engine;
-            let position = self.candidates.len().min(1);
-            self.candidates.splice(position..position, extras);
-            return None;
-        }
+        let (emoji, extras): (Vec<Candidate>, Vec<Candidate>) = extras
+            .into_iter()
+            .partition(|c| self.emoji_texts.contains(&c.text));
         self.candidates = engine;
-        self.promote(display_index);
+        let promoted = display_index < self.candidates.len();
+        if promoted {
+            self.promote(display_index);
+        }
+        // 外す前の並びは復元できないので、第 1 候補の直後へ戻す。
         let position = self.candidates.len().min(1);
         self.candidates.splice(position..position, extras);
-        Some(self.display().to_string())
+        self.place_emoji(emoji);
+        promoted.then(|| self.display().to_string())
     }
 
     fn promote(&mut self, display_index: usize) {
@@ -485,6 +506,32 @@ impl<E: CandidateEngine> Composer<E> {
             .collect();
         let position = self.candidates.len().min(1);
         self.candidates.splice(position..position, fresh);
+    }
+
+    /// 組成全体が絵文字の読みと一致する場合、絵文字を最大 EMOJI_LIMIT 件入れる。
+    fn insert_emoji_candidates(&mut self) {
+        if matches!(self.phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
+            return;
+        }
+        let fresh: Vec<Candidate> = (self.emoji_for)(&self.hiragana)
+            .into_iter()
+            .filter(|e| !self.candidates.iter().any(|c| &c.text == e))
+            .take(EMOJI_LIMIT)
+            .map(|text| Candidate {
+                text,
+                engine_index: None,
+            })
+            .collect();
+        self.emoji_texts.extend(fresh.iter().map(|c| c.text.clone()));
+        self.place_emoji(fresh);
+    }
+
+    /// 絵文字を、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
+    fn place_emoji(&mut self, emoji: Vec<Candidate>) {
+        let engine = self.candidates.iter().filter(|c| c.engine_index.is_some()).count();
+        let extras = self.candidates.len() - engine;
+        let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(self.candidates.len());
+        self.candidates.splice(position..position, emoji);
     }
 
     fn insert_raw_candidate(&mut self) {
@@ -1482,5 +1529,114 @@ mod tests {
             texts(&c),
             vec!["デス区トップ", "desktop", "desukutoppu", "デスクトップ"]
         );
+    }
+
+    fn emojis(reading: &str) -> Vec<String> {
+        match reading {
+            "ねこ" => ["😺", "😸", "😹", "😻", "😼", "🐱", "🐈"].map(String::from).to_vec(),
+            "かんぱい" => vec!["🍻".to_string(), "X1".to_string()],
+            "いぬ" => vec!["🐶".to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn emoji_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine> {
+        let engine = MockEngine {
+            log: Log::default(),
+            table: vec![(
+                reading.to_string(),
+                candidates.iter().map(|s| s.to_string()).collect(),
+            )],
+        };
+        Composer::new(engine).with_emoji(emojis)
+    }
+
+    #[test]
+    fn 絵文字は上位3件のエンジン候補とrawの後ろに入り最大5件() {
+        let mut c = emoji_composer("ねこ", &["猫", "ネコ", "根子", "寝こ", "値こ"]);
+        c.push_input("neko", "ねこ", "");
+        c.begin_conversion();
+        assert_eq!(
+            texts(&c),
+            vec!["猫", "neko", "ネコ", "根子", "😺", "😸", "😹", "😻", "😼", "寝こ", "値こ"]
+        );
+        assert_eq!(c.candidates()[4].engine_index, None);
+    }
+
+    #[test]
+    fn 絵文字は3番目より前には入らない() {
+        let mut c = emoji_composer("いぬ", &["犬"]);
+        c.push_input("inu", "いぬ", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["犬", "inu", "🐶"]);
+        let mut c = emoji_composer("いぬ", &[]);
+        c.push_input("inu", "いぬ", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["inu", "🐶"]);
+    }
+
+    #[test]
+    fn 絵文字を選んで確定するとその文字列が出て学習しない() {
+        let mut c = emoji_composer("かんぱい", &["乾杯", "完敗", "缶杯"]);
+        c.push_input("kanpai", "かんぱい", "");
+        c.begin_conversion();
+        let index = texts(&c).iter().position(|t| *t == "🍻").unwrap();
+        assert!(c.select_candidate(index));
+        assert_eq!(c.commit(), "🍻");
+        assert!(c.engine.log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn 読みが表に無ければ候補は変わらない() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
+    }
+
+    #[test]
+    fn 末尾の子音が残るDanglingでは絵文字を引かない() {
+        let mut c = emoji_composer("ねこ", &["猫"]);
+        c.push_input("neko", "ねこ", "");
+        c.push_flush(Flush::Dangling("r".to_string()));
+        c.begin_conversion();
+        assert!(!texts(&c).contains(&"😺"));
+    }
+
+    #[test]
+    fn かな混じりのMixedでは絵文字を引かない() {
+        let mut c = emoji_composer("ねこ", &["猫"]);
+        c.push_input("neko", "ねこ", "");
+        c.push_literal("A");
+        c.begin_conversion();
+        assert!(!texts(&c).contains(&"😺"));
+    }
+
+    #[test]
+    fn 記号の組成では絵文字を引かない() {
+        let engine = MockEngine { log: Log::default(), table: vec![] };
+        let mut c = Composer::new(engine).with_emoji(|_| vec!["😺".to_string()]);
+        c.push_input("!", "！", "");
+        c.begin_conversion();
+        assert!(!texts(&c).contains(&"😺"));
+    }
+
+    #[test]
+    fn 既にある候補と同じ絵文字は入れない() {
+        let mut c = emoji_composer("かんぱい", &["乾杯", "🍻"]);
+        c.push_input("kanpai", "かんぱい", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c).iter().filter(|t| **t == "🍻").count(), 1);
+        assert!(texts(&c).contains(&"X1"));
+    }
+
+    #[test]
+    fn リランキング後も絵文字はエンジン候補の後ろに並ぶ() {
+        let mut c = emoji_composer("いぬ", &["犬", "戌", "乾", "伊奴"]);
+        c.push_input("inu", "いぬ", "");
+        c.begin_conversion();
+        assert_eq!(texts(&c), vec!["犬", "inu", "戌", "乾", "🐶", "伊奴"]);
+        assert_eq!(c.apply_rerank(c.current_generation(), 1).as_deref(), Some("戌"));
+        assert_eq!(texts(&c), vec!["戌", "inu", "犬", "乾", "🐶", "伊奴"]);
     }
 }

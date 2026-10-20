@@ -115,7 +115,8 @@ declare_class!(
             let this = this.set_ivars(Ivars {
                 session: RefCell::new(Session::new(
                     Composer::new(AnyEngine::new(controller_id))
-                        .with_english(crate::loanword::english_for),
+                        .with_english(crate::loanword::english_for)
+                        .with_emoji(crate::emoji::emoji_for),
                 )),
                 mode: RefCell::new(ConversionMode::Space),
                 controller_id,
