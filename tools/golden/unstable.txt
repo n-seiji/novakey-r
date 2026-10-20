@@ -1,0 +1,4 @@
+# SWIFT_DETERMINISTIC_HASHING なしで fresh を複数回走らせたとき結果が揺れる行 (tools/golden_stats.py が生成)。
+# 列: 読み<TAB>seq<TAB>異なる結果の数<TAB>top3が揺れる(0/1)<TAB>top9の文字列順が揺れる(0/1)
+かんがえる		2	0	0
+かんがえる	か|かん|かんじ|かん|かんが|かんがえ|かんがえる	2	0	0
