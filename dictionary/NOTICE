@@ -1,0 +1,11 @@
+This directory contains the dictionary data of azooKey_dictionary_storage
+(https://github.com/ensan-hcl/azooKey_dictionary_storage), licensed under
+the Apache License 2.0 (see LICENSE in this directory).
+
+Source commit: 832fbb0d3039dfaa4b2183956f3d96f6b07eec4d (v2.4.2-5-g832fbb0d)
+Obtained via the submodule of AzooKeyKanaKanjiConverter v0.11.2
+(revision 80b8204f1cdfb364bb2ed355cf52c7ebb2519a0c).
+
+Modifications: the zero-hint prediction data directory "p/" was removed.
+All other files (louds/, cb/, mm.binary) are unchanged copies.
+Integrity: see SHA256SUMS.

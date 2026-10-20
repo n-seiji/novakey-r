@@ -61,3 +61,5 @@ sudo cp -r output/NovakeyR.app "/Library/Input Methods"
 カタカナ語の英単語候補(`resources/loanwords.tsv`)は、[EDRDG](https://www.edrdg.org/) の JMdict から `tools/gen_loanwords.py` で生成しています。JMdict は [CC BY-SA 4.0](https://www.edrdg.org/edrdg/licence.html) で提供されています。
 
 ローマ字→ひらがなの変換表(`src/romaji_table.tsv`)は、[Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv`(BSD 3-Clause, Copyright Google Inc.)を元にしています。
+
+変換辞書(`dictionary/`)は、[azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage)(Apache License 2.0)のデータを、予測用の `p/` を除いてそのまま収録しています。詳細は `dictionary/NOTICE` を参照してください。
