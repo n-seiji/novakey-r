@@ -1,5 +1,7 @@
 use std::ffi::{c_char, CStr};
 
+use crate::composer::CandidateEngine;
+
 extern "C" {
     fn novakey_kkc_convert(
         controller_id: u64,
@@ -77,4 +79,26 @@ pub fn smoke_test(reading: Option<&str>) {
         candidates
     );
     println!("OK");
+}
+
+pub struct KkcEngine {
+    controller_id: u64,
+}
+
+impl KkcEngine {
+    pub fn new(controller_id: u64) -> Self {
+        Self { controller_id }
+    }
+}
+
+impl CandidateEngine for KkcEngine {
+    fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+        convert(self.controller_id, revision, hiragana)
+    }
+    fn select(&mut self, revision: u64, engine_index: usize) -> bool {
+        select(self.controller_id, revision, engine_index)
+    }
+    fn cancel(&mut self) {
+        cancel(self.controller_id);
+    }
 }

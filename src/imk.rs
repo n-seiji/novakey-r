@@ -7,35 +7,16 @@ use objc2::{
     declare_class, extern_class, msg_send_id, mutability, sel, ClassType, DeclaredClass,
 };
 use objc2_foundation::{NSArray, NSObject, NSString};
-use once_cell::sync::Lazy;
-use rand::Rng;
 
-use crate::composer::{CandidateEngine, Composer, Phase};
+use crate::composer::{Composer, Phase};
 use crate::imk_client::Client;
-use crate::keymap::{self, Action, Key, Stroke};
-use crate::kkc_bridge;
+use crate::keymap::{self, Key, Stroke};
+use crate::kkc_bridge::KkcEngine;
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
-use crate::romaji_converter::{Flush, RomajiConverter};
-use crate::symbols;
+use crate::session::{Effect, Outcome, RerankJob, Session};
 use crate::trace;
-
-pub struct KkcEngine {
-    controller_id: u64,
-}
-
-impl CandidateEngine for KkcEngine {
-    fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
-        kkc_bridge::convert(self.controller_id, revision, hiragana)
-    }
-    fn select(&mut self, revision: u64, engine_index: usize) -> bool {
-        kkc_bridge::select(self.controller_id, revision, engine_index)
-    }
-    fn cancel(&mut self) {
-        kkc_bridge::cancel(self.controller_id);
-    }
-}
 
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
@@ -99,8 +80,7 @@ pub enum ConversionMode {
 }
 
 pub struct Ivars {
-    converter: RefCell<RomajiConverter>,
-    composer: RefCell<Composer<KkcEngine>>,
+    session: RefCell<Session<KkcEngine>>,
     mode: RefCell<ConversionMode>,
     controller_id: u64,
     last_client: RefCell<Option<Client>>,
@@ -133,8 +113,10 @@ declare_class!(
         ) -> Option<Id<Self>> {
             let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
             let this = this.set_ivars(Ivars {
-                converter: RefCell::new(RomajiConverter::new()),
-                composer: RefCell::new(Composer::new(KkcEngine { controller_id }).with_english(crate::loanword::english_for)),
+                session: RefCell::new(Session::new(
+                    Composer::new(KkcEngine::new(controller_id))
+                        .with_english(crate::loanword::english_for),
+                )),
                 mode: RefCell::new(ConversionMode::Space),
                 controller_id,
                 last_client: RefCell::new(None),
@@ -185,8 +167,10 @@ declare_class!(
                     self.dispatch(*key, text, &client) || handled
                 }),
                 Stroke::Navigation => {
-                    let has_pending = !self.ivars().converter.borrow().buffer().is_empty()
-                        || !self.ivars().composer.borrow().is_empty();
+                    let has_pending = {
+                        let session = self.ivars().session.borrow();
+                        !session.converter.buffer().is_empty() || !session.composer.is_empty()
+                    };
                     trace::record(
                         "handleEvent",
                         &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
@@ -199,8 +183,9 @@ declare_class!(
 
         #[method_id(candidates:)]
         fn candidates(&self, _sender: Option<&AnyObject>) -> Id<NSArray<NSString>> {
-            let composer = self.ivars().composer.borrow();
-            let texts: Vec<Id<NSString>> = composer
+            let session = self.ivars().session.borrow();
+            let texts: Vec<Id<NSString>> = session
+                .composer
                 .candidates()
                 .iter()
                 .map(|cand| NSString::from_str(&cand.text))
@@ -219,10 +204,11 @@ declare_class!(
             };
             trace::record("candidateSelectionChanged", &format!("phase={:?}", self.phase()));
             let marked = {
-                let mut composer = self.ivars().composer.borrow_mut();
-                composer
+                let mut session = self.ivars().session.borrow_mut();
+                session
+                    .composer
                     .select_candidate_text(&text)
-                    .then(|| composer.display().to_string())
+                    .then(|| session.composer.display().to_string())
             };
             if let Phase::Converting { selected, .. } = self.phase() {
                 self.ivars().panel_line.set(selected);
@@ -239,8 +225,8 @@ declare_class!(
                 return;
             };
             trace::record("candidateSelected", &format!("phase={:?}", self.phase()));
-            self.ivars().composer.borrow_mut().select_candidate_text(&text);
-            self.commit_and_insert(&client, "");
+            let effects = self.ivars().session.borrow_mut().commit_selected(&text);
+            self.run(effects, Some(&client));
         }
 
         #[method_id(menu)]
@@ -289,33 +275,25 @@ declare_class!(
                 };
                 *mode
             };
-            self.ivars().composer.borrow_mut().set_live(new_mode == ConversionMode::Live);
-            let is_empty = self.ivars().composer.borrow().is_empty();
-            if let (Some(client), false) = (self.client(), is_empty) {
-                self.refresh_marked(&client);
+            let marked = {
+                let mut session = self.ivars().session.borrow_mut();
+                session.composer.set_live(new_mode == ConversionMode::Live);
+                (!session.composer.is_empty()).then(|| session.marked_text())
+            };
+            if let (Some(client), Some(marked)) = (self.client(), marked) {
+                client.set_marked(&marked);
             }
         }
 
         #[method(commitComposition:)]
         fn commit_composition(&self, client: Option<&AnyObject>) {
             let client = client.map(Client::new);
-            self.flush_romaji(true);
-            let is_empty = self.ivars().composer.borrow().is_empty();
-            if let (Some(client), false) = (client, is_empty) {
-                let text = self.ivars().composer.borrow_mut().commit();
-                client.insert(&text);
-            }
-            self.hide_candidates_window();
+            self.sync_rerank_flag();
+            let effects = self.ivars().session.borrow_mut().commit_composition();
+            self.run(effects, client.as_ref());
         }
     }
 );
-
-/// リランキング要求の中身。composer の借用中に作り、借用を外してから送る。
-struct RerankJob {
-    generation: u64,
-    hiragana: String,
-    candidates: Vec<String>,
-}
 
 impl NovakeyRInputController {
     fn client(&self) -> Option<Client> {
@@ -323,219 +301,64 @@ impl NovakeyRInputController {
     }
 
     fn phase(&self) -> Phase {
-        self.ivars().composer.borrow().phase()
+        self.ivars().session.borrow().phase()
     }
 
-    /// 表示中の変換結果(またはかな) + 未変換のローマ字。
-    fn marked_text(&self) -> String {
-        let romaji = self.ivars().converter.borrow().pending_display();
-        let display = self.ivars().composer.borrow().display().to_string();
-        format!("{display}{romaji}")
+    /// 無効時は RequestRerank が作られず、Keychain に触れる経路へ進まない。
+    fn sync_rerank_flag(&self) {
+        self.ivars().session.borrow_mut().rerank =
+            rerank_allowed(ai_rerank_enabled(), credentials_missing());
     }
 
-    fn refresh_marked(&self, client: &Client) {
-        client.set_marked(&self.marked_text());
-    }
-
-    /// 未変換のローマ字を確定かなとして composer へ流す。
-    fn flush_romaji(&self, rerank: bool) {
-        let flush = self.ivars().converter.borrow_mut().flush();
-        let ranks = matches!(flush, Flush::Kana(_));
-        self.ivars().composer.borrow_mut().push_flush(flush);
-        if ranks && rerank {
-            self.request_rerank(false);
-        }
-    }
-
-    fn push_input(&self, raw: &str, kana: &str) {
-        let carry = self.ivars().converter.borrow().buffer().to_string();
-        self.ivars()
-            .composer
-            .borrow_mut()
-            .push_input(raw, kana, &carry);
-        if !kana.is_empty() {
-            self.request_rerank(false);
-        }
-    }
-
-    /// 現在の表示内容を確定して挿入する。suffix は確定直後に続けて入れる文字列。
-    fn commit_and_insert(&self, client: &Client, suffix: &str) {
-        let text = self.ivars().composer.borrow_mut().commit();
-        client.set_marked("");
-        client.insert(&format!("{text}{suffix}"));
-        self.hide_candidates_window();
-    }
-
-    /// キー処理の入口。キーを動作表で解決して実行する。処理したら true。
+    /// キー処理の入口。session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &Client) -> bool {
-        let phase = self.phase();
-        if let Some(handled) = self.prepare(key, client) {
-            trace::record(
+        self.sync_rerank_flag();
+        // session の借用はここで外れる。以降の Cocoa 呼び出しは composer を再借用してよい。
+        let outcome = self.ivars().session.borrow_mut().handle(key, text);
+        let Outcome { handled, action, phase, effects } = outcome;
+        self.run(effects, Some(client));
+        match action {
+            None => trace::record(
                 "handleEvent",
                 &format!("key={} phase={phase:?} action=Romaji handled={handled}", key.name()),
-            );
-            return handled;
-        }
-        let phase = self.phase();
-        let action = keymap::action_for(phase, key);
-        let handled = self.perform(action, text, client);
-        trace::record(
-            "handleEvent",
-            &format!(
-                "key={} phase={phase:?} action={} handled={handled} now={:?}",
-                key.name(),
-                action.name(),
-                self.phase()
             ),
-        );
+            Some(action) => trace::record(
+                "handleEvent",
+                &format!(
+                    "key={} phase={phase:?} action={} handled={handled} now={:?}",
+                    key.name(),
+                    action.name(),
+                    self.phase()
+                ),
+            ),
+        }
         handled
     }
 
-    /// 動作表に引く前の、ローマ字バッファ側の後始末。ここで処理が済んだら Some。
-    fn prepare(&self, key: Key, client: &Client) -> Option<bool> {
-        let flushes = matches!(
-            key,
-            Key::Space
-                | Key::ShiftSpace
-                | Key::Digit(_)
-                | Key::Punct
-                | Key::Mark
-                | Key::Hyphen
-                | Key::Symbol
-                | Key::Enter
-                | Key::Control
-                | Key::Letter { upper: true }
-                | Key::Translit(_)
-        );
-        if flushes {
-            self.flush_romaji(!matches!(key, Key::Translit(_)));
-        }
-        let has_romaji = !self.ivars().converter.borrow().buffer().is_empty();
-        match key {
-            Key::Backspace if has_romaji => {
-                self.ivars().converter.borrow_mut().handle_backspace();
-                self.ivars().composer.borrow_mut().pop_pending_raw();
-                self.refresh_marked(client);
-                Some(true)
-            }
-            Key::Escape => {
-                self.ivars().converter.borrow_mut().clear();
-                self.ivars().composer.borrow_mut().clear_pending_raw();
-                if has_romaji && self.ivars().composer.borrow().is_empty() {
-                    client.set_marked("");
-                    return Some(true);
+    fn run(&self, effects: Vec<Effect>, client: Option<&Client>) {
+        for effect in effects {
+            match effect {
+                Effect::SetMarked(text) => {
+                    if let Some(client) = client {
+                        client.set_marked(&text);
+                    }
                 }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn perform(&self, action: Action, text: &str, client: &Client) -> bool {
-        match action {
-            Action::PassThrough => false,
-            Action::InsertSpace => {
-                client.insert(" ");
-                true
-            }
-            Action::InsertDirect => playful_convert(text)
-                .map(|converted| client.insert(&converted))
-                .is_some(),
-            Action::TypeRomaji => {
-                let kana = text
-                    .chars()
-                    .filter_map(|ch| {
-                        self.ivars()
-                            .converter
-                            .borrow_mut()
-                            .process_input(ch.to_ascii_lowercase())
-                    })
-                    .collect::<String>();
-                self.push_input(text, &kana);
-                self.show_typing(client)
-            }
-            Action::StartLiteral | Action::TypeLiteral => {
-                self.ivars().composer.borrow_mut().push_literal(text);
-                self.show_typing(client)
-            }
-            Action::TypeText => {
-                self.push_input(text, symbols::default_form(text).unwrap_or(text));
-                self.show_typing(client)
-            }
-            Action::Convert => {
-                let needs_rerank = {
-                    let composer = self.ivars().composer.borrow();
-                    composer.phase() != Phase::Dangling && !composer.has_pending_rerank()
-                };
-                if needs_rerank {
-                    self.request_rerank(true);
+                Effect::Insert(text) => {
+                    if let Some(client) = client {
+                        client.insert(&text);
+                    }
                 }
-                self.ivars().composer.borrow_mut().begin_conversion();
-                self.refresh_marked(client);
-                true
-            }
-            Action::NextCandidate => {
-                self.ivars().composer.borrow_mut().advance();
-                self.show_selection(client)
-            }
-            Action::PrevCandidate => {
-                self.ivars().composer.borrow_mut().retreat();
-                self.show_selection(client)
-            }
-            Action::CommitThenPassThrough => {
-                self.commit_and_insert(client, "");
-                false
-            }
-            Action::PickCandidate(number) => {
-                let picked = self
-                    .ivars()
-                    .composer
-                    .borrow_mut()
-                    .select_candidate(usize::from(number) - 1);
-                if picked {
-                    self.commit_and_insert(client, "");
-                }
-                true
-            }
-            Action::Commit => {
-                self.commit_and_insert(client, "");
-                true
-            }
-            Action::CommitThenSpace => {
-                self.commit_and_insert(client, " ");
-                true
-            }
-            Action::CommitThenInsert => {
-                self.commit_and_insert(client, text);
-                true
-            }
-            Action::Revert => {
-                self.ivars().composer.borrow_mut().revert();
-                self.show_typing(client)
-            }
-            Action::Transliterate(form) => {
-                let changed = self.ivars().composer.borrow_mut().transliterate(form);
-                changed && self.show_typing(client)
-            }
-            Action::DeleteBack => {
-                let deleted = self.ivars().composer.borrow_mut().backspace();
-                if deleted {
-                    self.request_rerank(false);
-                    self.show_typing(client);
-                }
-                deleted
+                Effect::ShowCandidates { selected } => self.show_candidates(selected),
+                Effect::HideCandidates => platform::hide_candidates(),
+                Effect::RequestRerank { urgent, job } => self.send_rerank(urgent, &job),
             }
         }
     }
 
-    /// 選択中の候補を表示し、候補ウィンドウを出してハイライトを合わせる。
-    fn show_selection(&self, client: &Client) -> bool {
-        self.refresh_marked(client);
-        // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、composer を再借用する。
+    /// 候補ウィンドウを出してハイライトを合わせる。
+    fn show_candidates(&self, selected: usize) {
+        // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、session を再借用する。
         // ここでは借用を持っていない。
-        let Phase::Converting { selected, .. } = self.phase() else {
-            return true;
-        };
         self.ivars().syncing.set(true);
         if platform::show_candidates() {
             self.ivars().panel_line.set(0);
@@ -545,35 +368,10 @@ impl NovakeyRInputController {
         self.ivars().panel_line.set(selected);
         self.ivars().syncing.set(false);
         trace::record("select", &format!("line={selected} moved={delta}"));
-        true
-    }
-
-    /// 入力途中の表示を更新して候補ウィンドウを閉じる。
-    fn show_typing(&self, client: &Client) -> bool {
-        self.refresh_marked(client);
-        self.hide_candidates_window();
-        true
-    }
-
-    fn rerank_job(&self) -> Option<RerankJob> {
-        let composer = self.ivars().composer.borrow();
-        (composer.phase() == Phase::Composing
-            && !composer.is_symbol()
-            && composer.candidates().len() >= 2).then(|| {
-            RerankJob {
-                generation: composer.current_generation(),
-                hiragana: composer.display_hiragana().to_string(),
-                candidates: composer.candidates().iter().map(|c| c.text.clone()).collect(),
-            }
-        })
     }
 
     /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
-    fn request_rerank(&self, urgent: bool) {
-        if !rerank_allowed(ai_rerank_enabled(), credentials_missing()) {
-            return;
-        }
-        let Some(job) = self.rerank_job() else { return };
+    fn send_rerank(&self, urgent: bool, job: &RerankJob) {
         let client = self.client();
         let preceding = client
             .as_ref()
@@ -618,18 +416,16 @@ impl NovakeyRInputController {
             return;
         };
         let Some(client) = self.client() else { return };
-        let applied = self
-            .ivars()
-            .composer
-            .borrow_mut()
-            .apply_rerank(generation, index);
-        if applied.is_some() {
-            self.refresh_marked(&client);
+        let marked = {
+            let mut session = self.ivars().session.borrow_mut();
+            session
+                .composer
+                .apply_rerank(generation, index)
+                .map(|_| session.marked_text())
+        };
+        if let Some(marked) = marked {
+            client.set_marked(&marked);
         }
-    }
-
-    fn hide_candidates_window(&self) {
-        platform::hide_candidates();
     }
 }
 
@@ -647,22 +443,6 @@ pub fn run() {
 }
 
 const CONTEXT_MAX_UTF16: usize = 200;
-
-static PLAYFUL_MAP: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
-    let mut outs = HashMap::new();
-    outs.insert("l", vec!["l", "I", "|"]);
-    outs.insert("1", vec!["l", "1", "I"]);
-    outs.insert("I", vec!["l", "I", "|"]);
-    outs.insert("O", vec!["O", "0"]);
-    outs.insert("0", vec!["O", "0"]);
-    outs
-});
-
-fn playful_convert(text: &str) -> Option<String> {
-    let list = PLAYFUL_MAP.get(text)?;
-    let i = rand::thread_rng().gen_range(0..list.len());
-    Some(list[i].to_string())
-}
 
 #[cfg(test)]
 mod tests {

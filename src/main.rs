@@ -8,6 +8,7 @@ mod loanword;
 mod outbound;
 mod platform;
 mod romaji_converter;
+mod session;
 mod symbols;
 mod trace;
 mod translit;
