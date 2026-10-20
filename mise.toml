@@ -14,9 +14,6 @@ run = "cargo test"
 description = "LLM候補リランキングのスモークテスト"
 run = "cargo run --release -- --test-llm"
 
-[tasks.test-kkc]
-description = "辞書かな漢字変換の1回変換スモークテスト (読み指定可: mise run test-kkc -- ですくとっぷ)"
-run = "cargo run --release -- --test-kkc"
 
 [tasks.simulate]
 description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
@@ -27,43 +24,14 @@ description = "tools/scenarios.txt を流す。期待付きの行が外れたら
 run = "cargo run --release -- --simulate-file tools/scenarios.txt"
 
 [tasks.scenarios-learning]
-description = "学習ありのシナリオを Rust 版・Swift 版の両方で流す (記憶は一時ディレクトリ)"
-run = """
-set -e
-cargo build --release
-for engine in rust swift; do
-  echo "== $engine"
-  NOVAKEY_ENGINE=$engine NOVAKEY_SIM_LEARNING=1 ./target/release/novakey_r --simulate-file tools/learning_scenarios.txt
-done
-"""
+description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"
+run = "NOVAKEY_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learning_scenarios.txt"
 
-[tasks.kkc-dump]
-description = "Swift 版 KKC の golden を作り直す (fresh / typed / 漢数字・全半角表)。Rust 版との差分テストの基準"
-run = """
-set -e
-mkdir -p tools/golden
-cargo build --release
-tmp=$(mktemp -d)
-SWIFT_DETERMINISTIC_HASHING=1 ./target/release/novakey_r --kkc-dump tools/kkc_corpus.txt "$tmp/fresh.jsonl"
-SWIFT_DETERMINISTIC_HASHING=1 ./target/release/novakey_r --kkc-dump tools/kkc_corpus.txt "$tmp/typed.jsonl" --typed
-gzip -9nc "$tmp/fresh.jsonl" > tools/golden/fresh.jsonl.gz
-gzip -9nc "$tmp/typed.jsonl" > tools/golden/typed.jsonl.gz
-rm -rf "$tmp"
-./target/release/novakey_r --kkc-dump-numbers tools/golden/kansuji.tsv tools/golden/width_map.tsv
-"""
 
-[tasks.kkc-learn-compare]
-description = "学習の Swift 版との比較 (確定 → 再変換で上位がそろうか)。--show で上位 5 件も表示"
-depends = ["build"]
-run = "SWIFT_DETERMINISTIC_HASHING=1 ./target/release/novakey_r --kkc-learn-compare"
 
-[tasks.golden-stats]
-description = "golden の測定 (fresh と typed の差・決定的ハッシュなしの揺れ・特殊候補/wise の出現頻度)"
-depends = ["build"]
-run = "python3 -I tools/golden_stats.py"
 
 [tasks.kkc-compare]
-description = "Rust 版 KKC を Swift 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
+description = "Rust 版 KKC を azooKey (Swift) 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
 depends = ["build"]
 run = "./target/release/novakey_r --kkc-compare"
 
@@ -80,8 +48,9 @@ mkdir -p output/NovakeyR.app/Contents/MacOS
 mkdir -p output/NovakeyR.app/Contents/Resources
 cp Info.plist output/NovakeyR.app/Contents/
 cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
-cp -R swift/AzooKeyBridge/.build/release/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle output/NovakeyR.app/Contents/MacOS/
 cp -R resources/. output/NovakeyR.app/Contents/Resources/
+cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
+cp NOTICE output/NovakeyR.app/Contents/Resources/NOTICE
 """
 
 [tasks.clean]

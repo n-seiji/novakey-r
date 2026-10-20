@@ -11,7 +11,7 @@ use objc2_foundation::{NSArray, NSObject, NSString};
 use crate::composer::{Composer, Phase};
 use crate::imk_client::Client;
 use crate::keymap::{self, Key, Stroke};
-use crate::kkc_bridge::AnyEngine;
+use crate::kkc::RustEngine;
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
@@ -80,7 +80,7 @@ pub enum ConversionMode {
 }
 
 pub struct Ivars {
-    session: RefCell<Session<AnyEngine>>,
+    session: RefCell<Session<RustEngine>>,
     mode: RefCell<ConversionMode>,
     controller_id: u64,
     last_client: RefCell<Option<Client>>,
@@ -114,7 +114,7 @@ declare_class!(
             let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
             let this = this.set_ivars(Ivars {
                 session: RefCell::new(Session::new(
-                    Composer::new(AnyEngine::new(controller_id))
+                    Composer::new(RustEngine::new())
                         .with_english(crate::loanword::english_for)
                         .with_emoji(crate::emoji::emoji_for),
                 )),

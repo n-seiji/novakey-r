@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::composer::{Composer, Phase};
 use crate::keymap::{self, Key, Stroke};
-use crate::kkc_bridge::{self, AnyEngine};
+use crate::kkc::RustEngine;
 use crate::session::{Effect, Session};
 use crate::translit::Form;
 
@@ -81,7 +81,7 @@ fn parse_keys(keys: &str) -> Result<Vec<(String, Event)>, String> {
 
 /// 本物のアプリが持つ状態のうち、キー処理の結果として見えるもの。
 struct Sim {
-    session: Session<AnyEngine>,
+    session: Session<RustEngine>,
     /// アプリに確定済みの文字列。
     committed: String,
     /// アプリが表示している下線付きの未確定文字列 (最後の SetMarked)。
@@ -93,8 +93,8 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(controller_id: u64) -> Self {
-        let engine = AnyEngine::new(controller_id);
+    fn new() -> Self {
+        let engine = RustEngine::new();
         let mut session = Session::new(Composer::new(engine)
                 .with_english(crate::loanword::english_for)
                 .with_emoji(crate::emoji::emoji_for));
@@ -241,8 +241,8 @@ struct Run {
     stale: Vec<String>,
 }
 
-fn run_keys(keys: &str, controller_id: u64, verbose: bool) -> Result<Run, String> {
-    let mut sim = Sim::new(controller_id);
+fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
+    let mut sim = Sim::new();
     for (label, ev) in parse_keys(keys)? {
         sim.press(&ev);
         if sim.marked != sim.session.marked_text() {
@@ -262,14 +262,13 @@ fn run_keys(keys: &str, controller_id: u64, verbose: bool) -> Result<Run, String
             }
         }
     }
-    kkc_bridge::cancel(controller_id);
     Ok(Run { committed: sim.committed, marked: sim.marked, stale: sim.stale })
 }
 
 /// `--simulate '<keys>'`
 pub fn simulate(keys: &str) {
     setup_env();
-    match run_keys(keys, 1, true) {
+    match run_keys(keys, true) {
         Ok(Run { committed, marked, stale }) => {
             println!("final: {committed:?}");
             if !marked.is_empty() {
@@ -315,12 +314,12 @@ pub fn simulate_file(path: &str) {
     });
     let mut failures = 0;
     let scenarios = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#'));
-    for (i, line) in scenarios.enumerate() {
+    for line in scenarios {
         let (keys, expected) = match line.split_once('\t') {
             Some((keys, expected)) => (keys, Some(unescape(expected))),
             None => (line, None),
         };
-        let result = run_keys(keys, 1000 + i as u64, false);
+        let result = run_keys(keys, false);
         let shown = match &result {
             Ok(run) if run.marked.is_empty() => format!("{:?}", run.committed),
             Ok(run) => format!("{:?} +composing {:?}", run.committed, run.marked),

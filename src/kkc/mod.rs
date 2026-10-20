@@ -1,7 +1,7 @@
 //! azooKey 互換のかな漢字変換 (Swift 版 AzooKeyKanaKanjiConverter v0.11.2 の Rust 移植)。
 //!
 //! 辞書ファイル形式 (`dict` / `louds`)、ラティスと N-best Viterbi (`lattice`)、動的エントリ (`wise`)、
-//! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine` (環境変数 `NOVAKEY_ENGINE=rust` のとき)。
+//! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine`。
 //! 学習は `learning` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で無効)。
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_imports)]
@@ -11,7 +11,6 @@ pub mod compare;
 pub mod dict;
 pub mod elem;
 pub mod lattice;
-pub mod learn_compare;
 pub mod learning;
 pub mod louds;
 pub mod result;
@@ -212,6 +211,54 @@ mod tests {
         let mut e2 = engine(Learning::open(&dir));
         assert_eq!(e2.convert(1, "かんじ")[0], "幹事");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (読み, 確定する候補の順位 (1 始まり), 確定する回数)。事例は 1 つの記憶に積み上げる。
+    const LEARNING_CASES: &[(&str, usize, usize)] = &[
+        ("かんじ", 3, 1),
+        ("きかい", 2, 1),
+        ("こうえん", 3, 1),
+        ("せいかく", 2, 1),
+        ("はし", 4, 1),
+        ("かみ", 3, 1),
+        ("あめ", 2, 1),
+        ("いし", 3, 1),
+        ("きょうはいいてんきですね", 3, 1),
+        ("わたしのなまえはなかのです", 2, 1),
+        ("あしたかいしゃにいきます", 2, 1),
+        ("けんきゅうしつ", 3, 1),
+        ("ふくざつなもんだい", 2, 1),
+        ("おんがくをきく", 3, 1),
+        ("しゅうまつにかいものにいく", 2, 1),
+        ("はなをみる", 3, 2),
+        ("せいふのほうしん", 2, 1),
+        ("さくじつのかいぎ", 3, 1),
+        ("しょうがっこう", 4, 1),
+        ("そうだんにのってください", 2, 2),
+        ("ほんをよむ", 3, 1),
+        ("かてい", 3, 1),
+    ];
+
+    #[test]
+    fn confirmed_candidates_rise_when_accumulated() {
+        let mut e = engine(Learning::in_memory());
+        let mut rev = 0;
+        for &(reading, rank, times) in LEARNING_CASES {
+            rev += 1;
+            let before = e.convert(rev, reading);
+            let picked = before[rank - 1].clone();
+            for _ in 0..times {
+                rev += 1;
+                let list = e.convert(rev, reading);
+                let i = index_of(&list, &picked);
+                assert!(e.select(rev, i));
+            }
+            rev += 1;
+            let after = e.convert(rev, reading);
+            let now = index_of(&after, &picked);
+            assert!(now < rank - 1, "{reading}: {before:?} -> {after:?}");
+            e.cancel();
+        }
     }
 
     #[test]

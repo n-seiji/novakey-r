@@ -24,7 +24,9 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 - **IMPORTANT**: mise environment is already activated in this shell session. DO NOT use `eval "$(mise activate zsh)"` prefix for commands.
 
 ### Testing and Development
-- Unit tests cover the romaji conversion engine (`cargo test` / `mise run test`)
+- Unit tests (`cargo test` / `mise run test`) cover romaji, composer, kkc engine, learning, rerank (no network)
+- `mise run scenarios` / `scenarios-learning` - headless key scenarios; `mise run kkc-compare` - Rust KKC vs. committed azooKey goldens (`tools/golden/`)
+- `--test-llm` (`mise run test-llm`) は実際に Cloudflare へ送るので手動のときだけ
 - Manual testing: `mise run install`, then add "NovakeyR" in System Settings > Keyboard > Input Sources (re-login may be required the first time)
 
 ## Architecture
@@ -35,11 +37,9 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 - `src/romaji_converter.rs` - Pure-Rust romaji-to-hiragana conversion engine (unit tested)
 - `src/composer.rs` - 未確定文の状態機械(ひらがなバッファ+同期n-best候補+選択状態、unit tested)
 - `src/loanword.rs` + `resources/loanwords.tsv` - カタカナ語→英単語の表(JMdict由来、`tools/gen_loanwords.py` で生成)。変換候補に desktop などを足す
-- `src/kkc_bridge.rs` + `swift/AzooKeyBridge/` - AzooKeyKanaKanjiConverter(辞書ラティス)への同期FFI
-- `src/llm_bridge.rs` + `swift/LLMBridge.swift` - FoundationModels によるLLM候補リランキング(非同期・失敗無害)
 - 変換フロー: 既定は非ライブ(未確定文はひらがな表示、メニューでライブ変換に切替可)。打鍵ごとに辞書エンジンで同期変換し、スペース1回目で第1候補、2回目以降で候補送り+候補ウィンドウ(1〜9で候補確定)。ローマ字そのままの候補(raw)を第1候補の直後に追加。先頭が大文字の語は英単語としてそのまま入力。局面は composer の Phase、キー対応表は keymap.rs。
   Enter 確定(学習更新)。Esc で生ひらがな。LLM は裏で候補番号を選び未操作なら第1候補を差し替える
-- 辞書リソースバンドルを .app の Contents/MacOS/ に同梱(mise run app が実施)
+- 辞書 `dictionary/` を .app の Contents/Resources/dictionary に同梱(mise run app が実施)。Swift は一切含まない
 
 ### Key Technical Details
 - Uses macOS InputMethodKit framework via Objective-C bindings (`objc2` / `objc2-foundation`)
@@ -63,6 +63,8 @@ NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It p
 - `libc` - C library bindings
 - `rand` - Random number generation for character selection
 - `once_cell` - Lazy statics
+- `regex` / `unicode-segmentation` / `unicode-normalization` - 変換エンジン(src/kkc)
+- `ureq`(rustls) / `security-framework` / `serde_json` - AI 並べ替えの通信・Keychain・JSON
 
 ### Installation Process
 `mise run install` copies the built app to `~/Library/Input Methods` (user-level, no sudo). First activation may require logout/login. Users then add "NovakeyR" from System Preferences > Keyboard > Input Sources.
