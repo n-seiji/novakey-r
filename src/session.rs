@@ -91,6 +91,12 @@ impl<E: CandidateEngine> Session<E> {
         }
         let phase = self.phase();
         let action = keymap::action_for(phase, key);
+        if action == Action::CommitThenRestart {
+            self.commit_and_insert("", &mut fx);
+            let restarted = self.handle(key, text);
+            fx.extend(restarted.effects);
+            return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
+        }
         let handled = self.perform(action, text, &mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
@@ -287,6 +293,13 @@ impl<E: CandidateEngine> Session<E> {
                 self.commit_and_insert(text, fx);
                 true
             }
+            // handle が先に処理するのでここには来ない。
+            Action::CommitThenRestart => false,
+            Action::Clear => {
+                self.composer.discard();
+                self.converter.clear();
+                self.show_typing(fx)
+            }
             Action::Revert => {
                 self.composer.revert();
                 self.show_typing(fx)
@@ -363,5 +376,55 @@ mod tests {
     fn 表に続かないアポストロフィは記号として入る() {
         assert_eq!(typed("a'"), "あ'");
         assert_eq!(typed("t'i"), "てぃ");
+    }
+
+    /// 打鍵列を流し、(アプリへ確定済みの文字列, 下線付きの未確定文字列) を返す。Enter は付けない。
+    fn after(keys: &str) -> (String, String) {
+        let mut session = Session::new(Composer::new(NullEngine));
+        session.playful = |text| Some(text.to_string());
+        let (mut committed, mut marked) = (String::new(), String::new());
+        for ch in keys.chars() {
+            let outcome = session.handle(classify(ch), &ch.to_string());
+            for effect in outcome.effects {
+                match effect {
+                    Effect::SetMarked(text) => marked = text,
+                    Effect::Insert(text) => committed.push_str(&text),
+                    _ => {}
+                }
+            }
+        }
+        (committed, marked)
+    }
+
+    #[test]
+    fn 変換後の打鍵は表示中の候補を確定して新しい組成を始める() {
+        // NullEngine は候補を返さないので、変換の第 1 候補は raw になる。
+        assert_eq!(after("kyou a"), ("kyou".to_string(), "あ".to_string()));
+        assert_eq!(after("kyou 1"), ("kyou1".to_string(), String::new()));
+        assert_eq!(after("kyou ."), ("kyou".to_string(), "。".to_string()));
+        assert_eq!(after("kyou K"), ("kyou".to_string(), "K".to_string()));
+    }
+
+    #[test]
+    fn 変換中のbackspaceは読み全体に戻り_組成中は1文字消す() {
+        assert_eq!(after("kyou \u{8}"), (String::new(), "きょう".to_string()));
+        assert_eq!(after("kyou\u{8}"), (String::new(), "きょ".to_string()));
+    }
+
+    #[test]
+    fn escは変換中なら読みに戻し_組成中なら捨てる() {
+        assert_eq!(after("kyou \u{1b}"), (String::new(), "きょう".to_string()));
+        assert_eq!(after("kyou \u{1b}\u{1b}"), (String::new(), String::new()));
+        assert_eq!(after("kyou\u{1b}"), (String::new(), String::new()));
+        assert_eq!(after("Tokyo\u{1b}"), (String::new(), String::new()));
+        assert_eq!(after("kyouk\u{1b}"), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn 組成の途中の大文字と続く英字はそのまま入る() {
+        assert_eq!(after("kyouTokyo"), (String::new(), "きょうTokyo".to_string()));
+        assert_eq!(typed("kyouTokyo"), "きょうTokyo");
+        assert_eq!(typed("Tokyo"), "Tokyo");
+        assert_eq!(after("kyouT\u{8}"), (String::new(), "きょう".to_string()));
     }
 }

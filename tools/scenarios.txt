@@ -1,7 +1,7 @@
 # 期待付きシナリオ: `mise run scenarios` で流す。形式: キー列<TAB>確定される文字列 (期待が無い行は表示のみ)。
 # キー表記は src/simulate.rs を参照。IME が処理せずアプリに素通しした Enter は改行として確定文字列に入る。
 # 変換結果は azooKey の辞書と順位に依存する (学習は無効)。辞書を更新したら差分を目で見て更新する。
-# 判断保留の挙動 (変換後の続けて入力、変換中の Backspace、組成中の Esc など) は現状を記録しているだけで、望ましいと決めたものではない。
+# 挙動は Google 日本語入力に合わせている: 変換後の打鍵は確定して新しい組成、変換中の Backspace は読みに戻る、組成中の Esc は破棄、途中の大文字は英字のまま。
 kin'en<enter>	きんえん
 n'a<enter>	んあ
 t'i<enter>	てぃ
@@ -28,8 +28,8 @@ world<space><enter>	world
 git<space><enter>	git
 commit<space><enter>	commit
 ok<space><enter>	ok
-iPhone<enter>	iPhone
-iPhone<space><enter>	iPhone
+iPhone<enter>	いPhone
+iPhone<space><enter>	いPhone
 google<space><enter>	google
 desukutoppu<space><space><enter>	desktop
 desukutoppu<space><space><space><enter>	desukutoppu
@@ -74,13 +74,13 @@ ko-hi-<space><enter>	コーヒー
 kyou<bs><bs><enter>	き
 kyou<bs><bs><bs><bs><bs><enter>	\n
 kyo<bs>u<enter>	きう
-kyou<space><bs><enter>	きょ
-kyou<space><space><bs><enter>	きょ
-kyou<space><space><bs><bs><enter>	き
+kyou<space><bs><enter>	きょう
+kyou<space><space><bs><enter>	きょう
+kyou<space><space><bs><bs><enter>	きょ
 kyou<space><esc><enter>	きょう
 kyou<space><space><esc><enter>	きょう
-kyou<space><esc><esc><enter>	きょう
-kyou<esc><enter>	きょう
+kyou<space><esc><esc><enter>	\n
+kyou<esc><enter>	\n
 kyou<esc><esc>
 kyou<space><S-space><S-space><enter>	興
 kyou<S-space><enter>	強
@@ -101,10 +101,10 @@ kyou<space><space>9	興
 kyou<space><space>0
 kyou<space><space>1	強
 kyou<space>a
-kyou<space>a<enter>	きょうあ
-kyou<space>.<enter>	きょう。
-kyou<space>-<enter>	きょうー
-kyou<space>(<enter>	きょう（
+kyou<space>a<enter>	強あ
+kyou<space>.<enter>	強。
+kyou<space>-<enter>	強ー
+kyou<space>(<enter>	強（
 kyou<space>A
 kyou<space><space>a
 kyou<space><enter>kyou<space><enter>	強強
@@ -113,13 +113,13 @@ Tokyo<enter>	Tokyo
 Tokyo<space><enter>	Tokyo \n
 Tokyo<bs><bs><enter>	Tok
 IPhone<enter>	IPhone
-iPhone<bs><enter>	iPho
+iPhone<bs><enter>	いPhon
 Tokyo.<enter>	Tokyo.\n
 Tokyo1<enter>	Tokyo1
 Tokyo-san<enter>	Tokyo-san
 Tokyo(<enter>	Tokyo(
-kyouTokyo<enter>	きょうときょ
-kyouT<enter>	kyouT
+kyouTokyo<enter>	きょうTokyo
+kyouT<enter>	きょうT
 hello<bs><bs><bs><bs><bs><bs>	
 hello<bs><bs>
 nn<bs>	
@@ -135,8 +135,8 @@ kyou<C-k><enter>	キョウ
 kyou<C-l><enter>	ｋｙｏｕ
 kyou<F7><enter>	キョウ
 kyou<F7><space><enter>	強
-kyou<F7>a<enter>	きょうあ
-kyou<F7><bs><enter>	きょ
+kyou<F7>a<enter>	キョウあ
+kyou<F7><bs><enter>	きょう
 kyou<F7><esc><enter>	きょう
 kyou<F7><F7><enter>	キョウ
 kyou<F8><enter>	ｷｮｳ
@@ -167,7 +167,7 @@ gi<space><space><enter>	gi
 test<space><enter>	test
 test<space><space><enter>	手st
 test<space><space><space><enter>	てst
-iPhone<space><space><enter>	異p骨
+iPhone<space><space><enter>	iPhone
 google<space><space><enter>	ごおgぇ
 chrome<space><enter>	chrome
 Chrome<space><enter>	Chrome \n
@@ -253,18 +253,18 @@ _	_
 kyou"<enter>	きょう"
 kyou'<enter>	きょう'
 kyou<space>"
-Tokyo<esc><enter>	Tokyo
+Tokyo<esc><enter>	\n
 Tokyo<esc>
 Tokyo<tab>	Tokyo\t
 Tokyo<S-space>x
 Tokyo<up>
-enter<esc><enter>	えんて
+enter<esc><enter>	\n
 enter<esc><esc>
-enter<esc>a<enter>	えんてあ
+enter<esc>a<enter>	あ
 enter<bs><bs><enter>	えん
 enter<space><esc><enter>	えんてr
 enter<space><space><esc><enter>	えんてr
-enter<space><bs><enter>	えんて
+enter<space><bs><enter>	えんてr
 enter1<enter>	enter1\n
 enter,<enter>	enter,\n
 enter-<enter>	enter-\n
@@ -279,10 +279,10 @@ git<space><space>2	義t
 (<S-space><enter>	（
 (<space><S-space><S-space><enter>	〔
 (<bs><enter>	\n
-(<esc><enter>	（
+(<esc><enter>	\n
 (<space><esc><enter>	（
-(<space><bs><enter>	\n
-(<space><space><bs><enter>	\n
+(<space><bs><enter>	（
+(<space><space><bs><enter>	（
 (a<enter>	（あ
 (kyou<space><enter>	（強
 ()<enter>	（）
@@ -305,7 +305,7 @@ kyou?<space><enter>	強？
 ...<space><space><enter>	...
 !?<enter>	！？
 !?<space><enter>	！？
-kyou<C-k>a<enter>	きょうあ
+kyou<C-k>a<enter>	キョウあ
 kyou<C-k><C-j><enter>	きょう
 kyou<C-k><C-l><enter>	ｋｙｏｕ
 kyou<C-l><C-l><enter>	ＫＹＯＵ
@@ -317,15 +317,15 @@ kyou<F7><F6><enter>	きょう
 kyou<F7><space><space><enter>	kyou
 kyou<F7><S-space><enter>	強
 kyou<F7><tab>	キョウ\t
-kyou<F7>1<enter>	きょう1
-kyou<F7>.<enter>	きょう。
-kyou<F7>(<enter>	きょう（
+kyou<F7>1<enter>	キョウ1\n
+kyou<F7>.<enter>	キョウ。
+kyou<F7>(<enter>	キョウ（
 kyou<F7><up>
 kyou<F7><down>
 kyou<F7><bs><bs><bs><bs><enter>	\n
 kyou<F7><esc><esc>
 Tokyo<F7><enter>	Tokyo
-Tokyo<F9><enter>	ｔｏｋｙｏ
+Tokyo<F9><enter>	Ｔｏｋｙｏ
 enter<F7><enter>	エンテr
 enter<F10><enter>	enter
 enter<F9><enter>	ｅｎｔｅｒ
@@ -347,16 +347,16 @@ kyon<F9><enter>	ｋｙｏｎ
 kon<space><enter>	今
 kon<enter>	こん
 kyoun<bs><enter>	きょう
-kyoun<esc><enter>	きょう
+kyoun<esc><enter>	\n
 kyoun<esc>
 kyoun<bs><bs><enter>	きょ
-kyo<esc><enter>	きょ
-kyou<space>k<bs><enter>	強
-kyou<space>k<enter>	kyouk
-kyou<space>k<space><enter>	kyouk
-kyou<space><space>k<esc><enter>	きょう
-kyou<space>k<esc><enter>	きょう
-kyou<space>n<enter>	きょうん
+kyo<esc><enter>	\n
+kyou<space>k<bs><enter>	強\n
+kyou<space>k<enter>	強k
+kyou<space>k<space><enter>	強k
+kyou<space><space>k<esc><enter>	kyou\n
+kyou<space>k<esc><enter>	強\n
+kyou<space>n<enter>	強ん
 ky<bs><enter>	k
 ky<enter>	ky
 ky<space><enter>	ky
@@ -382,3 +382,59 @@ yyo<enter>	っよ
 wwa<enter>	っわ
 hhi<enter>	っひ
 ddo<enter>	っど
+# --- Google 日本語入力に合わせた挙動 ---
+# 変換後の打鍵: 表示中の候補を確定して新しい組成を始める
+kyou<space>a<enter>	強あ
+kyou<space>k<enter>	強k
+kyou<space>1<enter>	強1\n
+kyou<space>,<enter>	強、
+kyou<space>A<enter>	強A
+kyou<space><space>1	強
+kyou<space><space>a<enter>	kyouあ
+kyou<F7>a<enter>	キョウあ
+kyou<F9>1<enter>	ｋｙｏｕ1\n
+kyou<space>ka<enter>	強か
+# 変換中の Backspace: 読み全体に戻り、1 文字は消えない
+kyou<space><bs>
+kyou<space><bs><enter>	きょう
+kyou<space><bs><bs><enter>	きょ
+kyou<space><space><bs><enter>	きょう
+kyou<F7><bs><enter>	きょう
+kyou<F7><bs><bs><enter>	きょ
+kyou<bs><enter>	きょ
+# Esc: 組成中は破棄、変換中は読みに戻り 2 回目で破棄
+kyou<esc>
+kyou<esc>a<enter>	あ
+kyou<space><esc><enter>	きょう
+kyou<space><esc><esc>
+kyou<space><esc><esc>a<enter>	あ
+kyou<F7><esc><esc>
+kyou<space><space><esc><esc>
+Tokyo<esc>a<enter>	あ
+kyouTokyo<esc>
+enter<esc>a<enter>	あ
+# 組成の途中の大文字: 英字のまま入り、続く英字もそのまま
+kyouTokyo<enter>	きょうTokyo
+kyouT<enter>	きょうT
+kyouTokyo
+kyouT<bs>
+kyouT<bs><enter>	きょう
+kyouTo<bs><bs>ka<enter>	きょうか
+kyouTokyo<bs><enter>	きょうToky
+kyouTokyo.<enter>	きょうTokyo.\n
+kyouTokyo<space><enter>	きょうTokyo
+iPhone<enter>	いPhone
+iPhone<space><enter>	いPhone
+iPhone<space><space><enter>	iPhone
+kyouTokyo<space><space><enter>	kyouTokyo
+iPhone<space><bs>
+kyou<space>Tokyo<enter>	強Tokyo
+# 大文字を含む英数形: 最初は打鍵のまま、続けて 小文字 → 大文字 → 先頭大文字
+Tokyo<F10><enter>	Tokyo
+Tokyo<F10><F10><enter>	tokyo
+Tokyo<F10><F10><F10><enter>	TOKYO
+Tokyo<F10><F10><F10><F10><enter>	Tokyo
+Tokyo<F9><F9><enter>	ｔｏｋｙｏ
+kyouTokyo<F10><enter>	kyouTokyo
+kyouTokyo<F10><F10><enter>	kyoutokyo
+kyou<F10><F10><enter>	KYOU

@@ -5,6 +5,8 @@
 /// 英数形の大文字小文字。同じキーを続けて押すと Lower → Upper → Title の順に巡る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
+    /// 打鍵したままの大文字小文字。大文字を含む入力の最初の表示にだけ使う。
+    Typed,
     Lower,
     Upper,
     Title,
@@ -13,6 +15,7 @@ pub enum Case {
 impl Case {
     fn next(self) -> Self {
         match self {
+            Case::Typed => Case::Lower,
             Case::Lower => Case::Upper,
             Case::Upper => Case::Title,
             Case::Title => Case::Lower,
@@ -21,6 +24,7 @@ impl Case {
 
     fn apply(self, text: &str) -> String {
         match self {
+            Case::Typed => text.to_string(),
             Case::Lower => text.to_ascii_lowercase(),
             Case::Upper => text.to_ascii_uppercase(),
             Case::Title => {
@@ -70,6 +74,18 @@ pub fn next_form(current: Option<Form>, requested: Form) -> Form {
             cur.cycled()
         }
         _ => requested,
+    }
+}
+
+/// 英数形の最初の要求は、打鍵に大文字を含むなら打鍵したままの表示から始める (Lower → Typed)。
+pub fn as_typed_first(requested: Form, raw: &str) -> Form {
+    if !raw.chars().any(|c| c.is_ascii_uppercase()) {
+        return requested;
+    }
+    match requested {
+        Form::FullAlnum(Case::Lower) => Form::FullAlnum(Case::Typed),
+        Form::HalfAlnum(Case::Lower) => Form::HalfAlnum(Case::Typed),
+        other => other,
     }
 }
 

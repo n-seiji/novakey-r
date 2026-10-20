@@ -32,6 +32,8 @@ pub enum Phase {
     Converting { selected: usize, window: bool },
     /// 英単語をそのまま入力中(かな変換しない)。
     Literal,
+    /// かな入力の途中で大文字を打ち、英単語を続けている局面。スペースでは raw と並べて変換できる。
+    Mixed,
     /// ローマ字の末尾が変換しきれず、組成全体を英単語として扱う局面。確定は raw、変換は raw が第 1 候補。
     Dangling,
     /// 字種変換(カタカナ・全角英数など)の結果を表示している。確定は表示中の文字列で、学習しない。
@@ -43,6 +45,8 @@ pub enum Phase {
 struct Unit {
     raw: String,
     kana: String,
+    /// 大文字から始めた英単語など、かな変換せずそのまま入れた部分。
+    literal: bool,
 }
 
 pub struct Composer<E: CandidateEngine> {
@@ -146,6 +150,7 @@ impl<E: CandidateEngine> Composer<E> {
                 other => other,
             };
         }
+        let requested = translit::as_typed_first(requested, &self.raw());
         let form = translit::next_form(current, requested);
         self.translit = translit::render(form, &self.hiragana, &self.raw());
         self.phase = Phase::Transliterated(form);
@@ -237,6 +242,7 @@ impl<E: CandidateEngine> Composer<E> {
         self.units.push(Unit {
             raw: std::mem::replace(&mut self.pending_raw, carried),
             kana: kana.to_string(),
+            literal: false,
         });
         self.refresh();
     }
@@ -250,10 +256,15 @@ impl<E: CandidateEngine> Composer<E> {
         self.units.push(Unit {
             raw,
             kana: text.to_string(),
+            literal: true,
         });
         self.sync_hiragana();
         self.reset_candidates();
-        self.phase = Phase::Literal;
+        self.phase = if self.units.iter().all(|u| u.literal) {
+            Phase::Literal
+        } else {
+            Phase::Mixed
+        };
     }
 
     pub fn pop_pending_raw(&mut self) {
@@ -274,9 +285,11 @@ impl<E: CandidateEngine> Composer<E> {
         } else {
             last.raw = last.kana.clone();
         }
-        let literal = self.phase == Phase::Literal
-            || (matches!(self.phase, Phase::Transliterated(_)) && self.base == Phase::Literal);
-        if literal && !self.units.is_empty() {
+        let is_literal = |phase| matches!(phase, Phase::Literal | Phase::Mixed);
+        let was_literal = is_literal(self.phase)
+            || (matches!(self.phase, Phase::Transliterated(_)) && is_literal(self.base));
+        // 英単語の部分を消しきったら、残ったかなは通常の組成に戻す。
+        if was_literal && self.units.iter().any(|u| u.literal) {
             self.sync_hiragana();
             self.reset_candidates();
         } else {
@@ -292,12 +305,19 @@ impl<E: CandidateEngine> Composer<E> {
         }
         if !matches!(
             self.phase,
-            Phase::Composing | Phase::Reverted | Phase::Dangling
+            Phase::Composing | Phase::Reverted | Phase::Dangling | Phase::Mixed
         ) {
             return false;
         }
         if let Some(index) = self.pending_rerank.take() {
             self.promote(index);
+        }
+        if self.phase == Phase::Mixed {
+            // 表示中のかな混じりを第 1 候補にし、raw はその直後に並べる。
+            self.candidates.push(Candidate {
+                text: self.hiragana.clone(),
+                engine_index: None,
+            });
         }
         // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
         self.insert_raw_candidate();
@@ -352,6 +372,16 @@ impl<E: CandidateEngine> Composer<E> {
             Some(index) => self.select_candidate(index),
             None => false,
         }
+    }
+
+    /// 組成を捨てて空に戻す(何も確定しない)。
+    pub fn discard(&mut self) {
+        self.engine.cancel();
+        self.units.clear();
+        self.pending_raw.clear();
+        self.hiragana.clear();
+        self.reset_candidates();
+        self.phase = Phase::Empty;
     }
 
     pub fn revert(&mut self) {
@@ -441,7 +471,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 組成全体がカタカナ語として引ける場合、英単語を第 1 候補の直後に入れる (raw はその後ろ)。
     fn insert_english_candidates(&mut self) {
-        if self.phase == Phase::Dangling || self.is_symbol() {
+        if matches!(self.phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
             return;
         }
         let words = (self.english_for)(&translit::to_katakana(&self.hiragana));
@@ -1268,6 +1298,70 @@ mod tests {
         assert!(c.backspace());
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(c.display(), "きょ");
+    }
+
+    #[test]
+    fn discardは組成を何も確定せず捨てて学習もしない() {
+        let (mut c, log) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        c.discard();
+        assert_eq!(c.phase(), Phase::Empty);
+        assert!(c.is_empty());
+        assert_eq!(c.raw(), "");
+        assert!(c.candidates().is_empty());
+        assert!(log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn かなの途中の大文字は英単語として加わりmixedになる() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.push_literal("T");
+        assert_eq!(c.phase(), Phase::Mixed);
+        c.push_literal("okyo");
+        assert_eq!(c.display(), "きょうTokyo");
+        assert_eq!(c.raw(), "kyouTokyo");
+    }
+
+    #[test]
+    fn mixedの英単語部分をbackspaceで消しきると通常の組成に戻る() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.push_literal("To");
+        assert!(c.backspace());
+        assert_eq!(c.display(), "きょうT");
+        assert_eq!(c.phase(), Phase::Mixed);
+        assert!(c.backspace());
+        assert_eq!(c.display(), "きょう");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(texts(&c), vec!["今日", "京", "教"]);
+    }
+
+    #[test]
+    fn mixedの変換はかな混じりが第1候補でrawがその直後に並ぶ() {
+        let (mut c, log) = composer();
+        c.push_input("i", "い", "");
+        c.push_literal("Phone");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["いPhone", "iPhone"]);
+        assert_eq!(c.commit(), "いPhone");
+        assert!(log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn 大文字を含む打鍵の英数形は打鍵のまま始まり小文字_大文字_先頭大文字と巡る() {
+        let (mut c, _) = composer();
+        c.push_literal("Tokyo");
+        let half = Form::HalfAlnum(translit::Case::Lower);
+        for want in ["Tokyo", "tokyo", "TOKYO", "Tokyo", "tokyo"] {
+            assert!(c.transliterate(half));
+            assert_eq!(c.display(), want);
+        }
+        let full = Form::FullAlnum(translit::Case::Lower);
+        c.revert();
+        assert!(c.transliterate(full));
+        assert_eq!(c.display(), "Ｔｏｋｙｏ");
     }
 
     #[test]

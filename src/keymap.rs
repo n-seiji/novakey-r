@@ -53,7 +53,12 @@ pub enum Action {
     CommitThenInsert,
     /// 確定してから、キーをアプリへ素通しする (Tab など)。
     CommitThenPassThrough,
+    /// 表示中の変換結果を確定してから、入力されたキーを新しい組成の先頭として処理する。
+    CommitThenRestart,
+    /// 変換結果の表示をやめて、読み(かな)の表示に戻す。
     Revert,
+    /// 組成を捨てて空にする (何も確定しない)。
+    Clear,
     DeleteBack,
     /// 組成全体を指定の字種で表示する。
     Transliterate(Form),
@@ -75,22 +80,20 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Empty, Enter | Escape | Backspace | Control | Up | Down) => PassThrough,
 
         (P::Literal, Space | ShiftSpace) => CommitThenSpace,
-        (P::Literal, Letter { .. } | Digit(_) | Hyphen | Mark | Symbol) => TypeLiteral,
-        (P::Literal, Punct) => CommitThenInsert,
-        (P::Literal, Enter) => Commit,
-        (P::Literal, Control) => CommitThenPassThrough,
-        (P::Literal, Up | Down) => PassThrough,
-        (P::Literal, Escape) => Revert,
-        (P::Literal, Backspace) => DeleteBack,
+        (P::Mixed, Space | ShiftSpace) => Convert,
+        (P::Literal | P::Mixed, Letter { .. } | Digit(_) | Hyphen | Mark | Symbol) => TypeLiteral,
+        (P::Literal | P::Mixed, Punct) => CommitThenInsert,
+        (P::Literal | P::Mixed, Enter) => Commit,
+        (P::Literal | P::Mixed, Control) => CommitThenPassThrough,
+        (P::Literal | P::Mixed, Up | Down) => PassThrough,
 
         (P::Dangling, Space | ShiftSpace) => Convert,
         (P::Dangling, Enter) => Commit,
         (P::Dangling, Control) => CommitThenPassThrough,
         (P::Dangling, Up | Down) => PassThrough,
-        (P::Dangling, Letter { .. }) => TypeRomaji,
+        (P::Dangling, Letter { upper: true }) => TypeLiteral,
+        (P::Dangling, Letter { upper: false }) => TypeRomaji,
         (P::Dangling, Digit(_) | Punct | Mark | Hyphen | Symbol) => CommitThenInsert,
-        (P::Dangling, Escape) => Revert,
-        (P::Dangling, Backspace) => DeleteBack,
 
         (P::Converting { .. }, Space | Down) => NextCandidate,
         (P::Converting { .. }, Up | ShiftSpace) => PrevCandidate,
@@ -98,15 +101,18 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Control) => CommitThenPassThrough,
         (P::Composing | P::Reverted | P::Transliterated(_), Space | ShiftSpace) => Convert,
         (P::Converting { window: true, .. }, Digit(n @ 1..=9)) => PickCandidate(n),
-        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Letter { .. }) => TypeRomaji,
+        // 変換結果を表示している間の入力は、それを確定して新しい組成を始める。
         (
-            P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_),
-            Digit(_) | Punct | Mark | Hyphen | Symbol,
-        ) => TypeText,
+            P::Converting { .. } | P::Transliterated(_),
+            Letter { .. } | Digit(_) | Punct | Mark | Hyphen | Symbol,
+        ) => CommitThenRestart,
+        (P::Composing | P::Reverted, Letter { upper: true }) => TypeLiteral,
+        (P::Composing | P::Reverted, Letter { upper: false }) => TypeRomaji,
+        (P::Composing | P::Reverted, Digit(_) | Punct | Mark | Hyphen | Symbol) => TypeText,
         (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Enter) => Commit,
-        (P::Reverted, Escape) => PassThrough,
-        (P::Composing | P::Converting { .. } | P::Transliterated(_), Escape) => Revert,
-        (P::Composing | P::Reverted | P::Converting { .. } | P::Transliterated(_), Backspace) => DeleteBack,
+        (P::Converting { .. } | P::Transliterated(_), Escape | Backspace) => Revert,
+        (P::Composing | P::Reverted | P::Literal | P::Mixed | P::Dangling, Escape) => Clear,
+        (P::Composing | P::Reverted | P::Literal | P::Mixed | P::Dangling, Backspace) => DeleteBack,
     }
 }
 
@@ -191,7 +197,9 @@ impl Action {
             Action::CommitThenSpace => "CommitThenSpace",
             Action::CommitThenInsert => "CommitThenInsert",
             Action::CommitThenPassThrough => "CommitThenPassThrough",
+            Action::CommitThenRestart => "CommitThenRestart",
             Action::Revert => "Revert",
+            Action::Clear => "Clear",
             Action::DeleteBack => "DeleteBack",
             Action::Transliterate(_) => "Transliterate",
         }
@@ -303,8 +311,8 @@ mod tests {
     #[test]
     fn 数字キーは候補ウィンドウ表示中のみ候補選択() {
         assert_eq!(action_for(WINDOW, Digit(3)), PickCandidate(3));
-        assert_eq!(action_for(WINDOW, Digit(0)), TypeText);
-        assert_eq!(action_for(CONVERTING, Digit(3)), TypeText);
+        assert_eq!(action_for(WINDOW, Digit(0)), CommitThenRestart);
+        assert_eq!(action_for(CONVERTING, Digit(3)), CommitThenRestart);
         assert_eq!(action_for(Phase::Composing, Digit(3)), TypeText);
         assert_eq!(action_for(Phase::Empty, Digit(3)), InsertDirect);
     }
@@ -320,9 +328,13 @@ mod tests {
 
     #[test]
     fn 記号の続きは組成に加え_英単語入力中はasciiのまま() {
-        for phase in [Phase::Composing, Phase::Reverted, CONVERTING, WINDOW] {
+        for phase in [Phase::Composing, Phase::Reverted] {
             assert_eq!(action_for(phase, Mark), TypeText);
             assert_eq!(action_for(phase, Punct), TypeText);
+        }
+        for phase in [CONVERTING, WINDOW] {
+            assert_eq!(action_for(phase, Mark), CommitThenRestart);
+            assert_eq!(action_for(phase, Punct), CommitThenRestart);
         }
         assert_eq!(action_for(Phase::Literal, Mark), TypeLiteral);
         assert_eq!(action_for(Phase::Literal, Punct), CommitThenInsert);
@@ -333,7 +345,28 @@ mod tests {
     fn 先頭の大文字は英単語入力を開始し_小文字はローマ字() {
         assert_eq!(action_for(Phase::Empty, Letter { upper: true }), StartLiteral);
         assert_eq!(action_for(Phase::Empty, Letter { upper: false }), TypeRomaji);
-        assert_eq!(action_for(Phase::Composing, Letter { upper: true }), TypeRomaji);
+        assert_eq!(action_for(Phase::Composing, Letter { upper: false }), TypeRomaji);
+    }
+
+    #[test]
+    fn 組成の途中の大文字は英字のまま入り_英単語入力に移る() {
+        for phase in [Phase::Composing, Phase::Reverted, Phase::Dangling, Phase::Literal, Phase::Mixed] {
+            assert_eq!(action_for(phase, Letter { upper: true }), TypeLiteral, "{phase:?}");
+        }
+        assert_eq!(action_for(Phase::Mixed, Letter { upper: false }), TypeLiteral);
+        assert_eq!(action_for(Phase::Mixed, Space), Convert);
+        assert_eq!(action_for(Phase::Mixed, Enter), Commit);
+    }
+
+    #[test]
+    fn 変換結果の表示中に打鍵すると確定して新しい組成を始める() {
+        let phases = [CONVERTING, Phase::Transliterated(Form::Katakana)];
+        for phase in phases {
+            for key in [Letter { upper: false }, Letter { upper: true }, Digit(1), Punct, Mark, Hyphen, Symbol] {
+                assert_eq!(action_for(phase, key), CommitThenRestart, "{phase:?} {key:?}");
+            }
+        }
+        assert_eq!(action_for(WINDOW, Digit(1)), PickCandidate(1));
     }
 
     #[test]
@@ -375,17 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn escは一度だけ変換を戻し_戻した後は素通し() {
-        assert_eq!(action_for(Phase::Composing, Escape), Revert);
+    fn escは変換中なら読みに戻し_組成中なら組成を捨て_空なら素通し() {
+        assert_eq!(action_for(CONVERTING, Escape), Revert);
         assert_eq!(action_for(WINDOW, Escape), Revert);
-        assert_eq!(action_for(Phase::Reverted, Escape), PassThrough);
+        for phase in [Phase::Composing, Phase::Reverted, Phase::Literal, Phase::Mixed, Phase::Dangling] {
+            assert_eq!(action_for(phase, Escape), Clear, "{phase:?}");
+        }
         assert_eq!(action_for(Phase::Empty, Escape), PassThrough);
     }
 
     #[test]
-    fn backspaceは未確定文があれば1文字削除_無ければ素通し() {
+    fn backspaceは変換中なら読みに戻し_組成中なら1文字削除_無ければ素通し() {
         assert_eq!(action_for(Phase::Empty, Backspace), PassThrough);
-        assert_eq!(action_for(WINDOW, Backspace), DeleteBack);
+        assert_eq!(action_for(CONVERTING, Backspace), Revert);
+        assert_eq!(action_for(WINDOW, Backspace), Revert);
+        assert_eq!(action_for(Phase::Transliterated(Form::Katakana), Backspace), Revert);
+        assert_eq!(action_for(Phase::Composing, Backspace), DeleteBack);
         assert_eq!(action_for(Phase::Literal, Backspace), DeleteBack);
     }
 
@@ -465,12 +503,12 @@ mod tests {
         let phase = Phase::Transliterated(Form::Katakana);
         assert_eq!(action_for(phase, Enter), Commit);
         assert_eq!(action_for(phase, Escape), Revert);
-        assert_eq!(action_for(phase, Backspace), DeleteBack);
+        assert_eq!(action_for(phase, Backspace), Revert);
         assert_eq!(action_for(phase, Space), Convert);
         assert_eq!(action_for(phase, ShiftSpace), Convert);
-        assert_eq!(action_for(phase, Letter { upper: false }), TypeRomaji);
-        assert_eq!(action_for(phase, Digit(1)), TypeText);
-        assert_eq!(action_for(phase, Mark), TypeText);
+        assert_eq!(action_for(phase, Letter { upper: false }), CommitThenRestart);
+        assert_eq!(action_for(phase, Digit(1)), CommitThenRestart);
+        assert_eq!(action_for(phase, Mark), CommitThenRestart);
         assert_eq!(action_for(phase, Control), CommitThenPassThrough);
         assert_eq!(action_for(phase, Up), PassThrough);
     }
