@@ -39,15 +39,6 @@ impl Louds {
         Self { bits, rank0, node_chars }
     }
 
-    pub fn node_count(&self) -> usize {
-        self.node_chars.len()
-    }
-
-    /// ノードの文字 ID。
-    pub fn node_char(&self, node: usize) -> Option<u8> {
-        self.node_chars.get(node).copied()
-    }
-
     fn total_bits(&self) -> usize {
         self.bits.len() * 64
     }

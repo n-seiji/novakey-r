@@ -4,7 +4,6 @@
 //! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine`。
 //! 学習は `learning` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で無効)。
 #![forbid(unsafe_code)]
-#![allow(dead_code, unused_imports)]
 
 pub mod check;
 pub mod compare;
@@ -21,8 +20,8 @@ use std::rc::Rc;
 
 use crate::composer::CandidateEngine;
 
-pub use dict::{DictError, Dictionary, Entry};
-pub use result::{Cand, Converted, Source};
+pub use dict::{DictError, Dictionary};
+pub use result::Converted;
 
 /// 保持する N-best の数 (本番の `ConvertRequestOptions.N_best`)
 const N_BEST: usize = 9;
@@ -50,6 +49,7 @@ impl KkcCore {
         })
     }
 
+    #[cfg(test)]
     pub fn learning(&self) -> &RefCell<learning::Learning> {
         &self.learning
     }
@@ -57,10 +57,6 @@ impl KkcCore {
     /// 確定した候補のデータを学習する。
     pub fn learn(&self, data: &[Rc<elem::Elem>]) {
         self.learning.borrow_mut().learn(data, &|c| self.dict.char_id(c) != 255);
-    }
-
-    pub fn dictionary(&self) -> &Dictionary {
-        &self.dict
     }
 
     /// 読み全体を変換する。結果の全件 (`mainResults` / `firstClauseResults`)。毎回ラティスを作り直す。
@@ -165,6 +161,7 @@ impl RustEngine {
         Self { core: shared_core(), last: None }
     }
 
+    #[cfg(test)]
     pub fn with_core(core: Rc<KkcCore>) -> Self {
         Self { core: Some(core), last: None }
     }
@@ -255,7 +252,7 @@ mod tests {
         let logs = RefCell::new(Vec::new());
         let mut slot: CoreSlot<u32> = CoreSlot::new();
         let t0 = Instant::now();
-        let mut get = |slot: &mut CoreSlot<u32>, at: Instant, ok: bool| {
+        let get = |slot: &mut CoreSlot<u32>, at: Instant, ok: bool| {
             slot.get(
                 at,
                 || {

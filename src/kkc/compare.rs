@@ -19,7 +19,8 @@ use super::KkcCore;
 #[derive(Debug, Clone)]
 pub enum Json {
     Null,
-    Bool(bool),
+    /// golden に真偽値は出てこないので値は持たない
+    Bool,
     Num(f64),
     Str(String),
     Arr(Vec<Json>),
@@ -127,11 +128,11 @@ impl<'a> Parser<'a> {
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') if self.b[self.i..].starts_with(b"true") => {
                 self.i += 4;
-                Ok(Json::Bool(true))
+                Ok(Json::Bool)
             }
             Some(b'f') if self.b[self.i..].starts_with(b"false") => {
                 self.i += 5;
-                Ok(Json::Bool(false))
+                Ok(Json::Bool)
             }
             Some(b'n') if self.b[self.i..].starts_with(b"null") => {
                 self.i += 4;
@@ -225,14 +226,12 @@ struct GData {
     rcid: u32,
     mid: u32,
     value: u32,
-    adjust: u32,
 }
 
 #[derive(Debug, Clone)]
 struct GCand {
     text: String,
     value: u32,
-    ruby_count: usize,
     data: Vec<GData>,
 }
 
@@ -252,7 +251,6 @@ fn parse_cand(j: &Json) -> GCand {
     GCand {
         text: j.get("text").map_or("", Json::str).to_string(),
         value: hex(j.get("value").map_or("", Json::str)),
-        ruby_count: j.get("rubyCount").map_or(0.0, Json::num) as usize,
         data: j
             .get("data")
             .map_or(&[][..], Json::arr)
@@ -264,7 +262,6 @@ fn parse_cand(j: &Json) -> GCand {
                 rcid: d.get("rcid").map_or(0.0, Json::num) as u32,
                 mid: d.get("mid").map_or(0.0, Json::num) as u32,
                 value: hex(d.get("value").map_or("", Json::str)),
-                adjust: hex(d.get("adjust").map_or("", Json::str)),
             })
             .collect(),
     }
@@ -479,7 +476,6 @@ impl Tally {
 struct Mismatch {
     severity: u8, // 0 = top3, 1 = top9, 2 = full
     label: String,
-    reading: String,
     class: &'static str,
     diff_index: usize,
     golden: Vec<GCand>,
@@ -590,7 +586,6 @@ pub fn run(args: &[String]) -> i32 {
         mismatches.push(Mismatch {
             severity,
             label,
-            reading: row.reading.clone(),
             class,
             diff_index: first_diff(&g, &r),
             golden: row.main.clone(),
@@ -714,7 +709,7 @@ mod tests {
         assert_eq!(a[0].num(), 1.0);
         assert_eq!(a[1].num(), -2.5);
         assert_eq!(a[2].str(), "x\nあ😀");
-        assert!(matches!(j.get("b").unwrap().get("c"), Some(Json::Bool(true))));
+        assert!(matches!(j.get("b").unwrap().get("c"), Some(Json::Bool)));
         assert!(parse_json("{").is_err());
         assert!(parse_json("[1] x").is_err());
     }

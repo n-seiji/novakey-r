@@ -129,6 +129,7 @@ enum Msg {
     Prune(u16),
     Remove(Vec<EntryKey>),
     /// ここまでの変更を書き終えたら返事をする
+    #[cfg(test)]
     Flush(Sender<()>),
 }
 
@@ -172,6 +173,7 @@ fn writer_loop(rx: &mpsc::Receiver<Msg>, path: &Path, mut entries: HashMap<Strin
             Some(since) => rx.recv_timeout(interval.saturating_sub(since.elapsed())),
         };
         match received {
+            #[cfg(test)]
             Ok(Msg::Flush(reply)) => {
                 if dirty_since.take().is_some() {
                     write_file(path, &entries);
@@ -209,6 +211,7 @@ fn apply(entries: &mut HashMap<String, Vec<MemEntry>>, msg: Msg) {
             prune_entries(entries, today);
         }
         Msg::Remove(keys) => remove_keys(entries, &keys),
+        #[cfg(test)]
         Msg::Flush(_) => {}
     }
 }
@@ -292,33 +295,35 @@ impl Learning {
         let _ = rx.recv_timeout(Duration::from_secs(10));
     }
 
+    #[cfg(test)]
     /// 保存しない有効な学習 (単体テスト用)。
     pub fn in_memory() -> Self {
         Self { enabled: true, ..Self::disabled() }
     }
 
+    #[cfg(test)]
     pub fn with_clock(mut self, clock: impl Fn() -> u16 + 'static) -> Self {
         self.clock = Box::new(clock);
         self
     }
 
+    #[cfg(test)]
     pub fn with_cap(mut self, cap: usize) -> Self {
         self.cap = cap;
         self
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[cfg(test)]
     pub fn entries_for(&self, ruby: &str) -> &[MemEntry] {
         self.entries.get(ruby).map_or(&[], Vec::as_slice)
     }

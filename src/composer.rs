@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn 変換候補が空でもDanglingならrawが先頭のまま() {
+    fn 変換候補が空でもdanglingならrawが先頭のまま() {
         let engine = MockEngine { log: Log::default(), table: vec![] };
         let mut c = Composer::new(engine);
         c.push_flush(Flush::Dangling("きょうh".to_string()));

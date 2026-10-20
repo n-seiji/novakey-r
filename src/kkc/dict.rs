@@ -121,10 +121,6 @@ fn is_dictionary_dir(p: &Path) -> bool {
     p.join("louds/charID.chid").is_file() && p.join("mm.binary").is_file()
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, DictError> {
-    fs::read(path).map_err(|source| DictError::Io { path: path.to_path_buf(), source })
-}
-
 /// 存在しないファイルは `None`、それ以外のエラーは `Err`。
 fn read_file_optional(path: &Path) -> Result<Option<Vec<u8>>, DictError> {
     match fs::read(path) {

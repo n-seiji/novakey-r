@@ -96,11 +96,6 @@ impl Elem {
     pub fn bos() -> Self {
         Self::new(String::new(), String::new(), CID_BOS, CID_BOS, MID_BOS_EOS, 0.0)
     }
-
-    /// EOS (終点)
-    pub fn eos() -> Self {
-        Self::new(String::new(), String::new(), CID_EOS, CID_EOS, MID_BOS_EOS, 0.0)
-    }
 }
 
 /// 単語の種類 (`DicdataStore.wordTypes`): 3 = BOS/EOS, 0 = 前置, 1 = 内容, 2 = 後置

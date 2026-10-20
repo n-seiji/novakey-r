@@ -79,7 +79,6 @@ const NONE: u32 = u32::MAX;
 #[derive(Debug)]
 pub struct Node {
     pub elem: Rc<Elem>,
-    pub start: usize,
     /// 終端の surface index (排他的)
     pub end: usize,
     /// 辞書ではなく `getWiseDicdata` で作ったか
@@ -95,8 +94,8 @@ pub struct Node {
 }
 
 impl Node {
-    fn new(elem: Rc<Elem>, start: usize, end: usize, wise: bool) -> Self {
-        Self { lcid: elem.lcid, removed: elem.removed, elem, start, end, wise, full_min: f32::NEG_INFINITY, prevs: Vec::new() }
+    fn new(elem: Rc<Elem>, end: usize, wise: bool) -> Self {
+        Self { lcid: elem.lcid, removed: elem.removed, elem, end, wise, full_min: f32::NEG_INFINITY, prevs: Vec::new() }
     }
 }
 
@@ -138,6 +137,7 @@ pub struct Lattice {
 
 impl Lattice {
     /// `chars` はカタカナ化済みの読み。
+    #[cfg(test)]
     pub fn build(dict: &Dictionary, cache: &mut LookupCache, chars: &[char]) -> Self {
         Self::build_with_memory(dict, cache, None, chars)
     }
@@ -145,7 +145,7 @@ impl Lattice {
     /// `memory` の学習エントリも辞書の語と同じようにノードにする (辞書の語のあとに並べる)。
     pub fn build_with_memory(dict: &Dictionary, cache: &mut LookupCache, memory: Option<&Learning>, chars: &[char]) -> Self {
         let n = chars.len();
-        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, 0, false)];
+        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, false)];
         let mut ranges = Vec::with_capacity(n);
         let mut learned: Vec<Found> = Vec::new();
         for start in 0..n {
@@ -158,7 +158,7 @@ impl Lattice {
                 if f.ruby_chars == 0 || start + f.ruby_chars > n {
                     continue;
                 }
-                nodes.push(Node::new(f.elem.clone(), start, start + f.ruby_chars, false));
+                nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
             }
             if let Some(memory) = memory {
                 learned.clear();
@@ -167,7 +167,7 @@ impl Lattice {
                     if start + f.ruby_chars > n {
                         continue;
                     }
-                    nodes.push(Node::new(f.elem.clone(), start, start + f.ruby_chars, false));
+                    nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
                 }
             }
             // 機械的に作るエントリ
@@ -175,7 +175,7 @@ impl Lattice {
             for i in start..upper {
                 segment.push(chars[i]);
                 for e in wise_dicdata(&segment, start..i + 1, chars) {
-                    nodes.push(Node::new(Rc::new(e), start, i + 1, true));
+                    nodes.push(Node::new(Rc::new(e), i + 1, true));
                 }
             }
             ranges.push(from..nodes.len());
@@ -355,12 +355,12 @@ mod tests {
 
     /// 辞書を使わない小さなラティス。nodes: (start, end, elem)
     fn manual(n: usize, defs: Vec<(usize, usize, Rc<Elem>)>) -> Lattice {
-        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, 0, false)];
+        let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, false)];
         let mut ranges = Vec::new();
         for start in 0..n {
             let from = nodes.len();
-            for (s, e, el) in defs.iter().filter(|d| d.0 == start) {
-                nodes.push(Node::new(el.clone(), *s, *e, false));
+            for (_, e, el) in defs.iter().filter(|d| d.0 == start) {
+                nodes.push(Node::new(el.clone(), *e, false));
             }
             ranges.push(from..nodes.len());
         }

@@ -51,15 +51,14 @@ pub struct Cand {
     pub value: f32,
     /// ルビ文字数 (data の ruby の grapheme 数の合計)
     pub ruby_count: usize,
-    pub last_mid: usize,
     pub data: Vec<Rc<Elem>>,
     pub source: Source,
 }
 
 impl Cand {
-    fn new(text: String, value: f32, last_mid: usize, data: Vec<Rc<Elem>>, source: Source) -> Self {
+    fn new(text: String, value: f32, data: Vec<Rc<Elem>>, source: Source) -> Self {
         let ruby_count = data.iter().map(|e| e.ruby_len).sum();
-        Self { text, value, ruby_count, last_mid, data, source }
+        Self { text, value, ruby_count, data, source }
     }
 
     /// data の ruby をつなげたもの
@@ -77,15 +76,15 @@ fn process_clause_candidate(dict: &Dictionary, data: &CandidateData) -> Cand {
         mid = clause.mid;
     }
     let text: String = data.clauses.iter().map(|(c, _)| c.text.as_str()).collect();
-    let (last_clause, last_value) = data.clauses.last().expect("clauses は始点の文節を必ず持つ");
-    Cand::new(text, *last_value + mm_value, last_clause.mid, data.data.clone(), Source::Full)
+    let (_, last_value) = data.clauses.last().expect("clauses は始点の文節を必ず持つ");
+    Cand::new(text, *last_value + mm_value, data.data.clone(), Source::Full)
 }
 
 /// 第 1 文節だけの候補
 fn first_clause_candidate(data: &CandidateData) -> Cand {
     let (first, value) = &data.clauses[0];
     let count = first.data_end_index.max(0) as usize;
-    Cand::new(first.text.clone(), *value, first.mid, data.data[..=count].to_vec(), Source::FirstClause)
+    Cand::new(first.text.clone(), *value, data.data[..=count].to_vec(), Source::FirstClause)
 }
 
 /// `getUniqueCandidate`: 同じ text は先に現れた位置に、value か ruby_count が大きい方を残す。
@@ -167,7 +166,7 @@ fn katakana_score(katakana: &str) -> f32 {
 fn additional_candidates(katakana: &str) -> Vec<Cand> {
     let mk = |word: String, data_value: f32, cand_value: f32| {
         let elem = Rc::new(Elem::new(word.clone(), katakana.to_string(), CID_PROPER_NOUN, CID_PROPER_NOUN, MID_GENERAL, data_value));
-        Cand::new(word, cand_value, MID_GENERAL, vec![elem], Source::Additional)
+        Cand::new(word, cand_value, vec![elem], Source::Additional)
     };
     let value = -14.0 * katakana_score(katakana);
     vec![
@@ -188,7 +187,7 @@ fn special_candidates(reading_katakana: &str) -> Vec<Cand> {
 
 fn special_cand(text: String, ruby: &str, value: f32) -> Cand {
     let elem = Rc::new(Elem::new(text.clone(), ruby.to_string(), 0, 0, MID_GENERAL, value));
-    Cand::new(text, value, MID_GENERAL, vec![elem], Source::Special)
+    Cand::new(text, value, vec![elem], Source::Special)
 }
 
 const EMAIL_DOMAINS: [&str; 21] = [
@@ -316,7 +315,6 @@ pub fn process(dict: &Dictionary, lattice: &Lattice, reading_katakana: &str) -> 
             Cand::new(
                 n.elem.word.clone(),
                 n.elem.value(),
-                n.elem.mid,
                 vec![n.elem.clone()],
                 if n.wise { Source::Wise } else { Source::Word },
             )
@@ -347,7 +345,7 @@ mod tests {
 
     fn cand(text: &str, ruby: &str, value: f32) -> Cand {
         let e = Rc::new(Elem::new(text.into(), ruby.into(), 1288, 1288, 501, value));
-        Cand::new(text.into(), value, 501, vec![e], Source::Word)
+        Cand::new(text.into(), value, vec![e], Source::Word)
     }
 
     #[test]

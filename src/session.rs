@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn 確定したらAI要求の取り消しを1度だけ出す() {
+    fn 確定したらai要求の取り消しを1度だけ出す() {
         let mut session = Session::new(Composer::new(TwoEngine));
         session.rerank = true;
         let typing = effects_of(&mut session, "kyou");
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn commitCompositionでも取り消しを出す() {
+    fn commit_compositionでも取り消しを出す() {
         let mut session = Session::new(Composer::new(TwoEngine));
         session.rerank = true;
         effects_of(&mut session, "kyou");
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn AIが無効なら取り消しも出さない() {
+    fn aiが無効なら取り消しも出さない() {
         let mut session = Session::new(Composer::new(TwoEngine));
         effects_of(&mut session, "kyou");
         assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));

@@ -4,110 +4,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-NovakeyR is a Japanese Input Method Engine (IME) written in Rust for macOS. It provides romaji-to-hiragana conversion functionality while maintaining the original character conversion features for creating playful typing experiences.
+NovakeyR is a macOS Input Method Engine (IME) written entirely in Rust (no Swift). It converts romaji to kana, converts kana to kanji with a Rust port of azooKey's conversion engine, learns the candidates you commit, and can optionally re-rank candidates with an LLM (Cloudflare Workers AI). It also intentionally turns some typed characters into "typos" (`l` -> `I` / `|`, `O` -> `0`, ...) for a playful typing experience.
 
 ## Development Commands
 
-### Building and Packaging (mise tasks, no Makefile)
-- `mise run app` - Build the release binary and package it into `output/NovakeyR.app`
-- `mise run build` - Build the Rust binary only (`cargo build --release`)
-- `mise run test` - Run unit tests (`cargo test`)
-- `mise run install` - Build, package, and install into `~/Library/Input Methods` (no sudo)
-- `mise run uninstall` - Remove the installed app
-- `mise run logs` - Stream NSLog output from the running IME
-- `mise run clean` - Remove the generated app bundle
-- `mise run run` - Run the packaged binary directly (smoke test)
+Tasks are defined in `mise.toml`.
 
-### Environment Setup
-- Requires Rust installation via mise: `mise install rust`
-- Use `mise use rust` to activate Rust environment
-- **IMPORTANT**: mise environment is already activated in this shell session. DO NOT use `eval "$(mise activate zsh)"` prefix for commands.
+### Building and Packaging
+- `mise run app` - Build the release binary and package `output/NovakeyR.app` (copies `Info.plist`, `resources/`, `dictionary/`, `NOTICE`)
+- `cargo build --release` - Build the Rust binary only (must stay free of warnings)
+- `mise run install` / `mise run uninstall` - Copy to / remove from `~/Library/Input Methods`
+- `mise run logs` - Stream the IME's NSLog output
+- `mise run reset-memory` - Delete the learning data
 
-### Testing and Development
-- Unit tests (`cargo test` / `mise run test`) cover romaji, composer, kkc engine, learning, rerank (no network)
-- `mise run scenarios` / `scenarios-learning` - headless key scenarios; `mise run kkc-compare` - Rust KKC vs. committed azooKey goldens (`tools/golden/`)
-- `--test-llm` (`mise run test-llm`) は実際に Cloudflare へ送るので手動のときだけ
-- Manual testing: `mise run install`, then add "NovakeyR" in System Settings > Keyboard > Input Sources (re-login may be required the first time)
+### Testing
+- `cargo test` and `cargo test --release` - Unit tests (composer, session, keymap, kkc, rerank, llm_bridge with fakes, ...)
+- `mise run scenarios` - Replay `tools/scenarios.txt` headless; a line with an expectation that does not hold fails
+- `mise run scenarios-learning` - Same for `tools/learning_scenarios.txt` with learning on (memory goes to a temp dir)
+- `mise run simulate -- 'kyouha<space><enter>'` - Run a key sequence through the real key path without Cocoa (`NOVAKEY_SIM_LEARNING=1` to enable learning)
+- `mise run kkc-compare` - Compare the Rust engine against the Swift golden data in `tools/golden/` (top-1/3/9 must stay at 100%)
+- Other dev tools: `--kkc-check`, `--kkc-convert <reading>`, `--kkc-bench <reading>` (run `./target/release/novakey_r <flag>`)
+- Never run `mise run test-llm` / `--test-llm` or enable AI re-rank in automated checks: they call the real Cloudflare API. Tests inject fakes.
+- Manual testing of the IME itself needs the app installed in `~/Library/Input Methods` and added in System Settings > Keyboard > Input Sources.
+
+### Dictionary location
+Order: `NOVAKEY_DICTIONARY` (an invalid value is an error, no silent fallback) -> `<exe>/../Resources/dictionary` (app bundle) -> the repo's `dictionary/` **only in debug builds and tests**. Release binaries never fall back to the repo, so a missing bundle copy shows up in dev installs. The mise tasks above set `NOVAKEY_DICTIONARY` for you; when running `./target/release/novakey_r --kkc-*` / `--simulate*` by hand, set it to `$PWD/dictionary`.
+
+If the dictionary cannot be opened, the failure is logged once (NSLog), reopening is retried at most every 5 minutes, and conversion degrades to hiragana / katakana / raw candidates.
 
 ## Architecture
 
-### Core Components
-- `src/main.rs` - Entry point that initializes the NSApplication and IMKServer connection
-- `src/imk.rs` - Input Method Kit integration (controller class, marked text, candidate window, playful conversion)
-- `src/romaji_converter.rs` - Pure-Rust romaji-to-hiragana conversion engine (unit tested)
-- `src/composer.rs` - 未確定文の状態機械(ひらがなバッファ+同期n-best候補+選択状態、unit tested)
-- `src/loanword.rs` + `resources/loanwords.tsv` - カタカナ語→英単語の表(JMdict由来、`tools/gen_loanwords.py` で生成)。変換候補に desktop などを足す
-- 変換フロー: 既定は非ライブ(未確定文はひらがな表示、メニューでライブ変換に切替可)。打鍵ごとに辞書エンジンで同期変換し、スペース1回目で第1候補、2回目以降で候補送り+候補ウィンドウ(1〜9で候補確定)。ローマ字そのままの候補(raw)を第1候補の直後に追加。先頭が大文字の語は英単語としてそのまま入力。局面は composer の Phase、キー対応表は keymap.rs。
-  Enter 確定(学習更新)。Esc で生ひらがな。LLM は裏で候補番号を選び未操作なら第1候補を差し替える
-- 辞書 `dictionary/` を .app の Contents/Resources/dictionary に同梱(mise run app が実施)。Swift は一切含まない
+- `src/main.rs` - Entry point; dispatches dev-tool flags, otherwise starts the IME (`imk::register_controller`, `imk::run`)
+- `src/platform.rs` - The only place with `unsafe`: Cocoa / InputMethodKit / libdispatch glue via `objc2` (NSLog, main-queue dispatch with `catch_unwind`, candidate panel, defaults, secure-input check). `src/imk_client.rs` wraps the host app's text client (also unsafe, same reason). Everything else is `#![forbid(unsafe_code)]` or has no unsafe.
+- `src/imk.rs` - `NovakeyRInputController` (IMKInputController subclass). Turns IMK callbacks into `Session` calls and executes the returned `Effect`s. Holds the AI toggle and per-controller state.
+- `src/session.rs` - One key's worth of decisions (romaji buffer + composer); returns `Effect`s. Headless, drives `simulate.rs` and the tests.
+- `src/keymap.rs`, `src/romaji_converter.rs`, `src/translit.rs`, `src/symbols.rs`, `src/loanword.rs`, `src/emoji.rs` - Key classification, romaji -> kana, script conversion (F6-F10), symbol variants, katakana-word -> English candidates, reading -> emoji candidates (data in `resources/*.tsv`, generated by `tools/gen_*.py`)
+- `src/composer.rs` - Composition phases (Composing / Converting / Dangling / ...) and the candidate list. Falls back to hiragana + katakana candidates when the engine returns nothing.
+- `src/kkc/` - azooKey-compatible kana-kanji engine: `dict` / `louds` (dictionary files), `lattice` (N-best Viterbi), `wise` (dynamic entries), `result` (candidate assembly), `learning` (committed candidates -> `learning.tsv`; in-memory update is immediate, a background writer coalesces file writes), `compare` / `check` (dev tools). `RustEngine` is the `CandidateEngine` used by the IME.
+- `src/rerank.rs` - Pure state machine for AI re-rank (debounce, latest generation wins, cancel, result cache). Transport and credential store are traits.
+- `src/llm_bridge.rs` - Runs re-rank: Keychain (`security-framework`), HTTPS (`ureq` + rustls), a scheduler thread plus short-lived sender threads (max 2 in flight), results delivered to the main thread.
+- `src/outbound.rs` - Privacy guard: what may be sent to Cloudflare, and whether learning is allowed (not under secure input or in password managers).
+- `src/trace.rs` - Optional key-event trace (`defaults write me.sijis.inputmethod.NovakeyR NovakeyRTrace -bool true`); never records typed text.
 
-### Key Technical Details
-- Uses macOS InputMethodKit framework via Objective-C bindings (`objc2` / `objc2-foundation`)
-- Custom `NovakeyRInputController` class extends `IMKInputController` via `declare_class!`;
-  `register_controller()` must run before IMKServer connects so the class is registered
-  with the Objective-C runtime
-- Per-controller state: each controller instance owns a `RomajiConverter`
-  (`RefCell` ivar set in `initWithServer:delegate:client:`)
-- Japanese input processing:
-  - Alphabetic keys feed `RomajiConverter::process_input`; converted kana is committed
-    via `insertText:replacementRange:`, pending romaji is shown as marked text
-    (`setMarkedText:selectionRange:replacementRange:`)
-  - Non-character keys (delete / return / escape) are handled in `didCommandBySelector:client:`
-  - `commitComposition:` flushes pending romaji when focus changes
-- Playful character conversion (`playful_convert()`) randomizes select characters (1/0/space, etc.)
-- Uses unsafe Rust blocks for Objective-C interop
+### Rules worth remembering
+- Never log or print user text (readings, candidates, surrounding text), credentials, or request bodies.
+- Learning data lives in `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` (`NOVAKEY_MEMORY_DIR` to override, `NOVAKEY_DISABLE_LEARNING=1` to turn off). Concurrent IME processes are last-writer-wins.
+- AI re-rank is off by default (`NovakeyRAIRerankEnabled`) and needs Cloudflare credentials in the Keychain (see README).
 
 ### Dependencies
-- `objc2` - Objective-C runtime bindings
-- `objc2-foundation` - Foundation framework bindings (NSString, NSRange, ...)
-- `libc` - C library bindings
-- `rand` - Random number generation for character selection
-- `once_cell` - Lazy statics
-- `regex` / `unicode-segmentation` / `unicode-normalization` - 変換エンジン(src/kkc)
-- `ureq`(rustls) / `security-framework` / `serde_json` - AI 並べ替えの通信・Keychain・JSON
-
-### Installation Process
-`mise run install` copies the built app to `~/Library/Input Methods` (user-level, no sudo). First activation may require logout/login. Users then add "NovakeyR" from System Preferences > Keyboard > Input Sources.
-
-### Japanese Input Features
-- Romaji to hiragana conversion (a→あ, ka→か, etc.)
-- Supports common romaji patterns including alternative spellings (si/shi, tu/tsu, etc.)
-- Kana-kanji conversion happens incrementally as you type; pending romaji is shown after the current candidate as marked text
-- Space / newline / focus change commit any remaining buffered romaji
-- Automatic buffer management for multi-character sequences
-- Backspace handling for romaji buffer editing
-- Support for Japanese character repertoires: Hiragana, Katakana, Kanji, Latin
-
-## Git Branch Strategy
-
-### Branch Structure
-- `main` - Production-ready code, stable releases
-- `develop` - Development branch, integration of features
-- `feature/*` - Feature branches for new functionality
-- `fix/*` - Bug fix branches
-- `hotfix/*` - Emergency fixes for production
-
-### Workflow
-1. All development work happens on `develop` branch
-2. Create feature branches from `develop` for new features
-3. Create fix branches from `develop` for bug fixes
-4. Merge completed work back to `develop` via pull requests
-5. When ready for release, merge `develop` to `main`
-6. Hotfixes branch from `main` and merge back to both `main` and `develop`
-
-### Current Branch Status
-- **Active branch**: `develop` (as shown in git status)
-- **Main branch**: `main` (target for production releases)
-
-### Commit Convention
-- Use descriptive commit messages
-- Include emoji prefixes when appropriate:
-  - `:sparkles:` (✨) - New features
-  - `:bug:` (🐛) - Bug fixes
-  - `:books:` (📚) - Documentation
-  - `:wrench:` (🔧) - Configuration changes
-  - `:construction:` (🚧) - Work in progress
-  - `:recycle:` (♻️) - Refactoring
+- `objc2`, `objc2-foundation` - Objective-C runtime bindings
+- `libc`, `rand`, `once_cell`, `regex`, `unicode-segmentation`, `unicode-normalization`, `serde_json`
+- `ureq` (rustls), `security-framework` - Cloudflare calls and Keychain
 
 ## Claude Code Configuration
 

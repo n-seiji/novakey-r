@@ -42,6 +42,11 @@ $ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -
 2. パスワードマネージャ・ターミナル系アプリ(1Password、Bitwarden、キーチェーンアクセス、Terminal、iTerm2、Warp、Ghostty、kitty、Alacritty 等)では、リランキング自体を行いません。
 3. 直前の文に API キー、秘密鍵、JWT、メールアドレス、長い数字列、長いトークン風の文字列、「パスワード」などの語が含まれる場合は、直前の文を送らず候補と読みだけで行います。
 
+#### 学習について
+
+確定した候補は端末内の `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` に記録され、次の変換に反映されます(外部には送りません)。
+セキュア入力中、およびパスワードマネージャ(1Password、Bitwarden、キーチェーンアクセス、パスワード)では学習しません。
+
 ### 3. Install
 
 NovakeyR.app を `/Library/Input Methods` 内にコピーします。
