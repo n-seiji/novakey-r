@@ -69,12 +69,21 @@ extern "C" {
     );
 }
 
+/// `f` を実行し、panic したら `Err` にする。
+fn guarded(f: fn()) -> std::thread::Result<()> {
+    std::panic::catch_unwind(f)
+}
+
 /// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。
 pub fn run_on_main(f: fn()) {
     extern "C" fn trampoline(context: *mut std::ffi::c_void) {
         // SAFETY: run_on_main が `fn()` をそのままポインタ値として渡したもの。
         let f: fn() = unsafe { std::mem::transmute::<*mut std::ffi::c_void, fn()>(context) };
-        f();
+        // panic が extern "C" の境界を越えると IME ごと abort するので、ここで止めて続行する。
+        // ペイロードにはユーザーの入力が入りうるので、ログには出さない。
+        if guarded(f).is_err() {
+            log("panic in main-queue callback (ignored)");
+        }
     }
     // SAFETY: メインキューの番地は常に有効。context は fn ポインタ値で、trampoline が同じ型に戻す。
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, f as *mut std::ffi::c_void, trampoline) };
@@ -301,5 +310,16 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
             let _: () = msg_send![&*menu, addItem: &*warn_item];
         }
         menu
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded;
+
+    #[test]
+    fn a_panicking_callback_is_contained() {
+        assert!(guarded(|| panic!("boom")).is_err());
+        assert!(guarded(|| {}).is_ok());
     }
 }

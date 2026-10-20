@@ -32,7 +32,10 @@ const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
 
 fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
     CONTROLLERS.with(|c| {
-        let controllers = c.borrow();
+        // run loop が入れ子で回って登録処理の途中に再入しても、abort せず結果を捨てる。
+        let Ok(controllers) = c.try_borrow() else {
+            return;
+        };
         let Some(controller) = controllers.get(&controller_id) else {
             return;
         };
@@ -134,7 +137,12 @@ declare_class!(
                 msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
             };
             if let Some(ref obj) = this {
-                CONTROLLERS.with(|c| c.borrow_mut().insert(controller_id, obj.clone()));
+                CONTROLLERS.with(|c| match c.try_borrow_mut() {
+                    Ok(mut controllers) => {
+                        controllers.insert(controller_id, obj.clone());
+                    }
+                    Err(_) => platform::log("controller registry busy; AI results disabled for this controller"),
+                });
             }
             this
         }
@@ -432,7 +440,10 @@ impl NovakeyRInputController {
         };
         let Some(client) = self.client() else { return };
         let marked = {
-            let mut session = self.ivars().session.borrow_mut();
+            // 変換処理の途中に run loop が再入した場合は、結果を捨てる (借用の二重取得で落とさない)。
+            let Ok(mut session) = self.ivars().session.try_borrow_mut() else {
+                return;
+            };
             session
                 .composer
                 .apply_rerank(generation, index)
