@@ -102,3 +102,33 @@ impl CandidateEngine for KkcEngine {
         cancel(self.controller_id);
     }
 }
+
+// 差分テスト用ダンプ。Rust 版 KKC への移行 (P5) で Swift 側ごと撤去する。
+extern "C" {
+    fn novakey_kkc_dump(corpus: *const c_char, out: *const c_char, typed: bool) -> i32;
+    fn novakey_kkc_dump_numbers(out: *const c_char, width_out: *const c_char) -> i32;
+}
+
+fn cstring(s: &str) -> std::ffi::CString {
+    std::ffi::CString::new(s).expect("パスに NUL が含まれている")
+}
+
+/// 学習 off・空の一時メモリで、コーパスの各行の候補を JSONL にダンプする。
+/// 決定的な順序にするには起動時に SWIFT_DETERMINISTIC_HASHING=1 を環境に入れておく。
+pub fn dump(corpus: &str, out: &str, typed: bool) -> i32 {
+    let memory_dir = std::env::temp_dir().join(format!("novakey-r-kkc-dump-{}", std::process::id()));
+    std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
+    std::env::set_var("NOVAKEY_MEMORY_DIR", &memory_dir);
+    let (corpus, out) = (cstring(corpus), cstring(out));
+    // SAFETY: 引数は NUL 終端の有効な C 文字列で、呼び出しの間生きている。
+    let code = unsafe { novakey_kkc_dump(corpus.as_ptr(), out.as_ptr(), typed) };
+    let _ = std::fs::remove_dir_all(&memory_dir);
+    code
+}
+
+/// 漢数字 (NumberFormatter spellOut ja-JP) と全半角記号表をダンプする。
+pub fn dump_numbers(out: &str, width_out: &str) -> i32 {
+    let (out, width_out) = (cstring(out), cstring(width_out));
+    // SAFETY: 引数は NUL 終端の有効な C 文字列で、呼び出しの間生きている。
+    unsafe { novakey_kkc_dump_numbers(out.as_ptr(), width_out.as_ptr()) }
+}

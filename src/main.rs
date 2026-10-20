@@ -21,6 +21,22 @@ fn main() {
         return;
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--kkc-dump") {
+        let (Some(corpus), Some(out)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: novakey_r --kkc-dump <corpus> <out.jsonl> [--typed]");
+            std::process::exit(2);
+        };
+        let typed = args.iter().any(|a| a == "--typed");
+        std::process::exit(kkc_bridge::dump(corpus, out, typed));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--kkc-dump-numbers") {
+        let (Some(out), Some(width_out)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: novakey_r --kkc-dump-numbers <kansuji.tsv> <width_map.tsv>");
+            std::process::exit(2);
+        };
+        std::process::exit(kkc_bridge::dump_numbers(out, width_out));
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--simulate") {
         simulate::simulate(args.get(i + 1).map_or("", String::as_str));
         return;

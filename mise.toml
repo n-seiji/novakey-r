@@ -26,6 +26,26 @@ run = "cargo run --release -- --simulate"
 description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt"
 
+[tasks.kkc-dump]
+description = "Swift 版 KKC の golden を作り直す (fresh / typed / 漢数字・全半角表)。Rust 版との差分テストの基準"
+run = """
+set -e
+mkdir -p tools/golden
+cargo build --release
+tmp=$(mktemp -d)
+SWIFT_DETERMINISTIC_HASHING=1 ./target/release/novakey_r --kkc-dump tools/kkc_corpus.txt "$tmp/fresh.jsonl"
+SWIFT_DETERMINISTIC_HASHING=1 ./target/release/novakey_r --kkc-dump tools/kkc_corpus.txt "$tmp/typed.jsonl" --typed
+gzip -9nc "$tmp/fresh.jsonl" > tools/golden/fresh.jsonl.gz
+gzip -9nc "$tmp/typed.jsonl" > tools/golden/typed.jsonl.gz
+rm -rf "$tmp"
+./target/release/novakey_r --kkc-dump-numbers tools/golden/kansuji.tsv tools/golden/width_map.tsv
+"""
+
+[tasks.golden-stats]
+description = "golden の測定 (fresh と typed の差・決定的ハッシュなしの揺れ・特殊候補/wise の出現頻度)"
+depends = ["build"]
+run = "python3 -I tools/golden_stats.py"
+
 [tasks.reset-memory]
 description = "変換学習データを全消去する"
 run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"
