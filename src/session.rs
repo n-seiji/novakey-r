@@ -386,6 +386,11 @@ mod tests {
     }
 
     #[test]
+    fn 辞書がなくても_kyouha_スペース_エンターはきょうはを確定する() {
+        assert_eq!(typed("kyouha "), "きょうは");
+    }
+
+    #[test]
     fn アポストロフィでnを確定して次の母音を切り離せる() {
         assert_eq!(typed("kin'en"), "きんえん");
         assert_eq!(typed("n'a"), "んあ");
@@ -417,11 +422,11 @@ mod tests {
 
     #[test]
     fn 変換後の打鍵は表示中の候補を確定して新しい組成を始める() {
-        // NullEngine は候補を返さないので、変換の第 1 候補は raw になる。
-        assert_eq!(after("kyou a"), ("kyou".to_string(), "あ".to_string()));
-        assert_eq!(after("kyou 1"), ("kyou1".to_string(), String::new()));
-        assert_eq!(after("kyou ."), ("kyou".to_string(), "。".to_string()));
-        assert_eq!(after("kyou K"), ("kyou".to_string(), "K".to_string()));
+        // NullEngine は候補を返さないので、変換の第 1 候補はひらがな (raw ではない) になる。
+        assert_eq!(after("kyou a"), ("きょう".to_string(), "あ".to_string()));
+        assert_eq!(after("kyou 1"), ("きょう1".to_string(), String::new()));
+        assert_eq!(after("kyou ."), ("きょう".to_string(), "。".to_string()));
+        assert_eq!(after("kyou K"), ("きょう".to_string(), "K".to_string()));
     }
 
     #[test]

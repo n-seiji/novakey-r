@@ -84,7 +84,8 @@ pub fn escaped_identifier(id: &str) -> String {
 /// 辞書ディレクトリを探す。
 /// 1. 環境変数 `NOVAKEY_DICTIONARY` (指定されているのに不正ならエラー。黙ってフォールバックしない)
 /// 2. 実行ファイルの `../Resources/dictionary` (アプリバンドル)
-/// 3. ビルド時のリポジトリの `dictionary/` (開発・テスト用)
+/// 3. ビルド時のリポジトリの `dictionary/` (テストとデバッグビルドだけ。リリースビルドには入れない。
+///    バンドルへのコピー漏れを開発中の環境で見逃さないため。CLI の開発ツールは `NOVAKEY_DICTIONARY` で渡す)
 pub fn locate_dictionary_dir() -> Result<PathBuf, DictError> {
     if let Some(v) = std::env::var_os("NOVAKEY_DICTIONARY") {
         let p = PathBuf::from(v);
@@ -104,11 +105,14 @@ pub fn locate_dictionary_dir() -> Result<PathBuf, DictError> {
             tried.push(p);
         }
     }
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("dictionary");
-    if is_dictionary_dir(&p) {
-        return Ok(p);
+    #[cfg(any(test, debug_assertions))]
+    {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("dictionary");
+        if is_dictionary_dir(&p) {
+            return Ok(p);
+        }
+        tried.push(p);
     }
-    tried.push(p);
     let list: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
     Err(DictError::NotFound(format!("探した場所: {}", list.join(", "))))
 }

@@ -79,7 +79,6 @@ impl KkcCore {
 
 thread_local! {
     static LEARNING_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static CORE: RefCell<Option<Rc<KkcCore>>> = const { RefCell::new(None) };
 }
 
 /// 確定を学習してよいか (セキュア入力中・パスワード管理アプリでは false)。IME 側がキーごとに設定する。
@@ -91,20 +90,66 @@ fn learning_allowed() -> bool {
     LEARNING_ALLOWED.with(std::cell::Cell::get)
 }
 
-/// スレッドごとの共有コア。開けなかったときはエラーを 1 度表示して `None`。
-pub fn shared_core() -> Option<Rc<KkcCore>> {
-    CORE.with(|c| {
-        let mut slot = c.borrow_mut();
-        if slot.is_none() {
-            match KkcCore::open_with_learning(learning::Learning::from_env()) {
-                Ok(core) => *slot = Some(Rc::new(core)),
+/// 辞書を開けなかったときに、次に開き直すまで空ける時間。コントローラ (入力クライアント) が増えるたびに
+/// 開き直すと、辞書が無い環境で毎回ディスクを探しログを出すので、この間は結果 (失敗) を使い回す。
+/// 辞書を入れ直したときは IME が再起動するので、長く空けても困らない。
+const REOPEN_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 共有コアを持つ入れ物。失敗した時刻を覚え、`REOPEN_AFTER_FAILURE` の間は開き直さず、失敗のログは 1 度だけ。
+struct CoreSlot<T> {
+    core: Option<Rc<T>>,
+    failed_at: Option<std::time::Instant>,
+    logged: bool,
+}
+
+impl<T> CoreSlot<T> {
+    const fn new() -> Self {
+        Self { core: None, failed_at: None, logged: false }
+    }
+
+    fn get(
+        &mut self,
+        now: std::time::Instant,
+        open: impl FnOnce() -> Result<T, String>,
+        log: impl FnOnce(&str),
+    ) -> Option<Rc<T>> {
+        if self.core.is_none() {
+            if let Some(failed) = self.failed_at {
+                if now.saturating_duration_since(failed) < REOPEN_AFTER_FAILURE {
+                    return None;
+                }
+            }
+            match open() {
+                Ok(core) => {
+                    self.core = Some(Rc::new(core));
+                    self.failed_at = None;
+                }
                 Err(e) => {
-                    eprintln!("novakey_r: 辞書を開けませんでした: {e}");
+                    self.failed_at = Some(now);
+                    if !std::mem::replace(&mut self.logged, true) {
+                        log(&format!("dictionary unavailable; conversion falls back to kana: {e}"));
+                    }
                     return None;
                 }
             }
         }
-        slot.clone()
+        self.core.clone()
+    }
+}
+
+thread_local! {
+    static CORE: RefCell<CoreSlot<KkcCore>> = const { RefCell::new(CoreSlot::new()) };
+}
+
+/// スレッドごとの共有コア。開けなかったときは `None` (ログは 1 度だけ。再試行は `REOPEN_AFTER_FAILURE` 以上空ける)。
+/// エンジンが `None` でも、composer はかな候補で変換を続けられる。
+pub fn shared_core() -> Option<Rc<KkcCore>> {
+    CORE.with(|c| {
+        c.borrow_mut().get(
+            std::time::Instant::now(),
+            || KkcCore::open_with_learning(learning::Learning::from_env()).map_err(|e| e.to_string()),
+            crate::platform::log,
+        )
     })
 }
 
@@ -200,6 +245,39 @@ mod tests {
         assert!(e.select(1, index_of(&before, "幹事")));
         let after = e.convert(2, "かんじをかく");
         assert!(after[0].starts_with("幹事"), "{after:?}");
+    }
+
+    #[test]
+    fn a_failed_open_is_cached_logged_once_and_retried_only_after_the_interval() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        let opens = Cell::new(0);
+        let logs = RefCell::new(Vec::new());
+        let mut slot: CoreSlot<u32> = CoreSlot::new();
+        let t0 = Instant::now();
+        let mut get = |slot: &mut CoreSlot<u32>, at: Instant, ok: bool| {
+            slot.get(
+                at,
+                || {
+                    opens.set(opens.get() + 1);
+                    if ok { Ok(7) } else { Err("missing".to_string()) }
+                },
+                |m| logs.borrow_mut().push(m.to_string()),
+            )
+        };
+        assert!(get(&mut slot, t0, false).is_none());
+        for i in 1..5 {
+            assert!(get(&mut slot, t0 + Duration::from_secs(i), false).is_none());
+        }
+        assert_eq!(opens.get(), 1, "間隔内は開き直さない");
+        assert!(get(&mut slot, t0 + REOPEN_AFTER_FAILURE, false).is_none());
+        assert_eq!(opens.get(), 2);
+        assert_eq!(logs.borrow().len(), 1, "ログは 1 度だけ");
+        assert!(!logs.borrow()[0].contains("かんじ"));
+        let core = get(&mut slot, t0 + REOPEN_AFTER_FAILURE * 2, true).expect("開けたら使える");
+        assert_eq!(*core, 7);
+        assert!(get(&mut slot, t0 + REOPEN_AFTER_FAILURE * 2, false).is_some(), "開けたあとは開き直さない");
+        assert_eq!(opens.get(), 3);
     }
 
     #[test]

@@ -16,14 +16,17 @@ run = "cargo run --release -- --test-llm"
 
 
 [tasks.simulate]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
 run = "cargo run --release -- --simulate"
 
 [tasks.scenarios]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt"
 
 [tasks.scenarios-learning]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"
 run = "NOVAKEY_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learning_scenarios.txt"
 
@@ -31,6 +34,7 @@ run = "NOVAKEY_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learn
 
 
 [tasks.kkc-compare]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "Rust 版 KKC を azooKey (Swift) 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
 depends = ["build"]
 run = "./target/release/novakey_r --kkc-compare"

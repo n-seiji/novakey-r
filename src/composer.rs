@@ -337,6 +337,7 @@ impl<E: CandidateEngine> Composer<E> {
                 engine_index: None,
             });
         }
+        self.insert_kana_fallback();
         // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
         self.insert_raw_candidate();
         self.insert_english_candidates();
@@ -532,6 +533,20 @@ impl<E: CandidateEngine> Composer<E> {
         let extras = self.candidates.len() - engine;
         let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(self.candidates.len());
         self.candidates.splice(position..position, emoji);
+    }
+
+    /// エンジンが候補を 1 つも返さなかったとき (辞書が開けない・未知の読みなど) に、ひらがなとカタカナを候補にする。
+    /// これがないと raw (ローマ字) が唯一の候補になり、Space+Enter で日本語がローマ字に化ける。
+    fn insert_kana_fallback(&mut self) {
+        let unconverted = self.candidates.iter().all(|c| c.engine_index.is_none());
+        if !unconverted || self.is_symbol() || !matches!(self.phase, Phase::Composing | Phase::Reverted) {
+            return;
+        }
+        for text in [self.hiragana.clone(), translit::to_katakana(&self.hiragana)] {
+            if !text.is_empty() && !self.candidates.iter().any(|c| c.text == text) {
+                self.candidates.push(Candidate { text, engine_index: None });
+            }
+        }
     }
 
     fn insert_raw_candidate(&mut self) {
@@ -747,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn 変換候補が空でもraw候補だけで変換できる() {
+    fn 変換候補が空ならひらがなとカタカナが候補になりrawは先頭にならない() {
         let log = Log::default();
         let engine = MockEngine {
             log,
@@ -756,7 +771,22 @@ mod tests {
         let mut c = Composer::new(engine);
         c.push_input("gi", "ぎ", "");
         assert!(c.begin_conversion());
-        assert_eq!(c.display(), "gi");
+        assert_eq!(c.display(), "ぎ");
+        assert_eq!(texts(&c), vec!["ぎ", "gi", "ギ"]);
+        assert!(c.candidates().iter().all(|cand| cand.engine_index.is_none()));
+        assert_eq!(c.commit(), "ぎ");
+        assert_eq!(*c.engine_cancels(), 1, "学習しない");
+    }
+
+    #[test]
+    fn 変換候補が空でもDanglingならrawが先頭のまま() {
+        let engine = MockEngine { log: Log::default(), table: vec![] };
+        let mut c = Composer::new(engine);
+        c.push_flush(Flush::Dangling("きょうh".to_string()));
+        c.push_input("kyouh", "", "");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert!(c.begin_conversion());
+        assert_eq!(c.display(), "kyouh");
     }
 
     #[test]
@@ -1572,7 +1602,7 @@ mod tests {
         let mut c = emoji_composer("いぬ", &[]);
         c.push_input("inu", "いぬ", "");
         c.begin_conversion();
-        assert_eq!(texts(&c), vec!["inu", "🐶"]);
+        assert_eq!(texts(&c), vec!["いぬ", "inu", "イヌ", "🐶"]);
     }
 
     #[test]
