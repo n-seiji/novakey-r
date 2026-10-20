@@ -83,6 +83,8 @@ mod tests {
         assert!(lookup(&t, "びーる").contains(&"🍻".to_string()));
         // 生成器が足した U+FE0F が末尾に二重に残っていない
         assert!(t.values().flatten().all(|e| !e.ends_with("\u{fe0f}\u{fe0f}")));
-        assert!(!lookup(&t, "えがお")[0].ends_with('\u{fe0f}'));
+        // 読みに固有な絵文字が先に来る
+        assert_eq!(lookup(&t, "ねこ")[0], "🐈");
+        assert_eq!(lookup(&t, "いぬ")[0], "🐕");
     }
 }

@@ -440,10 +440,10 @@ kyouTokyo<F10><F10><enter>	kyoutokyo
 kyou<F10><F10><enter>	KYOU
 # 絵文字候補 (resources/emoji.tsv): 読み全体が一致したときだけ、上位のエンジン候補と英単語・raw の後ろに最大 5 件入り、数字キーで選べる。学習しない。
 neko<space>
-neko<space><space>5	😺
+neko<space><space>5	🐈
 kanpai<space><space>5	🍻
 kanpai<space><space>6	🥂
-egao<space><space>5	😀
-inu<space><space>6	🐶
+egao<space><space>5	☺️
+inu<space><space>5	🐕
 bi-ru<space><space>6	🍻
-ha-to<space><space>5	🥰
+ha-to<space><space>5	🧡

@@ -1,9 +1,10 @@
 """azooKey の絵文字辞書から 読み -> 絵文字 の表 (resources/emoji.tsv) を作る。
 
-使い方: python3 -I tools/gen_emoji.py <emoji_all_E16.0.txt のパス> > resources/emoji.tsv
+使い方: python3 -I tools/gen_emoji.py tools/data/emoji_all_E16.0.txt > resources/emoji.tsv
 
 入力は `絵文字<TAB>読み,読み,...<TAB>` の行。読みにはひらがなと漢字が混ざるので、
-ひらがな (と長音) だけの読みを残す。入力の絵文字には生成器が必ず U+FE0F を1つ足して
+ひらがな (と長音) だけの読みを残す。読みの数が少ない絵文字ほどその読みに固有なので先に並べる
+(ねこ なら 😺 より 🐈)。入力の絵文字には生成器が必ず U+FE0F を1つ足して
 あるため、末尾の U+FE0F を1つだけ外す。
 
 データは Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) 由来で、
@@ -34,17 +35,20 @@ def strip_one_vs16(emoji: str) -> str:
 
 
 def build_table(lines: list[str]) -> dict[str, list[str]]:
-    """読み -> 絵文字 (入力の出現順・重複なし)。"""
-    table: dict[str, list[str]] = defaultdict(list)
+    """読み -> 絵文字 (読みの数が少ない順、同数は入力の出現順・重複なし)。"""
+    ranked: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for line in lines:
         cols = line.rstrip("\n").split("\t")
         if len(cols) < 2 or not cols[0]:
             continue
         emoji = strip_one_vs16(cols[0])
-        for reading in cols[1].split(","):
-            if HIRAGANA.match(reading) and emoji not in table[reading]:
-                table[reading].append(emoji)
-    return table
+        readings = cols[1].split(",")
+        for reading in readings:
+            if HIRAGANA.match(reading) and all(e != emoji for _, e in ranked[reading]):
+                ranked[reading].append((len(readings), emoji))
+    return {
+        r: [e for _, e in sorted(es, key=lambda x: x[0])] for r, es in ranked.items()
+    }
 
 
 def render(table: dict[str, list[str]]) -> str:
