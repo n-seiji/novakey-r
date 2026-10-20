@@ -210,9 +210,19 @@ impl Sim {
 }
 
 fn setup_env() {
-    let memory_dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
-    std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
-    std::env::set_var("NOVAKEY_MEMORY_DIR", memory_dir);
+    // 既定は学習 off。`NOVAKEY_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。NOVAKEY_MEMORY_DIR で変えられる)。
+    // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
+    let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
+    if learning {
+        std::env::remove_var("NOVAKEY_DISABLE_LEARNING");
+    } else {
+        std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
+    }
+    if !learning || std::env::var_os("NOVAKEY_MEMORY_DIR").is_none_or(|v| v.is_empty()) {
+        let memory_dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&memory_dir);
+        std::env::set_var("NOVAKEY_MEMORY_DIR", memory_dir);
+    }
     if std::env::var_os("NOVAKEY_LOANWORDS").is_none() {
         let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/loanwords.tsv");
         std::env::set_var("NOVAKEY_LOANWORDS", repo_table);

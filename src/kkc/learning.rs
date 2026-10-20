@@ -1,0 +1,728 @@
+//! 学習 (`LearningMemory.swift` の `LearningManager` / `LongTermLearningMemory` の移植)。
+//!
+//! 確定した候補を、単語ごと・第 1+第 2 文節の複合・候補全体の 3 種のエントリとして覚え、
+//! 次の変換でラティスに辞書と同じように加える。Swift 版の LOUDS 形式は読まず、ruby でソートした
+//! 1 つの TSV (`learning.tsv`) に書く。確定のたびに一時記憶を経ずに保存する (IME は即確定なので不要)。
+//!
+//! Swift 版との違い:
+//! - Swift は書き出すときに `lastUpdatedDay := lastUsedDay` にしてしまい、32 日ごとの半減が次の保存の
+//!   たびにやり直しになる。ここでは `lastUpdatedDay` も保存して、意図どおり 32 日ごとに 1 回だけ半減する。
+//! - 上限 (65536) を超えるときは、Swift と同じく読みの長いエントリから捨てる。ただし今回の確定で
+//!   触れたエントリは捨てない。
+//! - 直前の確定との bigram (`lastData`) は移植しない (NovakeyR は確定のたびに変換を止めるので発火しない)。
+#![forbid(unsafe_code)]
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::elem::{count_graphemes, include_mm_value_calculation, is_clause, Elem};
+use super::lattice::Found;
+
+/// 覚えるエントリ数の上限 (`maxMemoryCount`)
+pub const MAX_MEMORY_COUNT: usize = 65536;
+const HEADER: &str = "# novakey-r learning v1";
+const FILE_NAME: &str = "learning.tsv";
+const DIR_NAME: &str = "rust-learning";
+
+/// 学習エントリ 1 件。`ruby` は呼び出し側 (マップのキー) が持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemEntry {
+    pub word: String,
+    pub lcid: usize,
+    pub rcid: usize,
+    pub mid: usize,
+    pub count: u8,
+    pub last_used: u16,
+    pub last_updated: u16,
+}
+
+/// 値の式 (`valueForData`)。出現数が多いほど、読みが長いほど大きい。
+pub fn value_for(count: u8, ruby_len: usize) -> f32 {
+    let d = 1.0 - f64::from(count) / 255.0;
+    (-1.0 - 4.0 / ruby_len.max(1) as f64 - 3.0 * d.powi(3)) as f32
+}
+
+/// `DicdataStore.needWValueMemory`: 単語単位で覚える語彙か。
+pub fn need_w_value_memory(lcid: usize) -> bool {
+    !((147..=554).contains(&lcid)
+        || (557..=560).contains(&lcid)
+        || (1297..=1305).contains(&lcid)
+        || (6..=9).contains(&lcid)
+        || lcid == 0
+        || lcid == 1316)
+}
+
+/// 日付 (1970-01-01 からの日数 − 19000)。
+pub fn today_from_unix(secs: u64) -> u16 {
+    (secs / 86400).wrapping_sub(19000) as u16
+}
+
+fn system_today() -> u16 {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    today_from_unix(secs)
+}
+
+/// 学習データの置き場所 (`<NOVAKEY_MEMORY_DIR または ~/Library/Application Support/NovakeyR>/rust-learning`)。
+pub fn default_dir() -> Option<PathBuf> {
+    let base = match std::env::var("NOVAKEY_MEMORY_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/NovakeyR"),
+    };
+    Some(base.join(DIR_NAME))
+}
+
+/// 値のように扱う 1 回分の語 (clause の組み立て用)
+#[derive(Clone)]
+struct Piece {
+    word: String,
+    ruby: String,
+    lcid: usize,
+    rcid: usize,
+    mid: usize,
+    base: f32,
+}
+
+impl Piece {
+    fn of(e: &Elem) -> Self {
+        Self { word: e.word.clone(), ruby: e.ruby.clone(), lcid: e.lcid, rcid: e.rcid, mid: e.mid, base: e.base }
+    }
+
+    fn append(&mut self, e: &Elem) {
+        self.word.push_str(&e.word);
+        self.ruby.push_str(&e.ruby);
+        self.rcid = e.rcid;
+        if include_mm_value_calculation(e) {
+            self.mid = e.mid;
+        }
+        self.base += e.base;
+    }
+
+    /// 第 1 文節 + 第 2 文節 (`mid` は第 2 文節のもの)
+    fn compound(first: &Piece, second: &Piece) -> Piece {
+        Piece {
+            word: format!("{}{}", first.word, second.word),
+            ruby: format!("{}{}", first.ruby, second.ruby),
+            lcid: first.lcid,
+            rcid: first.rcid,
+            mid: second.mid,
+            base: first.base + second.base,
+        }
+    }
+}
+
+pub struct Learning {
+    /// `None` なら無効 (読み書きしない)
+    enabled: bool,
+    /// 保存先。`None` なら保存しない (テスト用)
+    path: Option<PathBuf>,
+    entries: HashMap<String, Vec<MemEntry>>,
+    len: usize,
+    clock: Box<dyn Fn() -> u16>,
+    cap: usize,
+}
+
+impl Learning {
+    /// 読み書きしない学習。
+    pub fn disabled() -> Self {
+        Self { enabled: false, path: None, entries: HashMap::new(), len: 0, clock: Box::new(system_today), cap: MAX_MEMORY_COUNT }
+    }
+
+    /// 環境変数 (`NOVAKEY_DISABLE_LEARNING=1` で無効、`NOVAKEY_MEMORY_DIR`) に従って開く。
+    pub fn from_env() -> Self {
+        if std::env::var("NOVAKEY_DISABLE_LEARNING").is_ok_and(|v| v == "1") {
+            return Self::disabled();
+        }
+        match default_dir() {
+            Some(dir) => Self::open(&dir),
+            None => Self::disabled(),
+        }
+    }
+
+    /// `dir` の `learning.tsv` を読んで開く。無いときは空、壊れているときは空にして
+    /// 元のファイルを `learning.tsv.corrupt` に退避する (panic しない)。
+    pub fn open(dir: &Path) -> Self {
+        let mut me = Self { enabled: true, path: Some(dir.join(FILE_NAME)), ..Self::disabled() };
+        me.load();
+        me
+    }
+
+    /// 保存しない有効な学習 (単体テスト用)。
+    pub fn in_memory() -> Self {
+        Self { enabled: true, ..Self::disabled() }
+    }
+
+    pub fn with_clock(mut self, clock: impl Fn() -> u16 + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    pub fn with_cap(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn entries_for(&self, ruby: &str) -> &[MemEntry] {
+        self.entries.get(ruby).map_or(&[], Vec::as_slice)
+    }
+
+    fn load(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!("novakey_r: 学習データを読めませんでした ({}): {e}", path.display());
+                return;
+            }
+        };
+        match parse(&bytes) {
+            Some(entries) => {
+                self.len = entries.values().map(Vec::len).sum();
+                self.entries = entries;
+            }
+            None => {
+                eprintln!("novakey_r: 学習データが壊れています。空として扱います ({})", path.display());
+                let _ = std::fs::rename(&path, path.with_extension("tsv.corrupt"));
+            }
+        }
+    }
+
+    /// `katakana` の先頭から始まる、読みが prefix になっている学習エントリ (短い順)。
+    pub fn lookup(&self, katakana: &str, out: &mut Vec<Found>) {
+        if !self.enabled || self.len == 0 {
+            return;
+        }
+        let mut chars = 0;
+        for (idx, c) in katakana.char_indices() {
+            chars += 1;
+            let ruby = &katakana[..idx + c.len_utf8()];
+            let Some(list) = self.entries.get(ruby) else { continue };
+            let ruby_len = count_graphemes(ruby);
+            for m in list {
+                let elem = Elem::new(m.word.clone(), ruby.to_string(), m.lcid, m.rcid, m.mid, value_for(m.count, ruby_len));
+                out.push(Found { elem: Rc::new(elem), ruby_chars: chars });
+            }
+        }
+    }
+
+    /// 確定した候補 (`Candidate.data`) を覚えて保存する (`update` + `commitUpdateLearningData`)。
+    /// `known` は辞書の文字表にある文字か (無い文字を含む読みは覚えない)。
+    pub fn learn(&mut self, data: &[Rc<Elem>], known: &dyn Fn(char) -> bool) {
+        if !self.enabled || data.is_empty() {
+            return;
+        }
+        let today = (self.clock)();
+        let mut touched: HashSet<(String, String, usize, usize)> = HashSet::new();
+        // 保存済みのものを先に整理する (merge の「古いデータの選別」)
+        self.prune(today);
+        let mut memorize = |me: &mut Self, p: &Piece| {
+            if p.ruby.is_empty() || !p.ruby.chars().all(known) {
+                return;
+            }
+            me.memorize(p, today);
+            touched.insert((p.ruby.clone(), p.word.clone(), p.lcid, p.rcid));
+        };
+
+        // 単語単位
+        for e in data {
+            if need_w_value_memory(e.lcid) {
+                memorize(self, &Piece::of(e));
+            }
+        }
+        if data.len() > 1 {
+            // 文節単位 bigram (第 1 文節 + 第 2 文節)
+            let mut first: Option<Piece> = None;
+            let mut second: Option<Piece> = None;
+            for e in data {
+                let Some(f) = first.as_mut() else {
+                    first = Some(Piece::of(e));
+                    continue;
+                };
+                let clause = is_clause(f.rcid, e.lcid);
+                match second.as_mut() {
+                    None if clause => second = Some(Piece::of(e)),
+                    None => f.append(e),
+                    Some(s) if clause => {
+                        let element = Piece::compound(f, s);
+                        first = second.take();
+                        second = Some(Piece::of(e));
+                        memorize(self, &element);
+                    }
+                    Some(s) => s.append(e),
+                }
+            }
+            if let (Some(f), Some(s)) = (&first, &second) {
+                memorize(self, &Piece::compound(f, s));
+            }
+            // 全体
+            let whole = Piece {
+                word: data.iter().map(|e| e.word.as_str()).collect(),
+                ruby: data.iter().map(|e| e.ruby.as_str()).collect(),
+                lcid: data[0].lcid,
+                rcid: data[data.len() - 1].rcid,
+                mid: data[data.len() - 1].mid,
+                base: data.iter().fold(0.0, |acc, e| acc + e.base),
+            };
+            memorize(self, &whole);
+        }
+        self.enforce_cap(&touched);
+        self.save();
+    }
+
+    /// 1 件を覚える。同じ (読み, 表層, lcid, rcid) があれば出現数を足す。
+    fn memorize(&mut self, p: &Piece, today: u16) {
+        let list = self.entries.entry(p.ruby.clone()).or_default();
+        if let Some(m) = list.iter_mut().find(|m| m.word == p.word && m.lcid == p.lcid && m.rcid == p.rcid) {
+            m.count = m.count.saturating_add(1);
+            m.last_used = today;
+            m.last_updated = today;
+        } else {
+            list.push(MemEntry { word: p.word.clone(), lcid: p.lcid, rcid: p.rcid, mid: p.mid, count: 1, last_used: today, last_updated: today });
+            self.len += 1;
+        }
+    }
+
+    /// 未来の日付のリセット・128 日以上使っていないものの削除・32 日ごとの半減。
+    pub fn prune(&mut self, today: u16) {
+        let today = i32::from(today);
+        let mut removed = 0;
+        self.entries.retain(|_, list| {
+            list.retain_mut(|m| {
+                if today < i32::from(m.last_updated) || today < i32::from(m.last_used) {
+                    // 変なデータは入れ直す
+                    m.count = 1;
+                    m.last_used = today as u16;
+                    m.last_updated = today as u16;
+                }
+                if today - i32::from(m.last_used) >= 128 {
+                    removed += 1;
+                    return false;
+                }
+                while today - i32::from(m.last_updated) > 32 {
+                    m.count >>= 1;
+                    m.last_updated += 32;
+                }
+                if m.count == 0 {
+                    removed += 1;
+                    return false;
+                }
+                true
+            });
+            !list.is_empty()
+        });
+        self.len -= removed;
+    }
+
+    /// 上限を超えた分を、読みの長いものから捨てる (今回触れたものは残す)。
+    fn enforce_cap(&mut self, touched: &HashSet<(String, String, usize, usize)>) {
+        if self.len <= self.cap {
+            return;
+        }
+        let mut keys: Vec<(usize, String, String, usize, usize)> = self
+            .entries
+            .iter()
+            .flat_map(|(ruby, list)| list.iter().map(move |m| (count_graphemes(ruby), ruby.clone(), m.word.clone(), m.lcid, m.rcid)))
+            .filter(|(_, ruby, word, l, r)| !touched.contains(&(ruby.clone(), word.clone(), *l, *r)))
+            .collect();
+        // 長い順 (同じ長さなら読み・表層の降順) に並べて先頭から捨てる
+        keys.sort_by(|a, b| b.cmp(a));
+        for (_, ruby, word, lcid, rcid) in keys {
+            if self.len <= self.cap {
+                break;
+            }
+            if let Some(list) = self.entries.get_mut(&ruby) {
+                let before = list.len();
+                list.retain(|m| !(m.word == word && m.lcid == lcid && m.rcid == rcid));
+                self.len -= before - list.len();
+                if list.is_empty() {
+                    self.entries.remove(&ruby);
+                }
+            }
+        }
+    }
+
+    /// `learning.tsv` に書く (一時ファイルに書いてから rename)。
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let result = (|| -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("tsv.tmp");
+            std::fs::write(&tmp, serialize(&self.entries))?;
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = result {
+            eprintln!("novakey_r: 学習データを保存できませんでした ({}): {e}", path.display());
+        }
+    }
+}
+
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match chars.next()? {
+            '\\' => '\\',
+            't' => '\t',
+            'n' => '\n',
+            'r' => '\r',
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+/// 読み → 表層 → lcid → rcid の順に並べて書く (内容が同じなら同じバイト列になる)。
+fn serialize(entries: &HashMap<String, Vec<MemEntry>>) -> String {
+    let mut rubies: Vec<&String> = entries.keys().collect();
+    rubies.sort();
+    let mut out = String::from(HEADER);
+    out.push('\n');
+    for ruby in rubies {
+        let mut list: Vec<&MemEntry> = entries[ruby].iter().collect();
+        list.sort_by(|a, b| (&a.word, a.lcid, a.rcid).cmp(&(&b.word, b.lcid, b.rcid)));
+        for m in list {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                escape(ruby),
+                escape(&m.word),
+                m.lcid,
+                m.rcid,
+                m.mid,
+                m.count,
+                m.last_used,
+                m.last_updated
+            ));
+        }
+    }
+    out
+}
+
+/// 壊れていたら `None`。
+fn parse(bytes: &[u8]) -> Option<HashMap<String, Vec<MemEntry>>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != HEADER {
+        return None;
+    }
+    let mut entries: HashMap<String, Vec<MemEntry>> = HashMap::new();
+    for line in lines {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 8 {
+            return None;
+        }
+        let ruby = unescape(f[0])?;
+        if ruby.is_empty() {
+            return None;
+        }
+        let m = MemEntry {
+            word: unescape(f[1])?,
+            lcid: f[2].parse().ok()?,
+            rcid: f[3].parse().ok()?,
+            mid: f[4].parse().ok()?,
+            count: f[5].parse().ok()?,
+            last_used: f[6].parse().ok()?,
+            last_updated: f[7].parse().ok()?,
+        };
+        let list = entries.entry(ruby).or_default();
+        if list.iter().any(|x| x.word == m.word && x.lcid == m.lcid && x.rcid == m.rcid) {
+            return None;
+        }
+        list.push(m);
+    }
+    Some(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn el(word: &str, ruby: &str, lcid: usize, rcid: usize, mid: usize, base: f32) -> Rc<Elem> {
+        Rc::new(Elem::new(word.into(), ruby.into(), lcid, rcid, mid, base))
+    }
+
+    fn known(_: char) -> bool {
+        true
+    }
+
+    fn clock(day: &Rc<Cell<u16>>) -> impl Fn() -> u16 + 'static {
+        let d = day.clone();
+        move || d.get()
+    }
+
+    fn found(l: &Learning, ruby: &str) -> Vec<(String, f32)> {
+        let mut out = Vec::new();
+        l.lookup(ruby, &mut out);
+        out.iter().map(|f| (f.elem.word.clone(), f.elem.base)).collect()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("novakey-r-learning-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn value_formula_matches_swift_ranges() {
+        // 長さ 1 のとき [-5, -8]、2 のとき [-3, -6]、4 のとき [-2, -5]
+        assert!((value_for(1, 1) - (-1.0 - 4.0 - 3.0 * (254.0f64 / 255.0).powi(3)) as f32).abs() < 1e-6);
+        assert!((value_for(255, 2) - -3.0).abs() < 1e-6);
+        assert!((value_for(255, 4) - -2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn word_level_memory_follows_need_w_value_memory() {
+        assert!(need_w_value_memory(1288));
+        assert!(!need_w_value_memory(200)); // 助詞・助動詞
+        assert!(!need_w_value_memory(0));
+        assert!(!need_w_value_memory(1316));
+        assert!(!need_w_value_memory(1300)); // 接尾名詞
+        assert!(!need_w_value_memory(7)); // 記号
+    }
+
+    #[test]
+    fn memorized_word_is_found_by_every_prefix_length() {
+        let mut l = Learning::in_memory();
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        assert_eq!(l.len(), 1);
+        assert!(found(&l, "カ").is_empty());
+        assert_eq!(found(&l, "カンジ").len(), 1);
+        assert_eq!(found(&l, "カンジヲミル").len(), 1);
+        let v = l.entries_for("カンジ")[0].count;
+        assert_eq!(v, 1);
+        let mut out = Vec::new();
+        l.lookup("カンジ", &mut out);
+        assert_eq!(out[0].ruby_chars, 3);
+        assert!((out[0].elem.base - value_for(1, 3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn repeated_commits_accumulate_count_up_to_255() {
+        let mut l = Learning::in_memory();
+        let d = [el("幹事", "カンジ", 1288, 1288, 501, -7.0)];
+        for _ in 0..300 {
+            l.learn(&d, &known);
+        }
+        assert_eq!(l.entries_for("カンジ")[0].count, 255);
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn particles_alone_are_not_memorized_but_compounds_are() {
+        let mut l = Learning::in_memory();
+        // 名詞 + 助詞: 単語は名詞だけ、複合 (第 1 + 第 2 文節) は文節が 1 つなので全体だけ
+        let data = [el("今日", "キョウ", 1288, 1288, 501, -6.0), el("は", "ハ", 200, 200, 10, -3.0)];
+        l.learn(&data, &known);
+        assert_eq!(l.entries_for("キョウ").len(), 1);
+        assert!(l.entries_for("ハ").is_empty());
+        assert_eq!(l.entries_for("キョウハ").len(), 1);
+        let whole = &l.entries_for("キョウハ")[0];
+        assert_eq!((whole.word.as_str(), whole.lcid, whole.rcid, whole.mid), ("今日は", 1288, 200, 10));
+    }
+
+    #[test]
+    fn two_clause_candidate_memorizes_the_compound_and_the_whole() {
+        let mut l = Learning::in_memory();
+        // 名詞 助詞 | 動詞 (内容語どうしは文節が切れる)
+        let data = [
+            el("本", "ホン", 1288, 1288, 501, -6.0),
+            el("を", "ヲ", 200, 200, 10, -3.0),
+            el("読む", "ヨム", 700, 700, 400, -6.0),
+        ];
+        let boundaries = (is_clause(data[0].rcid, data[1].lcid), is_clause(data[1].rcid, data[2].lcid));
+        assert_eq!(boundaries, (false, true));
+        l.learn(&data, &known);
+        // 単語: 本 / 読む。複合 (本を + 読む) と全体は表層・読みが同じでも rcid が違う (助詞 / 動詞) ので別のエントリ
+        assert_eq!(l.entries_for("ホン").len(), 1);
+        assert_eq!(l.entries_for("ヨム").len(), 1);
+        let both = l.entries_for("ホンヲヨム");
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().all(|m| m.word == "本を読む" && m.count == 1));
+        let mut rcids: Vec<usize> = both.iter().map(|m| m.rcid).collect();
+        rcids.sort();
+        assert_eq!(rcids, [200, 700]);
+    }
+
+    #[test]
+    fn unknown_chars_are_skipped() {
+        let mut l = Learning::in_memory();
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &|c| c != 'ン');
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn halves_count_every_32_days_and_expires_after_128() {
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::in_memory().with_clock(clock(&day));
+        let d = [el("幹事", "カンジ", 1288, 1288, 501, -7.0)];
+        for _ in 0..8 {
+            l.learn(&d, &known);
+        }
+        assert_eq!(l.entries_for("カンジ")[0].count, 8);
+        // 32 日ちょうどでは半減しない
+        l.prune(1032);
+        assert_eq!(l.entries_for("カンジ")[0].count, 8);
+        // 33 日で 1 回、65 日で 2 回
+        l.prune(1033);
+        assert_eq!(l.entries_for("カンジ")[0].count, 4);
+        l.prune(1033);
+        assert_eq!(l.entries_for("カンジ")[0].count, 4, "同じ日に何度整理しても半減は 1 回");
+        l.prune(1065);
+        assert_eq!(l.entries_for("カンジ")[0].count, 2);
+        // 128 日未使用で消える
+        l.prune(1127);
+        assert_eq!(l.len(), 1);
+        l.prune(1128);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn count_that_halves_to_zero_is_dropped() {
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::in_memory().with_clock(clock(&day));
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        l.prune(1033);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn use_after_halving_keeps_the_entry_fresh() {
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::in_memory().with_clock(clock(&day));
+        let d = [el("幹事", "カンジ", 1288, 1288, 501, -7.0)];
+        for _ in 0..4 {
+            l.learn(&d, &known);
+        }
+        day.set(1100);
+        l.learn(&d, &known); // 先に整理 (100 日 → 3 回半減で 0 ...) してから覚えるので 1 から数え直し
+        assert_eq!(l.entries_for("カンジ")[0].count, 1);
+        assert_eq!(l.entries_for("カンジ")[0].last_used, 1100);
+    }
+
+    #[test]
+    fn future_dates_are_reset() {
+        let day = Rc::new(Cell::new(1000u16));
+        let mut l = Learning::in_memory().with_clock(clock(&day));
+        let d = [el("幹事", "カンジ", 1288, 1288, 501, -7.0)];
+        for _ in 0..5 {
+            l.learn(&d, &known);
+        }
+        day.set(900); // 時計が戻った
+        l.prune(900);
+        let m = &l.entries_for("カンジ")[0];
+        assert_eq!((m.count, m.last_used, m.last_updated), (1, 900, 900));
+    }
+
+    #[test]
+    fn cap_drops_the_longest_readings_but_keeps_what_was_just_learned() {
+        let mut l = Learning::in_memory().with_cap(3);
+        l.learn(&[el("あ", "ア", 1288, 1288, 501, -7.0)], &known);
+        l.learn(&[el("いい", "イイ", 1288, 1288, 501, -7.0)], &known);
+        l.learn(&[el("ううう", "ウウウ", 1288, 1288, 501, -7.0)], &known);
+        assert_eq!(l.len(), 3);
+        l.learn(&[el("えええ", "エエエ", 1288, 1288, 501, -7.0)], &known);
+        assert_eq!(l.len(), 3);
+        assert!(l.entries_for("エエエ").len() == 1, "新しく覚えたものは残る");
+        assert!(l.entries_for("ウウウ").is_empty(), "最も長い古いものが捨てられる");
+        assert!(!l.entries_for("ア").is_empty() && !l.entries_for("イイ").is_empty());
+    }
+
+    #[test]
+    fn persists_and_reloads() {
+        let dir = tmp_dir("roundtrip");
+        let day = Rc::new(Cell::new(1000u16));
+        {
+            let mut l = Learning::open(&dir).with_clock(clock(&day));
+            l.learn(&[el("幹\t事", "カ\\ンジ", 1288, 1288, 501, -7.0)], &known);
+            l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+            l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        }
+        assert!(dir.join("learning.tsv").exists());
+        assert!(!dir.join("learning.tsv.tmp").exists(), "一時ファイルは rename で消える");
+        let l = Learning::open(&dir);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l.entries_for("カンジ")[0].count, 2);
+        assert_eq!(l.entries_for("カ\\ンジ")[0].word, "幹\t事");
+        // 同じ内容なら同じバイト列
+        assert_eq!(serialize(&l.entries), std::fs::read_to_string(dir.join("learning.tsv")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_reads_and_writes_nothing() {
+        let dir = tmp_dir("disabled");
+        let mut l = Learning::disabled();
+        l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+        assert!(l.is_empty());
+        let mut out = Vec::new();
+        l.lookup("カンジ", &mut out);
+        assert!(out.is_empty());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn corrupted_file_is_treated_as_empty() {
+        for (name, content) in [
+            ("garbage", b"\xff\xfe\x00 not a tsv".to_vec()),
+            ("header", "# other\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\n".as_bytes().to_vec()),
+            ("fields", format!("{HEADER}\nカンジ\t幹事\t1\n").into_bytes()),
+            ("number", format!("{HEADER}\nカンジ\t幹事\tx\t1\t1\t1\t1\t1\n").into_bytes()),
+            ("range", format!("{HEADER}\nカンジ\t幹事\t1\t1\t1\t999\t1\t1\n").into_bytes()),
+            ("escape", format!("{HEADER}\nカンジ\t幹\\q\t1\t1\t1\t1\t1\t1\n").into_bytes()),
+            ("dup", format!("{HEADER}\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\nカンジ\t幹事\t1\t1\t1\t1\t1\t1\n").into_bytes()),
+        ] {
+            let dir = tmp_dir(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("learning.tsv"), content).unwrap();
+            let mut l = Learning::open(&dir);
+            assert!(l.is_empty(), "{name}");
+            assert!(dir.join("learning.tsv.corrupt").exists(), "{name}: 退避される");
+            // その後も普通に学習できる
+            l.learn(&[el("幹事", "カンジ", 1288, 1288, 501, -7.0)], &known);
+            assert_eq!(Learning::open(&dir).len(), 1, "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        let dir = tmp_dir("missing");
+        assert!(Learning::open(&dir).is_empty());
+        assert!(!dir.exists(), "読むだけでは作らない");
+    }
+}

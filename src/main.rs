@@ -34,6 +34,9 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--kkc-check") {
         std::process::exit(kkc::check::run_cli(args.get(i + 1).map(String::as_str)));
     }
+    if args.iter().any(|a| a == "--kkc-learn-compare") {
+        std::process::exit(kkc::learn_compare::run(&args));
+    }
     if args.iter().any(|a| a == "--kkc-compare") {
         std::process::exit(kkc::compare::run(&args));
     }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::dict::{to_katakana, Dictionary};
+use super::learning::Learning;
 use super::elem::{include_mm_value_calculation, is_clause, Elem, MID_BOS_EOS};
 use super::wise::wise_dicdata;
 
@@ -134,9 +135,15 @@ pub struct Lattice {
 impl Lattice {
     /// `chars` はカタカナ化済みの読み。
     pub fn build(dict: &Dictionary, cache: &mut LookupCache, chars: &[char]) -> Self {
+        Self::build_with_memory(dict, cache, None, chars)
+    }
+
+    /// `memory` の学習エントリも辞書の語と同じようにノードにする (辞書の語のあとに並べる)。
+    pub fn build_with_memory(dict: &Dictionary, cache: &mut LookupCache, memory: Option<&Learning>, chars: &[char]) -> Self {
         let n = chars.len();
         let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, 0, false)];
         let mut ranges = Vec::with_capacity(n);
+        let mut learned: Vec<Found> = Vec::new();
         for start in 0..n {
             let from = nodes.len();
             let upper = (start + MAX_LENGTH).min(n);
@@ -148,6 +155,16 @@ impl Lattice {
                     continue;
                 }
                 nodes.push(Node::new(f.elem.clone(), start, start + f.ruby_chars, false));
+            }
+            if let Some(memory) = memory {
+                learned.clear();
+                memory.lookup(&substring, &mut learned);
+                for f in &learned {
+                    if start + f.ruby_chars > n {
+                        continue;
+                    }
+                    nodes.push(Node::new(f.elem.clone(), start, start + f.ruby_chars, false));
+                }
             }
             // 機械的に作るエントリ
             let mut segment = String::new();

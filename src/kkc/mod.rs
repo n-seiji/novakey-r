@@ -2,7 +2,7 @@
 //!
 //! 辞書ファイル形式 (`dict` / `louds`)、ラティスと N-best Viterbi (`lattice`)、動的エントリ (`wise`)、
 //! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine` (環境変数 `NOVAKEY_ENGINE=rust` のとき)。
-//! 学習・特殊候補は未実装 (P3 / P4)。
+//! 学習は `learning` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で無効)。
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_imports)]
 
@@ -11,6 +11,8 @@ pub mod compare;
 pub mod dict;
 pub mod elem;
 pub mod lattice;
+pub mod learn_compare;
+pub mod learning;
 pub mod louds;
 pub mod result;
 pub mod wise;
@@ -32,11 +34,30 @@ const TOP_N: usize = 9;
 pub struct KkcCore {
     dict: Dictionary,
     cache: RefCell<lattice::LookupCache>,
+    learning: RefCell<learning::Learning>,
 }
 
 impl KkcCore {
+    /// 学習なしで開く (差分テストや計測は学習の影響を受けない)。
     pub fn open() -> Result<Self, DictError> {
-        Ok(Self { dict: Dictionary::open_default()?, cache: RefCell::new(lattice::LookupCache::new()) })
+        Self::open_with_learning(learning::Learning::disabled())
+    }
+
+    pub fn open_with_learning(learning: learning::Learning) -> Result<Self, DictError> {
+        Ok(Self {
+            dict: Dictionary::open_default()?,
+            cache: RefCell::new(lattice::LookupCache::new()),
+            learning: RefCell::new(learning),
+        })
+    }
+
+    pub fn learning(&self) -> &RefCell<learning::Learning> {
+        &self.learning
+    }
+
+    /// 確定した候補のデータを学習する。
+    pub fn learn(&self, data: &[Rc<elem::Elem>]) {
+        self.learning.borrow_mut().learn(data, &|c| self.dict.char_id(c) != 255);
     }
 
     pub fn dictionary(&self) -> &Dictionary {
@@ -50,7 +71,8 @@ impl KkcCore {
         }
         let chars = lattice::katakana_chars(reading);
         let katakana: String = chars.iter().collect();
-        let mut lat = lattice::Lattice::build(&self.dict, &mut self.cache.borrow_mut(), &chars);
+        let learning = self.learning.borrow();
+        let mut lat = lattice::Lattice::build_with_memory(&self.dict, &mut self.cache.borrow_mut(), Some(&learning), &chars);
         lat.run(&self.dict, N_BEST);
         result::process(&self.dict, &lat, &katakana)
     }
@@ -65,7 +87,7 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
     CORE.with(|c| {
         let mut slot = c.borrow_mut();
         if slot.is_none() {
-            match KkcCore::open() {
+            match KkcCore::open_with_learning(learning::Learning::from_env()) {
                 Ok(core) => *slot = Some(Rc::new(core)),
                 Err(e) => {
                     eprintln!("novakey_r: 辞書を開けませんでした: {e}");
@@ -80,13 +102,17 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
 /// Rust 実装のかな漢字変換エンジン。
 pub struct RustEngine {
     core: Option<Rc<KkcCore>>,
-    /// 直近の変換の (revision, 返した候補数)。`select` の検証用。
-    last: Option<(u64, usize)>,
+    /// 直近の変換の revision と、返した候補ごとの `Candidate.data`。`select` の検証と学習用。
+    last: Option<(u64, Vec<Vec<Rc<elem::Elem>>>)>,
 }
 
 impl RustEngine {
     pub fn new() -> Self {
         Self { core: shared_core(), last: None }
+    }
+
+    pub fn with_core(core: Rc<KkcCore>) -> Self {
+        Self { core: Some(core), last: None }
     }
 }
 
@@ -105,20 +131,94 @@ impl CandidateEngine for RustEngine {
             return Vec::new();
         }
         let converted = core.convert_all(hiragana);
-        let texts: Vec<String> =
-            converted.main.iter().take(TOP_N).map(|c| c.text.replace('\u{1F}', "")).collect();
-        self.last = Some((revision, texts.len()));
+        let top = &converted.main[..converted.main.len().min(TOP_N)];
+        let texts: Vec<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
+        self.last = Some((revision, top.iter().map(|c| c.data.clone()).collect()));
         texts
     }
 
-    /// 学習は P4。ここでは revision と添字の検証だけして、状態を捨てる。
+    /// revision と添字を確かめて、選ばれた候補を学習する (保存まで行う)。
     fn select(&mut self, revision: u64, engine_index: usize) -> bool {
-        let ok = matches!(self.last, Some((r, n)) if r == revision && engine_index < n);
-        self.last = None;
-        ok
+        let last = self.last.take();
+        let (Some(core), Some((r, candidates))) = (&self.core, last) else {
+            return false;
+        };
+        match candidates.get(engine_index) {
+            Some(data) if r == revision => {
+                core.learn(data);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn cancel(&mut self) {
         self.last = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::learning::Learning;
+    use super::*;
+
+    fn engine(learning: Learning) -> RustEngine {
+        RustEngine::with_core(Rc::new(KkcCore::open_with_learning(learning).unwrap()))
+    }
+
+    /// 上位 9 件のうち `want` の添字。
+    fn index_of(cands: &[String], want: &str) -> usize {
+        cands.iter().position(|c| c == want).unwrap_or_else(|| panic!("{want} が候補にない: {cands:?}"))
+    }
+
+    #[test]
+    fn selected_lower_candidate_comes_first_next_time() {
+        let mut e = engine(Learning::in_memory());
+        let before = e.convert(1, "かんじ");
+        let i = index_of(&before, "幹事");
+        assert!(i > 0, "前提: 幹事は最上位ではない ({before:?})");
+        assert!(e.select(1, i));
+        let after = e.convert(2, "かんじ");
+        assert_eq!(after[0], "幹事", "{after:?}");
+    }
+
+    #[test]
+    fn learned_word_also_helps_inside_a_longer_reading() {
+        let mut e = engine(Learning::in_memory());
+        let before = e.convert(1, "かんじ");
+        assert!(e.select(1, index_of(&before, "幹事")));
+        let after = e.convert(2, "かんじをかく");
+        assert!(after[0].starts_with("幹事"), "{after:?}");
+    }
+
+    #[test]
+    fn select_with_stale_revision_or_index_learns_nothing() {
+        let mut e = engine(Learning::in_memory());
+        let cands = e.convert(5, "かんじ");
+        assert!(!e.select(6, index_of(&cands, "幹事")));
+        e.convert(7, "かんじ");
+        assert!(!e.select(7, 99));
+        assert!(e.core.as_ref().unwrap().learning().borrow().is_empty());
+        assert!(!e.select(7, 0), "select のあとは状態が捨てられる");
+    }
+
+    #[test]
+    fn learning_survives_reopening_the_file() {
+        let dir = std::env::temp_dir().join(format!("novakey-r-engine-learn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut e = engine(Learning::open(&dir));
+        let before = e.convert(1, "かんじ");
+        assert!(e.select(1, index_of(&before, "幹事")));
+        let mut e2 = engine(Learning::open(&dir));
+        assert_eq!(e2.convert(1, "かんじ")[0], "幹事");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_learning_changes_nothing() {
+        let mut e = engine(Learning::disabled());
+        let before = e.convert(1, "かんじ");
+        assert!(e.select(1, index_of(&before, "幹事")));
+        assert_eq!(e.convert(2, "かんじ"), before);
     }
 }
