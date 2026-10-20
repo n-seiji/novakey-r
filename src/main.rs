@@ -2,6 +2,7 @@ mod composer;
 mod imk;
 mod imk_client;
 mod keymap;
+mod kkc;
 mod kkc_bridge;
 mod llm_bridge;
 mod loanword;
@@ -28,6 +29,9 @@ fn main() {
         };
         let typed = args.iter().any(|a| a == "--typed");
         std::process::exit(kkc_bridge::dump(corpus, out, typed));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--kkc-check") {
+        std::process::exit(kkc::check::run_cli(args.get(i + 1).map(String::as_str)));
     }
     if let Some(i) = args.iter().position(|a| a == "--kkc-dump-numbers") {
         let (Some(out), Some(width_out)) = (args.get(i + 1), args.get(i + 2)) else {
