@@ -87,7 +87,9 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
         (P::Literal | P::Mixed, Control) => CommitThenPassThrough,
         (P::Literal | P::Mixed, Up | Down) => PassThrough,
 
-        (P::Dangling, Space | ShiftSpace) => Convert,
+        // 英語を打っている途中の Space は空白として入れる。候補を出したいときは Shift+Space。
+        (P::Dangling, Space) => CommitThenSpace,
+        (P::Dangling, ShiftSpace) => Convert,
         (P::Dangling, Enter) => Commit,
         (P::Dangling, Control) => CommitThenPassThrough,
         (P::Dangling, Up | Down) => PassThrough,

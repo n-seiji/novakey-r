@@ -450,12 +450,19 @@ mod tests {
     }
 
     #[test]
-    fn 英字で表示中のスペースは英字を第1候補にする() {
+    fn 英語の途中のスペースは英字を確定して空白を入れる() {
+        assert_eq!(typed_english("rain merge").1, "rain merge");
+    }
+
+    #[test]
+    fn 英語の途中のシフトスペースは英字を第1候補にして変換する() {
         let mut session = english_session();
-        for ch in "rain ".chars() {
+        for ch in "rain".chars() {
             session.handle(classify(ch), &ch.to_string());
         }
+        session.handle(Key::ShiftSpace, " ");
         assert_eq!(session.marked_text(), "rain");
+        assert!(matches!(session.phase(), Phase::Converting { .. }));
     }
 
     #[test]
