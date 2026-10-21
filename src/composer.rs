@@ -69,6 +69,8 @@ pub struct Composer<E: CandidateEngine> {
     base: Phase,
     /// カタカナ語に対応する英単語を引く関数。テストでは差し替える。
     english_for: fn(&str) -> Vec<String>,
+    /// 打鍵列が英単語かを判定する関数。テストでは差し替える。
+    is_english_word: fn(&str) -> bool,
     /// ひらがなの読み全体に対応する絵文字を引く関数。テストでは差し替える。
     emoji_for: fn(&str) -> Vec<String>,
     /// 変換候補に入れた絵文字。リランキングで並べ直すときに見分けるために持つ。
@@ -90,6 +92,7 @@ impl<E: CandidateEngine> Composer<E> {
             translit: String::new(),
             base: Phase::Empty,
             english_for: |_| Vec::new(),
+            is_english_word: |_| false,
             emoji_for: |_| Vec::new(),
             emoji_texts: Vec::new(),
         }
@@ -98,6 +101,12 @@ impl<E: CandidateEngine> Composer<E> {
     /// カタカナ語の英単語候補 (desktop など) を引く関数を差し込む。
     pub fn with_english(mut self, english_for: fn(&str) -> Vec<String>) -> Self {
         self.english_for = english_for;
+        self
+    }
+
+    /// 打鍵列が英単語かを判定する関数 (enter など) を差し込む。
+    pub fn with_english_word(mut self, is_english_word: fn(&str) -> bool) -> Self {
+        self.is_english_word = is_english_word;
         self
     }
 
@@ -229,13 +238,26 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// ローマ字バッファの確定結果を取り込む。Dangling なら局面を Dangling にする。
     pub fn push_flush(&mut self, flush: Flush) {
+        let english = self.is_typing_english();
         match flush {
             Flush::Empty => {}
             Flush::Kana(kana) | Flush::Dangling(kana) => self.push_input("", &kana, ""),
         }
-        if self.phase == Phase::Composing && self.has_ascii_kana() {
+        if self.phase == Phase::Composing && (english || self.has_ascii_kana()) {
             self.phase = Phase::Dangling;
         }
+    }
+
+    /// かなにしきれない打鍵が残り、打鍵列全体が 4 文字以上の英単語になっている (enter など)。
+    /// このときは英字のまま表示し、確定も英字にする。短い語は日本語の打ちかけ (in, den) と紛れるので外す。
+    pub fn is_typing_english(&self) -> bool {
+        const MIN_LEN: usize = 4;
+        let raw = self.raw();
+        self.phase == Phase::Composing
+            && !self.pending_raw.is_empty()
+            && raw.len() >= MIN_LEN
+            && raw.bytes().all(|b| b.is_ascii_lowercase())
+            && (self.is_english_word)(&raw)
     }
 
     /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。

@@ -73,6 +73,9 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 表示中の変換結果(またはかな) + 未変換のローマ字。
     pub fn marked_text(&self) -> String {
+        if self.composer.is_typing_english() {
+            return self.composer.raw();
+        }
         format!(
             "{}{}",
             self.composer.display(),
@@ -383,6 +386,67 @@ mod tests {
             }
         }
         out
+    }
+
+    fn english_session() -> Session<NullEngine> {
+        Session::new(
+            Composer::new(NullEngine).with_english_word(|w| matches!(w, "enter" | "rain" | "in")),
+        )
+    }
+
+    /// 打鍵列を流し、各打鍵後の表示と、最後に Enter で確定した文字列を返す。
+    fn typed_english(keys: &str) -> (Vec<String>, String) {
+        let mut session = english_session();
+        let mut shown = Vec::new();
+        let mut out = String::new();
+        for ch in keys.chars().chain(['\r']) {
+            for effect in session.handle(classify(ch), &ch.to_string()).effects {
+                if let Effect::Insert(text) = effect {
+                    out.push_str(&text);
+                }
+            }
+            shown.push(session.marked_text());
+        }
+        shown.pop();
+        (shown, out)
+    }
+
+    #[test]
+    fn 英単語を打ち終えた時点で英字で表示しenterで英字を確定する() {
+        let (shown, out) = typed_english("enter");
+        assert_eq!(shown, ["え", "えn", "えんt", "えんて", "enter"]);
+        assert_eq!(out, "enter");
+    }
+
+    #[test]
+    fn nで終わる英単語もenterで英字を確定する() {
+        let (shown, out) = typed_english("rain");
+        assert_eq!(shown.last().unwrap(), "rain");
+        assert_eq!(out, "rain");
+    }
+
+    #[test]
+    fn 英単語の続きを打てばかなに戻る() {
+        let (shown, out) = typed_english("rainen");
+        assert_eq!(shown[3], "rain");
+        assert_eq!(shown.last().unwrap(), "らいねn");
+        assert_eq!(out, "らいねん");
+    }
+
+    #[test]
+    fn 三文字以下の英単語はかなのまま() {
+        let (shown, out) = typed_english("inu");
+        assert_eq!(shown[1], "いn");
+        assert_eq!(out, "いぬ");
+    }
+
+    #[test]
+    fn 英字で表示中のスペースは英字を第1候補にする() {
+        let mut session = english_session();
+        for ch in "rain ".chars() {
+            session.handle(classify(ch), &ch.to_string());
+        }
+        assert_eq!(session.marked_text(), "rain");
     }
 
     #[test]

@@ -126,6 +126,7 @@ declare_class!(
                 session: RefCell::new(Session::new(
                     Composer::new(RustEngine::new())
                         .with_english(crate::loanword::english_for)
+                        .with_english_word(crate::loanword::is_english_word)
                         .with_emoji(crate::emoji::emoji_for),
                 )),
                 mode: RefCell::new(ConversionMode::Space),

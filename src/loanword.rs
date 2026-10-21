@@ -3,7 +3,7 @@
 // loanword.rs - カタカナ語 -> 英単語の表 (resources/loanwords.tsv, JMdict 由来)。
 // 表は初回参照時に一度だけ読み、ファイルが無ければ空の表として扱う。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -53,6 +53,23 @@ pub fn english_for(katakana: &str) -> Vec<String> {
     lookup(&TABLE, katakana).to_vec()
 }
 
+/// 表の英語 (open account のような句は語に分ける) のうち、小文字の英字だけの語の集合。
+pub fn words(table: &Table) -> HashSet<&str> {
+    table
+        .values()
+        .flatten()
+        .flat_map(|w| w.split(' '))
+        .filter(|w| w.bytes().all(|b| b.is_ascii_lowercase()))
+        .collect()
+}
+
+static WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| words(&TABLE));
+
+/// 打鍵列が表に載っている英単語か。
+pub fn is_english_word(typed: &str) -> bool {
+    WORDS.contains(typed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +100,12 @@ mod tests {
         let t = table();
         assert_eq!(lookup(&t, "サーバ"), ["server"]);
         assert_eq!(lookup(&t, "ライトー"), ["light", "right"]);
+    }
+
+    #[test]
+    fn 英単語の集合は句を語に分け小文字の英字だけの語を持つ() {
+        let t = parse("ア\tenter\nイ\topen account\tiPhone\tT-shirt\n");
+        assert_eq!(words(&t), HashSet::from(["enter", "open", "account"]));
     }
 
     #[test]

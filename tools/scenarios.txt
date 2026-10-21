@@ -22,6 +22,10 @@ onnna<enter>	おんな
 onna<enter>	おんあ
 enter<space><enter>	enter
 enter<enter>	enter
+open<enter>	open
+open<space><enter>	open
+rainen<enter>	らいねん
+mainichi<space><enter>	毎日
 hello<space><enter>	へっォ
 hello<space><space><enter>	hello
 world<space><enter>	world
