@@ -71,6 +71,10 @@ pub struct Composer<E: CandidateEngine> {
     english_for: fn(&str) -> Vec<String>,
     /// 打鍵列が英単語かを判定する関数。テストでは差し替える。
     is_english_word: fn(&str) -> bool,
+    /// 英語として確定したことのある語か (english_memory)。テストでは差し替える。
+    knows_english: fn(&str) -> bool,
+    /// 英語として確定した語を覚える関数。
+    learn_english: fn(&str),
     /// ひらがなの読み全体に対応する絵文字を引く関数。テストでは差し替える。
     emoji_for: fn(&str) -> Vec<String>,
     /// 変換候補に入れた絵文字。リランキングで並べ直すときに見分けるために持つ。
@@ -93,6 +97,8 @@ impl<E: CandidateEngine> Composer<E> {
             base: Phase::Empty,
             english_for: |_| Vec::new(),
             is_english_word: |_| false,
+            knows_english: |_| false,
+            learn_english: |_| {},
             emoji_for: |_| Vec::new(),
             emoji_texts: Vec::new(),
         }
@@ -107,6 +113,13 @@ impl<E: CandidateEngine> Composer<E> {
     /// 打鍵列が英単語かを判定する関数 (enter など) を差し込む。
     pub fn with_english_word(mut self, is_english_word: fn(&str) -> bool) -> Self {
         self.is_english_word = is_english_word;
+        self
+    }
+
+    /// 英語として確定した語の記憶 (git など) を差し込む。
+    pub fn with_english_memory(mut self, knows: fn(&str) -> bool, learn: fn(&str)) -> Self {
+        self.knows_english = knows;
+        self.learn_english = learn;
         self
     }
 
@@ -250,12 +263,14 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 英語を打っていると見なせる局面。英字のまま表示し、確定も英字にする。
     /// かなの途中に変換できない子音が挟まった (merge の めrげ) か、かなにしきれない打鍵が残り、
-    /// 打鍵列全体が 4 文字以上の英単語になっている (enter)。短い語は日本語の打ちかけ (in, den) と紛れるので外す。
+    /// 打鍵列全体が英語として確定したことのある語 (git) か 4 文字以上の英単語 (enter) になっている。
+    /// 表の短い語は日本語の打ちかけ (in, den) と紛れるので外す。
     pub fn is_typing_english(&self) -> bool {
         const MIN_LEN: usize = 4;
         let raw = self.raw();
         let word = || {
-            !self.pending_raw.is_empty() && raw.len() >= MIN_LEN && (self.is_english_word)(&raw)
+            !self.pending_raw.is_empty()
+                && ((self.knows_english)(&raw) || (raw.len() >= MIN_LEN && (self.is_english_word)(&raw)))
         };
         self.phase == Phase::Composing
             && raw.bytes().all(|b| b.is_ascii_lowercase())
@@ -439,6 +454,9 @@ impl<E: CandidateEngine> Composer<E> {
             Phase::Dangling => self.raw(),
             _ => self.display().to_string(),
         };
+        if self.phase == Phase::Dangling {
+            (self.learn_english)(&out);
+        }
         let learned = match self.phase {
             Phase::Converting { selected, .. } => self.candidates[selected].engine_index,
             Phase::Composing if self.live => self.candidates.first().and_then(|c| c.engine_index),

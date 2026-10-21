@@ -82,8 +82,13 @@ pub fn set_learning_allowed(allowed: bool) {
     LEARNING_ALLOWED.with(|c| c.set(allowed));
 }
 
-fn learning_allowed() -> bool {
+pub fn learning_allowed() -> bool {
     LEARNING_ALLOWED.with(std::cell::Cell::get)
+}
+
+/// 学習データの置き場所。英語の記憶 (english_memory) も同じ場所に置く。
+pub fn learning_dir() -> Option<std::path::PathBuf> {
+    learning::default_dir()
 }
 
 /// 辞書を開けなかったときに、次に開き直すまで空ける時間。コントローラ (入力クライアント) が増えるたびに

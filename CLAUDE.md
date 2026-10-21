@@ -48,7 +48,7 @@ If the dictionary cannot be opened, the failure is logged once (NSLog), reopenin
 
 ### Rules worth remembering
 - Never log or print user text (readings, candidates, surrounding text), credentials, or request bodies.
-- Learning data lives in `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` (`NOVAKEY_MEMORY_DIR` to override, `NOVAKEY_DISABLE_LEARNING=1` to turn off). Concurrent IME processes are last-writer-wins.
+- Learning data lives in `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` (`NOVAKEY_MEMORY_DIR` to override, `NOVAKEY_DISABLE_LEARNING=1` to turn off). Concurrent IME processes are last-writer-wins. Words committed as English (Dangling) go to `english.txt` in the same directory (`src/english_memory.rs`).
 - AI re-rank is off by default (`NovakeyRAIRerankEnabled`) and needs Cloudflare credentials in the Keychain (see README).
 
 ### Dependencies

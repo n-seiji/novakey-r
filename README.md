@@ -44,7 +44,7 @@ $ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -
 
 #### 学習について
 
-確定した候補は端末内の `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` に記録され、次の変換に反映されます(外部には送りません)。
+確定した候補は端末内の `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` に記録され、次の変換に反映されます(外部には送りません)。英語として確定した語 (git など) は同じ場所の `english.txt` に記録され、次からは打ちかけの時点で英字で表示されます。パスワード欄とパスワード管理アプリでは、どちらも記録しません。
 セキュア入力中、およびパスワードマネージャ(1Password、Bitwarden、キーチェーンアクセス、パスワード)では学習しません。
 
 ### 3. Install

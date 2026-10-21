@@ -442,6 +442,41 @@ mod tests {
         assert_eq!(shown[2], "bra");
     }
 
+    thread_local! {
+        static LEARNED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn remembering_session() -> Session<NullEngine> {
+        Session::new(Composer::new(NullEngine).with_english_memory(
+            |w| LEARNED.with(|l| l.borrow().iter().any(|x| x == w)),
+            |w| LEARNED.with(|l| l.borrow_mut().push(w.to_string())),
+        ))
+    }
+
+    fn shown_after(session: &mut Session<NullEngine>, keys: &str) -> String {
+        for ch in keys.chars() {
+            session.handle(classify(ch), &ch.to_string());
+        }
+        session.marked_text()
+    }
+
+    #[test]
+    fn 英語として確定した語は次から打ちかけでも英字で表示する() {
+        let mut session = remembering_session();
+        assert_eq!(shown_after(&mut session, "git"), "ぎt");
+        session.handle(Key::Enter, "\r");
+        assert_eq!(shown_after(&mut session, "git"), "git");
+        assert_eq!(shown_after(&mut session, "a"), "ぎた");
+    }
+
+    #[test]
+    fn かなで確定した語は覚えない() {
+        let mut session = remembering_session();
+        shown_after(&mut session, "gita");
+        session.handle(Key::Enter, "\r");
+        assert_eq!(shown_after(&mut session, "git"), "ぎt");
+    }
+
     #[test]
     fn 三文字以下の英単語はかなのまま() {
         let (shown, out) = typed_english("inu");

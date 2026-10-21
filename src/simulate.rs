@@ -98,6 +98,7 @@ impl Sim {
         let mut session = Session::new(Composer::new(engine)
                 .with_english(crate::loanword::english_for)
                 .with_english_word(crate::loanword::is_english_word)
+                .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
                 .with_emoji(crate::emoji::emoji_for));
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.playful = |text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string());
