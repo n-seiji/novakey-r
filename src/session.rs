@@ -434,6 +434,15 @@ mod tests {
     }
 
     #[test]
+    fn かなの途中に変換できない子音が挟まれば辞書に無い語も英字で表示する() {
+        let (shown, out) = typed_english("merge");
+        assert_eq!(shown, ["m", "め", "めr", "merg", "merge"]);
+        assert_eq!(out, "merge");
+        let (shown, _) = typed_english("branch");
+        assert_eq!(shown[2], "bra");
+    }
+
+    #[test]
     fn 三文字以下の英単語はかなのまま() {
         let (shown, out) = typed_english("inu");
         assert_eq!(shown[1], "いn");

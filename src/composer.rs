@@ -248,16 +248,18 @@ impl<E: CandidateEngine> Composer<E> {
         }
     }
 
-    /// かなにしきれない打鍵が残り、打鍵列全体が 4 文字以上の英単語になっている (enter など)。
-    /// このときは英字のまま表示し、確定も英字にする。短い語は日本語の打ちかけ (in, den) と紛れるので外す。
+    /// 英語を打っていると見なせる局面。英字のまま表示し、確定も英字にする。
+    /// かなの途中に変換できない子音が挟まった (merge の めrげ) か、かなにしきれない打鍵が残り、
+    /// 打鍵列全体が 4 文字以上の英単語になっている (enter)。短い語は日本語の打ちかけ (in, den) と紛れるので外す。
     pub fn is_typing_english(&self) -> bool {
         const MIN_LEN: usize = 4;
         let raw = self.raw();
+        let word = || {
+            !self.pending_raw.is_empty() && raw.len() >= MIN_LEN && (self.is_english_word)(&raw)
+        };
         self.phase == Phase::Composing
-            && !self.pending_raw.is_empty()
-            && raw.len() >= MIN_LEN
             && raw.bytes().all(|b| b.is_ascii_lowercase())
-            && (self.is_english_word)(&raw)
+            && (self.has_ascii_kana() || word())
     }
 
     /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。

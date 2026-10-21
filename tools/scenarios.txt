@@ -23,6 +23,8 @@ onna<enter>	おんあ
 enter<space><enter>	enter
 enter<enter>	enter
 open<enter>	open
+merge<enter>	merge
+branch<space><enter>	branch
 open<space><enter>	open
 rainen<enter>	らいねん
 mainichi<space><enter>	毎日
