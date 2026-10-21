@@ -74,8 +74,8 @@ run = """
   echo "Warning: /Library/Input Methods/NovakeyR.app was found. This older system-wide install can cause duplicate entries in Input Sources. Please remove it manually with: sudo rm -rf /Library/Input Methods/NovakeyR.app"
 pkill -x novakey_r || true
 mkdir -p "$HOME/Library/Input Methods"
-rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
-cp -R output/NovakeyR.app "$HOME/Library/Input Methods/"
+# バンドルを消して作り直すと macOS が入力ソースの一覧から外すので、中身だけ入れ替える。
+rsync -a --delete output/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
 echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
 """
 
