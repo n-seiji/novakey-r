@@ -24,6 +24,10 @@ enter<S-space><enter>	enter
 enter<enter>	enter
 open<enter>	open
 merge<enter>	merge
+artifactni<enter>	artifactに
+artifactni<space><enter>	artifactに
+artifactwotsukau<space><enter>	artifactを使う
+include<enter>	include
 git<space>merge<enter>	git merge
 enter<space>	enter 
 merge<space>	merge 
@@ -166,8 +170,9 @@ kyon<enter>	きょん
 kyon<space><enter>	きょん
 nihongo<space><enter>	日本語
 nihongo<space><space><enter>	nihongo
-githubwo<S-space><enter>	githubwo
-githubwo<S-space><space><enter>	ぎてゅbを
+githubwo<S-space><enter>	githubを
+githubwo<enter>	githubを
+githubwo<S-space><space><enter>	githubwo
 git<S-space><space><enter>	義t
 git<S-space><space><space><enter>	魏t
 git<bs><space><enter>	偽

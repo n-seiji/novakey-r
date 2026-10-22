@@ -4,6 +4,7 @@
 // 候補は {text, engine_index} で持ち、リランキング後も学習には元 index を渡す。
 // ローマ字そのまま(raw)の候補は engine_index を持たず、確定しても学習しない。
 
+use crate::english_split;
 use crate::romaji_converter::Flush;
 use crate::symbols;
 use crate::translit::{self, Form};
@@ -256,8 +257,40 @@ impl<E: CandidateEngine> Composer<E> {
             Flush::Empty => {}
             Flush::Kana(kana) | Flush::Dangling(kana) => self.push_input("", &kana, ""),
         }
+        if let Some(split) = self.english_split(true) {
+            self.fix_english_split(split);
+            return;
+        }
         if self.phase == Phase::Composing && (english || self.has_ascii_kana()) {
             self.phase = Phase::Dangling;
+        }
+    }
+
+    /// 英単語のあとに助詞などが続く組成 (artifactni → artifact + に)。finished は打ち終えたとき。
+    pub fn english_split(&self, finished: bool) -> Option<english_split::Split> {
+        if self.phase != Phase::Composing {
+            return None;
+        }
+        english_split::split(&self.raw(), finished, self.knows_english)
+    }
+
+    /// 英単語を 1 つの単位にまとめ、かな混じり (Mixed) として確定・変換できるようにする。
+    /// 変換候補は、かなの部分をエンジンで変換したものに英単語を前に付けたもの (artifactを使う)。
+    fn fix_english_split(&mut self, split: english_split::Split) {
+        let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
+        let head = Unit { kana: split.head.clone(), raw: split.head.clone(), literal: true };
+        let tail = split.tail.into_iter().map(|(raw, kana)| Unit { raw, kana, literal: false });
+        self.units = std::iter::once(head).chain(tail).collect();
+        self.pending_raw.clear();
+        self.sync_hiragana();
+        self.reset_candidates();
+        self.phase = Phase::Mixed;
+        let texts = self.engine.convert(self.generation, &tail_kana);
+        for (engine_index, text) in texts.into_iter().enumerate() {
+            let text = format!("{}{text}", split.head);
+            if !self.candidates.iter().any(|c| c.text == text) {
+                self.candidates.push(Candidate { text, engine_index: Some(engine_index) });
+            }
         }
     }
 
@@ -369,7 +402,7 @@ impl<E: CandidateEngine> Composer<E> {
         if let Some(index) = self.pending_rerank.take() {
             self.promote(index);
         }
-        if self.phase == Phase::Mixed {
+        if self.phase == Phase::Mixed && !self.candidates.iter().any(|c| c.text == self.hiragana) {
             // 表示中のかな混じりを第 1 候補にし、raw はその直後に並べる。
             self.candidates.push(Candidate {
                 text: self.hiragana.clone(),
@@ -456,6 +489,9 @@ impl<E: CandidateEngine> Composer<E> {
         };
         if self.phase == Phase::Dangling {
             (self.learn_english)(&out);
+        }
+        for unit in self.units.iter().filter(|u| u.literal) {
+            (self.learn_english)(&unit.raw);
         }
         let learned = match self.phase {
             Phase::Converting { selected, .. } => self.candidates[selected].engine_index,

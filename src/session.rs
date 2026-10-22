@@ -73,6 +73,9 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 表示中の変換結果(またはかな) + 未変換のローマ字。
     pub fn marked_text(&self) -> String {
+        if let Some(split) = self.composer.english_split(false) {
+            return split.display();
+        }
         if self.composer.is_typing_english() {
             return self.composer.raw();
         }
@@ -475,6 +478,28 @@ mod tests {
         shown_after(&mut session, "gita");
         session.handle(Key::Enter, "\r");
         assert_eq!(shown_after(&mut session, "git"), "ぎt");
+    }
+
+    #[test]
+    fn 英単語のあとの助詞はかなで表示しenterでそのまま確定する() {
+        let (shown, out) = typed_english("artifactni");
+        assert_eq!(shown.last().unwrap(), "artifactに");
+        assert_eq!(out, "artifactに");
+    }
+
+    #[test]
+    fn 英単語のあとの助詞はスペースで変換に入り候補は一度ずつ() {
+        let mut session = english_session();
+        shown_after_english(&mut session, "artifactni ");
+        assert_eq!(session.marked_text(), "artifactに");
+        let texts: Vec<&str> = session.composer.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["artifactに", "artifactni"]);
+    }
+
+    fn shown_after_english(session: &mut Session<NullEngine>, keys: &str) {
+        for ch in keys.chars() {
+            session.handle(classify(ch), &ch.to_string());
+        }
     }
 
     #[test]
