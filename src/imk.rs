@@ -420,6 +420,8 @@ impl NovakeyRInputController {
             secure_input: platform::is_secure_input_enabled(),
             bundle_id: bundle_id.as_deref(),
             preceding: &preceding,
+            reading: &job.hiragana,
+            candidates: &job.candidates,
         };
         let context = match outbound::decide(&snapshot) {
             Outbound::Skip(reason) => {

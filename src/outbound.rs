@@ -33,6 +33,9 @@ pub struct Snapshot<'a> {
     pub secure_input: bool,
     pub bundle_id: Option<&'a str>,
     pub preceding: &'a str,
+    /// 組成中の読みと候補も外へ出るので、文脈と同じ検査にかける。
+    pub reading: &'a str,
+    pub candidates: &'a [String],
 }
 
 /// パスワードを扱うアプリ。外への送信も、学習も止める。
@@ -143,6 +146,9 @@ pub fn decide(s: &Snapshot) -> Outbound {
     if s.bundle_id.is_some_and(|id| DENIED_APPS.contains(&id)) {
         return Outbound::Skip(Reason::DeniedApp);
     }
+    if let Some(name) = find_secret(s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(c))) {
+        return Outbound::Skip(Reason::SecretPattern(name));
+    }
     let context = current_sentence(s.preceding);
     match find_secret(context) {
         Some(name) => Outbound::WithoutContext(Reason::SecretPattern(name)),
@@ -155,7 +161,7 @@ mod tests {
     use super::*;
 
     fn decide_text(preceding: &str) -> Outbound {
-        decide(&Snapshot { secure_input: false, bundle_id: Some("com.apple.TextEdit"), preceding })
+        decide(&Snapshot { secure_input: false, bundle_id: Some("com.apple.TextEdit"), preceding, reading: "", candidates: &[] })
     }
 
     fn secret(name: &'static str) -> Outbound {
@@ -164,20 +170,20 @@ mod tests {
 
     #[test]
     fn secure_input_skips_even_for_allowed_app() {
-        let s = Snapshot { secure_input: true, bundle_id: Some("com.apple.TextEdit"), preceding: "こんにちは" };
+        let s = Snapshot { secure_input: true, bundle_id: Some("com.apple.TextEdit"), preceding: "こんにちは", reading: "", candidates: &[] };
         assert_eq!(decide(&s), Outbound::Skip(Reason::SecureInput));
     }
 
     #[test]
     fn secure_input_takes_priority_over_denied_app() {
-        let s = Snapshot { secure_input: true, bundle_id: Some("com.apple.Terminal"), preceding: "" };
+        let s = Snapshot { secure_input: true, bundle_id: Some("com.apple.Terminal"), preceding: "", reading: "", candidates: &[] };
         assert_eq!(decide(&s), Outbound::Skip(Reason::SecureInput));
     }
 
     #[test]
     fn every_denied_app_is_skipped() {
         DENIED_APPS.iter().for_each(|id| {
-            let s = Snapshot { secure_input: false, bundle_id: Some(id), preceding: "こんにちは" };
+            let s = Snapshot { secure_input: false, bundle_id: Some(id), preceding: "こんにちは", reading: "", candidates: &[] };
             assert_eq!(decide(&s), Outbound::Skip(Reason::DeniedApp), "bundle_id={id}");
         });
     }
@@ -201,7 +207,7 @@ mod tests {
 
     #[test]
     fn unknown_or_missing_bundle_id_is_allowed() {
-        let missing = Snapshot { secure_input: false, bundle_id: None, preceding: "こんにちは" };
+        let missing = Snapshot { secure_input: false, bundle_id: None, preceding: "こんにちは", reading: "", candidates: &[] };
         assert_eq!(decide(&missing), Outbound::WithContext("こんにちは".to_string()));
         assert_eq!(decide_text("こんにちは"), Outbound::WithContext("こんにちは".to_string()));
     }
@@ -299,6 +305,32 @@ mod tests {
     fn secret_beyond_100_chars_is_not_in_context() {
         let text = format!("sk-abcdefgh12345678{}", "あ".repeat(100));
         assert_eq!(decide_text(&text), Outbound::WithContext("あ".repeat(100)));
+    }
+
+    fn decide_payload(reading: &str, candidates: &[String]) -> Outbound {
+        decide(&Snapshot {
+            secure_input: false,
+            bundle_id: Some("com.apple.TextEdit"),
+            preceding: "こんにちは",
+            reading,
+            candidates,
+        })
+    }
+
+    #[test]
+    fn secret_in_reading_skips_request() {
+        let skip = |name| Outbound::Skip(Reason::SecretPattern(name));
+        assert_eq!(decide_payload("090123456789", &[]), skip("long_digits"));
+        assert_eq!(decide_payload("あんしょうばんごう 1234 5678 9012", &[]), skip("long_digits"));
+        assert_eq!(decide_payload("ぱすわーど", &[]), Outbound::WithContext("こんにちは".to_string()));
+    }
+
+    #[test]
+    fn secret_in_any_candidate_skips_request() {
+        let candidates = vec!["今日".to_string(), "sk-abcdefgh12345678".to_string()];
+        assert_eq!(decide_payload("きょう", &candidates), Outbound::Skip(Reason::SecretPattern("api_key_prefix")));
+        let candidates = vec!["今日".to_string(), "京".to_string()];
+        assert_eq!(decide_payload("きょう", &candidates), Outbound::WithContext("こんにちは".to_string()));
     }
 
     #[test]
