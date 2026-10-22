@@ -87,6 +87,32 @@ pub enum ConversionMode {
     Space,
 }
 
+fn new_session() -> Session<RustEngine> {
+    Session::new(
+        Composer::new(RustEngine::new())
+            .with_english(crate::loanword::english_for)
+            .with_english_word(crate::loanword::is_english_word)
+            .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
+            .with_emoji(crate::emoji::emoji_for),
+    )
+}
+
+/// 生きている間 `flag` を true にし、panic で巻き戻っても false に戻す。
+struct FlagGuard<'a>(&'a Cell<bool>);
+
+impl<'a> FlagGuard<'a> {
+    fn set(flag: &'a Cell<bool>) -> Self {
+        flag.set(true);
+        Self(flag)
+    }
+}
+
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 pub struct Ivars {
     session: RefCell<Session<RustEngine>>,
     mode: RefCell<ConversionMode>,
@@ -97,7 +123,10 @@ pub struct Ivars {
     /// 候補パネルがハイライトしている行。パネルの行番号 API は使えないので、こちらで追跡する。
     panel_line: Cell<usize>,
     /// クライアントの bundle id。コントローラは 1 つのクライアントに付くので、最初に取れたものを使い回す。
-    bundle_id: OnceCell<Option<String>>,
+    /// 取れなかったときは入れず、次の機会に取り直す。
+    bundle_id: OnceCell<String>,
+    /// 直前に外へ出した「送らなかった / 文脈なしで送った」理由。同じ理由を打鍵ごとにログしないために持つ。
+    last_gate: Cell<Option<(&'static str, &'static str)>>,
 }
 
 declare_class!(
@@ -124,19 +153,14 @@ declare_class!(
             platform::guard(|| None, || {
                 let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
                 let this = this.set_ivars(Ivars {
-                    session: RefCell::new(Session::new(
-                        Composer::new(RustEngine::new())
-                            .with_english(crate::loanword::english_for)
-                            .with_english_word(crate::loanword::is_english_word)
-                            .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
-                            .with_emoji(crate::emoji::emoji_for),
-                    )),
+                    session: RefCell::new(new_session()),
                     mode: RefCell::new(ConversionMode::Space),
                     controller_id,
                     last_client: RefCell::new(None),
                     syncing: Cell::new(false),
                     panel_line: Cell::new(0),
                     bundle_id: OnceCell::new(),
+                    last_gate: Cell::new(None),
                 });
                 // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
                 let this: Option<Id<Self>> = unsafe {
@@ -164,7 +188,7 @@ declare_class!(
         /// キー入力の唯一の入口。候補パネル表示中も先にここへ届く (make_panel 参照)。
         #[method(handleEvent:client:)]
         fn handle_event(&self, event: Option<&AnyObject>, client: Option<&AnyObject>) -> Bool {
-            platform::guard(|| Bool::NO, || {
+            self.guard_session(|| Bool::NO, || {
                 let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
                     return Bool::NO;
                 };
@@ -222,7 +246,7 @@ declare_class!(
 
         #[method(candidateSelectionChanged:)]
         fn candidate_selection_changed(&self, candidate_string: Option<&AnyObject>) {
-            platform::guard(|| (), || {
+            self.guard_session(|| (), || {
                 if self.ivars().syncing.get() {
                     return;
                 }
@@ -249,7 +273,7 @@ declare_class!(
 
         #[method(candidateSelected:)]
         fn candidate_selected(&self, candidate_string: Option<&AnyObject>) {
-            platform::guard(|| (), || {
+            self.guard_session(|| (), || {
                 let Some(client) = self.client() else { return };
                 let Some(text) = candidate_string.and_then(platform::candidate_text) else {
                     return;
@@ -306,7 +330,7 @@ declare_class!(
 
         #[method(toggleConversionMode:)]
         fn toggle_conversion_mode(&self, _sender: *mut AnyObject) {
-            platform::guard(|| (), || {
+            self.guard_session(|| (), || {
                 let new_mode = {
                     let mut mode = self.ivars().mode.borrow_mut();
                     *mode = match *mode {
@@ -328,7 +352,7 @@ declare_class!(
 
         #[method(commitComposition:)]
         fn commit_composition(&self, client: Option<&AnyObject>) {
-            platform::guard(|| (), || {
+            self.guard_session(|| (), || {
                 let client = client.map(Client::new);
                 self.sync_rerank_flag();
                 self.sync_learning_flag(client.as_ref());
@@ -354,15 +378,53 @@ impl NovakeyRInputController {
             rerank_allowed(ai_rerank_enabled(), credentials_missing());
     }
 
+    /// session を触るコールバックを panic から守る。panic した時点で session / composer は中途半端かもしれないので、
+    /// 作り直して画面側 (候補パネル・マーク文字・AI 要求) も揃えてから fallback を返す。
+    fn guard_session<T>(&self, fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
+        platform::guard(
+            || {
+                self.reset_after_panic();
+                fallback()
+            },
+            f,
+        )
+    }
+
+    fn reset_after_panic(&self) {
+        // ここで再び panic すると abort するので、これ自体も守る。
+        platform::guard(|| (), || {
+            let ivars = self.ivars();
+            if let Ok(mut session) = ivars.session.try_borrow_mut() {
+                *session = new_session();
+            }
+            llm_bridge::cancel(ivars.controller_id);
+            platform::hide_candidates();
+            ivars.syncing.set(false);
+            ivars.panel_line.set(0);
+            if let Some(client) = self.client() {
+                client.set_marked("");
+            }
+        });
+    }
+
+    /// クライアントの bundle id (学習判定と AI 送信判定で共通)。最初に取れたものを使い回す。
+    fn bundle_id(&self, client: Option<&Client>) -> Option<&str> {
+        let cell = &self.ivars().bundle_id;
+        if cell.get().is_none() {
+            let fetched = match client {
+                Some(client) => client.bundle_id(),
+                None => self.client().and_then(|c| c.bundle_id()),
+            };
+            if let Some(id) = fetched {
+                let _ = cell.set(id);
+            }
+        }
+        cell.get().map(String::as_str)
+    }
+
     /// 確定が起きうる処理の前に、学習してよい場面かを kkc に伝える。
     fn sync_learning_flag(&self, client: Option<&Client>) {
-        let bundle_id = match self.ivars().bundle_id.get() {
-            Some(known) => known.as_deref(),
-            None => match client.or(self.ivars().last_client.borrow().as_ref()) {
-                Some(client) => self.ivars().bundle_id.get_or_init(|| client.bundle_id()).as_deref(),
-                None => None,
-            },
-        };
+        let bundle_id = self.bundle_id(client);
         kkc::set_learning_allowed(outbound::learning_allowed(platform::is_secure_input_enabled(), bundle_id));
     }
 
@@ -417,14 +479,14 @@ impl NovakeyRInputController {
     fn show_candidates(&self, selected: usize) {
         // IMKCandidates は candidates: / candidateSelectionChanged: を同期で呼び戻し、session を再借用する。
         // ここでは借用を持っていない。
-        self.ivars().syncing.set(true);
+        let _syncing = FlagGuard::set(&self.ivars().syncing);
         if platform::show_candidates() {
             self.ivars().panel_line.set(0);
         }
         let delta = selected as isize - self.ivars().panel_line.get() as isize;
         platform::move_candidate_highlight(delta);
         self.ivars().panel_line.set(selected);
-        self.ivars().syncing.set(false);
+        drop(_syncing);
         trace::record("select", &format!("line={selected} moved={delta}"));
     }
 
@@ -435,26 +497,28 @@ impl NovakeyRInputController {
             .as_ref()
             .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
             .unwrap_or_default();
-        let bundle_id = client.as_ref().and_then(Client::bundle_id);
         let snapshot = Snapshot {
             secure_input: platform::is_secure_input_enabled(),
-            bundle_id: bundle_id.as_deref(),
+            bundle_id: self.bundle_id(client.as_ref()),
             preceding: &preceding,
             reading: &job.hiragana,
             candidates: &job.candidates,
         };
         let context = match outbound::decide(&snapshot) {
             Outbound::Skip(reason) => {
-                platform::log(&format!("LLM rerank skipped: {}", reason.name()));
+                self.log_gate(Some(("skipped", reason.name())));
                 // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
                 llm_bridge::cancel(self.ivars().controller_id);
                 return;
             }
             Outbound::WithoutContext(reason) => {
-                platform::log(&format!("LLM rerank without context: {}", reason.name()));
+                self.log_gate(Some(("without context", reason.name())));
                 String::new()
             }
-            Outbound::WithContext(context) => context,
+            Outbound::WithContext(context) => {
+                self.log_gate(None);
+                context
+            }
         };
         llm_bridge::rerank_async(
             self.ivars().controller_id,
@@ -464,6 +528,15 @@ impl NovakeyRInputController {
             &job.candidates,
             urgent,
         );
+    }
+
+    /// 理由が前回と変わったときだけログする (打鍵ごとに同じ行が出ないように)。名前だけで入力は含まない。
+    fn log_gate(&self, gate: Option<(&'static str, &'static str)>) {
+        if self.ivars().last_gate.replace(gate) != gate {
+            if let Some((kind, reason)) = gate {
+                platform::log(&format!("LLM rerank {kind}: {reason}"));
+            }
+        }
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
@@ -514,7 +587,25 @@ const CONTEXT_MAX_UTF16: usize = 200;
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_llm_result, rerank_allowed};
+    use std::cell::Cell;
+
+    use super::{accepts_llm_result, rerank_allowed, FlagGuard};
+
+    #[test]
+    fn flag_guard_clears_the_flag_on_drop_and_on_panic() {
+        let flag = Cell::new(false);
+        {
+            let _guard = FlagGuard::set(&flag);
+            assert!(flag.get());
+        }
+        assert!(!flag.get());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = FlagGuard::set(&flag);
+            panic!("boom");
+        }));
+        assert!(unwound.is_err());
+        assert!(!flag.get());
+    }
 
     #[test]
     fn results_are_ignored_once_ai_is_turned_off() {
