@@ -1,2 +1,92 @@
 [tools]
 rust = "latest"
+uv = "latest"
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run unit tests"
+run = "cargo test"
+
+[tasks.test-llm]
+description = "LLM候補リランキングのスモークテスト"
+run = "cargo run --release -- --test-llm"
+
+
+[tasks.simulate]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
+run = "cargo run --release -- --simulate"
+
+[tasks.scenarios]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
+run = "cargo run --release -- --simulate-file tools/scenarios.txt"
+
+[tasks.scenarios-learning]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"
+run = "NOVAKEY_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learning_scenarios.txt"
+
+
+
+
+[tasks.kkc-compare]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+description = "Rust 版 KKC を azooKey (Swift) 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
+depends = ["build"]
+run = "./target/release/novakey_r --kkc-compare"
+
+[tasks.reset-memory]
+description = "変換学習データを全消去する"
+run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"
+
+[tasks.app]
+description = "Package the release binary into output/NovakeyR.app"
+depends = ["build"]
+run = """
+rm -rf output/NovakeyR.app
+mkdir -p output/NovakeyR.app/Contents/MacOS
+mkdir -p output/NovakeyR.app/Contents/Resources
+cp Info.plist output/NovakeyR.app/Contents/
+cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
+cp -R resources/. output/NovakeyR.app/Contents/Resources/
+cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
+cp NOTICE output/NovakeyR.app/Contents/Resources/NOTICE
+"""
+
+[tasks.clean]
+description = "Remove the generated app bundle"
+run = "rm -rf output/NovakeyR.app"
+
+[tasks.run]
+description = "Run the packaged binary directly (smoke test)"
+depends = ["app"]
+run = "./output/NovakeyR.app/Contents/MacOS/novakey_r"
+
+[tasks.install]
+description = "Install NovakeyR.app into ~/Library/Input Methods (no sudo needed)"
+depends = ["app"]
+run = """
+[ -d "/Library/Input Methods/NovakeyR.app" ] && \
+  echo "Warning: /Library/Input Methods/NovakeyR.app was found. This older system-wide install can cause duplicate entries in Input Sources. Please remove it manually with: sudo rm -rf /Library/Input Methods/NovakeyR.app"
+pkill -x novakey_r || true
+mkdir -p "$HOME/Library/Input Methods"
+# バンドルを消して作り直すと macOS が入力ソースの一覧から外すので、中身だけ入れ替える。
+rsync -a --delete output/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
+echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
+"""
+
+[tasks.uninstall]
+description = "Remove NovakeyR.app from ~/Library/Input Methods"
+run = """
+pkill -x novakey_r || true
+rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
+echo "Uninstalled NovakeyR."
+"""
+
+[tasks.logs]
+description = "Stream NSLog output from the running IME"
+run = "log stream --predicate 'process == \"novakey_r\"'"

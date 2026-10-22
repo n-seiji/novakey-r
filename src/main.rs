@@ -1,34 +1,52 @@
-use cocoa::appkit::{NSApp, NSApplication};
-use cocoa::base::{id, nil, BOOL};
-use cocoa::foundation::{NSAutoreleasePool, NSString};
-
-#[macro_use]
-extern crate objc;
-
+mod composer;
 mod imk;
+mod imk_client;
+mod keymap;
+mod kkc;
+mod llm_bridge;
+mod emoji;
+mod english_memory;
+mod english_split;
+mod loanword;
+mod outbound;
+mod platform;
+mod rerank;
+mod romaji_converter;
+mod session;
+mod simulate;
+mod symbols;
+mod trace;
+mod translit;
 
 fn main() {
-    imk::register_controller();
-
-    unsafe {
-        let _pool = NSAutoreleasePool::new(nil);
-        let app = NSApp();
-        let k_connection_name = NSString::alloc(nil).init_str("me.sijis.inputmethod.NovakeyR_Connection");
-        let nib_name = NSString::alloc(nil).init_str("MainMenu");
-
-        // TODO: cocoa の NSbundle に置き換えたいかも
-        let bundle: id = msg_send![class!(NSBundle), mainBundle];
-        let identifer: id = msg_send![bundle, bundleIdentifier];
-
-        imk::describe(identifer);
-        imk::describe(nib_name);
-        imk::describe(k_connection_name);
-
-        // NOTE: OBJC 風の書き方を調べる
-        imk::connect_imkserver(k_connection_name, identifer);
-
-        let _: BOOL = msg_send![class!(NSBundle), loadNibNamed:nib_name
-                                owner:app];
-        app.run()
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--kkc-check") {
+        std::process::exit(kkc::check::run_cli(args.get(i + 1).map(String::as_str)));
     }
+    if args.iter().any(|a| a == "--kkc-compare") {
+        std::process::exit(kkc::compare::run(&args));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--kkc-convert") {
+        std::process::exit(kkc::compare::convert_cli(args.get(i + 1).map_or("", String::as_str), args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(30)));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
+        std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--simulate") {
+        simulate::simulate(args.get(i + 1).map_or("", String::as_str));
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--simulate-file") {
+        simulate::simulate_file(args.get(i + 1).map_or("", String::as_str));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--test-llm") {
+        llm_bridge::smoke_test();
+        return;
+    }
+
+    imk::register_controller();
+    imk::init_llm_dispatch();
+    imk::run();
 }

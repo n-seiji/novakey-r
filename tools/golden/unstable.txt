@@ -1,0 +1,4 @@
+# 元の Swift 版 (azooKey) を SWIFT_DETERMINISTIC_HASHING なしで fresh を複数回走らせたとき結果が揺れた行 (測定済みの記録。--kkc-compare が同点扱いの参考にする)。
+# 列: 読み<TAB>seq<TAB>異なる結果の数<TAB>top3が揺れる(0/1)<TAB>top9の文字列順が揺れる(0/1)
+かんがえる		2	0	0
+かんがえる	か|かん|かんじ|かん|かんが|かんがえ|かんがえる	2	0	0
