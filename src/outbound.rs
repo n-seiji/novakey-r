@@ -149,11 +149,11 @@ pub fn decide(s: &Snapshot) -> Outbound {
     if let Some(name) = find_secret(s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(c))) {
         return Outbound::Skip(Reason::SecretPattern(name));
     }
-    let context = current_sentence(s.preceding);
-    match find_secret(context) {
-        Some(name) => Outbound::WithoutContext(Reason::SecretPattern(name)),
-        None => Outbound::WithContext(context.to_string()),
+    // 文区切りや切り詰めの前に窓全体を検査する (境界をまたぐ鍵や改行をまたぐ「パスワード\nxxx」を逃さない)。
+    if let Some(name) = find_secret(s.preceding) {
+        return Outbound::WithoutContext(Reason::SecretPattern(name));
     }
+    Outbound::WithContext(current_sentence(s.preceding).to_string())
 }
 
 #[cfg(test)]
@@ -277,11 +277,9 @@ mod tests {
     }
 
     #[test]
-    fn secret_in_previous_sentence_does_not_block_current_one() {
-        assert_eq!(
-            decide_text("パスワードは秘密。今日は晴れ"),
-            Outbound::WithContext("今日は晴れ".to_string())
-        );
+    fn secret_in_previous_sentence_blocks_context() {
+        assert_eq!(decide_text("パスワードは秘密。今日は晴れ"), secret("secret_word"));
+        assert_eq!(decide_text("パスワード\nAbc12345"), secret("secret_word"));
     }
 
     #[test]
@@ -302,9 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn secret_beyond_100_chars_is_not_in_context() {
+    fn secret_beyond_100_chars_blocks_context() {
         let text = format!("sk-abcdefgh12345678{}", "あ".repeat(100));
-        assert_eq!(decide_text(&text), Outbound::WithContext("あ".repeat(100)));
+        assert_eq!(decide_text(&text), secret("api_key_prefix"));
+    }
+
+    #[test]
+    fn secret_straddling_the_100_char_cut_blocks_context() {
+        let text = format!("sk-abcdefgh12345678{}", "あ".repeat(85));
+        assert_eq!(decide_text(&text), secret("api_key_prefix"));
     }
 
     fn decide_payload(reading: &str, candidates: &[String]) -> Outbound {
