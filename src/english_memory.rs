@@ -91,11 +91,11 @@ pub fn learn(word: &str) {
 fn save(path: &Path, words: &[String]) {
     let result = (|| -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::private_fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension(format!("txt.tmp-{}", std::process::id()));
         let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
+            let mut file = crate::private_fs::create_file(&tmp)?;
             file.write_all((words.join("\n") + "\n").as_bytes())?;
             file.sync_all()?;
             std::fs::rename(&tmp, path)

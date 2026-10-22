@@ -560,12 +560,12 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn write_file(path: &Path, entries: &HashMap<String, Vec<MemEntry>>) {
     let result = (|| -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::private_fs::create_dir_all(dir)?;
         }
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tsv.tmp-{}-{n}", std::process::id()));
         let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
+            let mut file = crate::private_fs::create_file(&tmp)?;
             file.write_all(serialize(entries).as_bytes())?;
             file.sync_all()?;
             std::fs::rename(&tmp, path)

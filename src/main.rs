@@ -10,6 +10,7 @@ mod english_split;
 mod loanword;
 mod outbound;
 mod platform;
+mod private_fs;
 mod rerank;
 mod romaji_converter;
 mod session;

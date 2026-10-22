@@ -2,7 +2,6 @@
 
 //! 調査用のキー操作トレース。`defaults write me.sijis.inputmethod.NovakeyR NovakeyRTrace -bool true` で有効になり、
 //! ~/Library/Logs/NovakeyR/trace.log に 1 行ずつ追記する。入力文字や候補の文字列は書かない。
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,13 +21,8 @@ pub fn record(entry: &str, fields: &str) {
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let line = format!("{}.{:03} {entry} {fields}\n", now.as_secs(), now.subsec_millis());
-    let written = std::fs::create_dir_all(&dir).and_then(|()| {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("trace.log"))?
-            .write_all(line.as_bytes())
-    });
+    let written = crate::private_fs::create_dir_all(&dir)
+        .and_then(|()| crate::private_fs::open_append(&dir.join("trace.log"))?.write_all(line.as_bytes()));
     if let Err(err) = written {
         platform::log(&format!("trace write failed: {err}"));
     }
