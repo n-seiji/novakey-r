@@ -1,0 +1,90 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wordmark-dark.svg">
+  <img src="docs/assets/wordmark-light.svg" alt="NovakeyR" width="320">
+</picture>
+
+[English](README.md) · **日本語**
+
+**英語も日本語も、モードを切り替えずに打てる macOS の日本語入力。**
+
+かな漢字変換はすべて Rust で書かれ、手元の Mac の中だけで動きます。打った文字は外に送りません。
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-convert.svg" width="200" alt="あしたははれです が Space で 明日は晴れです になり、Enter で確定する"><br>
+      <b>変換</b><br>
+      <sub>Space で変換、Enter で確定。</sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-english.svg" width="200" alt="ぎ が git になり、Space を挟んで git merge と打てる"><br>
+      <b>英語はそのまま</b><br>
+      <sub>英単語は英字で。Space は空白。</sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-mixed.svg" width="200" alt="artifact のあとの wo が を になり、artifactを使う に変換される"><br>
+      <b>英語まじり</b><br>
+      <sub>artifactを使う も、続けて打てる。</sub>
+    </td>
+  </tr>
+</table>
+
+- **変換。** Space で変換し、もう一度押すと次の候補です。数字キーで選び、Enter で表示しているとおりに確定します。ローマ字の表は Google 日本語入力 (Mozc) と同じです。
+- **英語。** かなにならない英単語は英字のまま表示します (enter, merge)。英語の途中の Space は空白として入ります。一度英語で確定した語は、次から打った時点で英字になります (git)。
+- **候補。** カタカナ語の英単語 (デスクトップ → desktop) と絵文字 (ねこ → 🐈) も候補に出ます。
+- **学習。** 選んだ候補を覚えて、次から先に出します。パスワード欄とパスワード管理アプリでは覚えません。
+- **ライブ変換 (任意)。** 打ちながら変換結果を表示します。入力メニューから切り替えます。
+- **AI 並べ替え (任意)。** Cloudflare Workers AI で候補を並べ替えられます。既定はオフです。
+
+## インストール
+
+macOS 26 以降、[mise](https://mise.jdx.dev/) と Rust が必要です。
+
+```sh
+mise run install
+```
+
+`~/Library/Input Methods/NovakeyR.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
+
+## キー
+
+| キー | 動作 |
+|---|---|
+| Space | 変換 / 次の候補。英語の途中では空白 |
+| Shift+Space | 前の候補。英語の途中では変換 |
+| ↑ ↓ | 候補を移動 |
+| 1〜9 | 候補を選んで確定 |
+| Enter | 表示しているとおりに確定 |
+| Esc / Backspace | 変換を取り消す |
+| Ctrl+J / K / L / ; / : | ひらがな / カタカナ / 全角英数 / 半角カナ / 半角英数 |
+| F6〜F10 | 同上 |
+
+## AI 並べ替え (任意)
+
+候補の並べ替えに Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) を使えます。入力メニューの「AI並べ替え」で有効にし、API トークンとアカウント ID を Keychain に登録してください。
+
+```sh
+security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
+security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
+```
+
+有効にすると、候補・読み・直前の文 (最大 100 文字) を送ります。次の場合は送りません (`src/outbound.rs`)。
+
+- パスワード欄などのセキュア入力中。
+- パスワード管理アプリとターミナル (1Password, Bitwarden, キーチェーンアクセス, Terminal, iTerm2, Ghostty など)。
+- 直前の文に API キー、秘密鍵、メールアドレス、長い数字列などが含まれるときは、直前の文だけ送りません。
+
+## データの置き場所
+
+学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。
+
+## クレジット
+
+- かな漢字変換 (`src/kkc/`) は [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) (MIT, © 2023 Miwa / Ensan) を Rust に移植したものです。
+- 変換辞書 (`dictionary/`) は [azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage) (Apache-2.0) のデータです。
+- ローマ字の表 (`src/romaji_table.tsv`) は [Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.) です。
+- カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
+- 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
+- ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
+
+ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。

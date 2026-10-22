@@ -1,74 +1,90 @@
-# [WIP]NovakeyR
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wordmark-dark.svg">
+  <img src="docs/assets/wordmark-light.svg" alt="NovakeyR" width="320">
+</picture>
 
-NovakeyR は、LLMと単語辞書をかけ合わせた macOS 向け IME です。すべて Rust で書かれており、Swift ランタイムには依存しません。
+**English** · [日本語](README.ja.md)
 
-## 動作例
+**A Japanese input method for macOS that lets you type English without switching modes.**
 
-comming soon.
+Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you type stays there.
 
-## 動作環境
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-convert.svg" width="200" alt="あしたははれです becomes 明日は晴れです with Space and is committed with Enter"><br>
+      <b>Convert</b><br>
+      <sub>Space to convert, Enter to commit.</sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-english.svg" width="200" alt="ぎ turns into git, and git merge is typed with a plain space"><br>
+      <b>English as you type it</b><br>
+      <sub>English words stay English. Space is a space.</sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/assets/tile-mixed.svg" width="200" alt="wo after artifact becomes を and converts to artifactを使う"><br>
+      <b>Mixed</b><br>
+      <sub>Type artifactを使う in one go.</sub>
+    </td>
+  </tr>
+</table>
 
-macOS　26
+- **Conversion.** Space converts, and pressing it again moves to the next candidate. Number keys pick one. Enter commits exactly what is shown. The romaji table is the same as Google Japanese Input (Mozc).
+- **English.** English words that cannot become kana stay in English letters (enter, merge). Space in the middle of English inserts a space. A word you have committed as English shows up in English from then on (git).
+- **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
+- **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
+- **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
+- **AI reranking (optional).** Cloudflare Workers AI can reorder candidates. Off by default.
 
-## 使い方
+## Install
 
-### 1. ビルド ・ パッケージの出力
-
-```sh
-$ mise run app
-```
-
-`output/NovakeyR.app` が出力されます
-
-### 2. Cloudflare 認証情報の登録
-
-候補のリランキングに Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) を使います。
-API トークン(Workers AI の権限が必要)とアカウント ID を macOS の Keychain に登録してください。
-`-w` の後ろに値を書かないと、対話プロンプトで入力できます(コマンド履歴に残りません)。
-
-```sh
-$ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
-$ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
-```
-
-未登録の場合、リランキングは無効になり辞書変換のみで動作します。登録後は IME の再起動が必要です。
-
-#### Cloudflare に送られる情報とガード
-
-リランキングのたびに、変換候補・読み(ひらがな)・直前の文(最大100文字)を Cloudflare Workers AI に送信します。
-次の場合は送信を制限します(`src/outbound.rs`)。
-
-1. セキュア入力中(パスワード欄など)は、リランキング自体を行いません。
-2. パスワードマネージャ・ターミナル系アプリ(1Password、Bitwarden、キーチェーンアクセス、Terminal、iTerm2、Warp、Ghostty、kitty、Alacritty 等)では、リランキング自体を行いません。
-3. 直前の文に API キー、秘密鍵、JWT、メールアドレス、長い数字列、長いトークン風の文字列、「パスワード」などの語が含まれる場合は、直前の文を送らず候補と読みだけで行います。
-
-#### 学習について
-
-確定した候補は端末内の `~/Library/Application Support/NovakeyR/rust-learning/learning.tsv` に記録され、次の変換に反映されます(外部には送りません)。英語として確定した語 (git など) は同じ場所の `english.txt` に記録され、次からは打ちかけの時点で英字で表示されます。パスワード欄とパスワード管理アプリでは、どちらも記録しません。
-セキュア入力中、およびパスワードマネージャ(1Password、Bitwarden、キーチェーンアクセス、パスワード)では学習しません。
-
-### 3. Install
-
-NovakeyR.app を `/Library/Input Methods` 内にコピーします。
+Requires macOS 26 or later, [mise](https://mise.jdx.dev/), and Rust.
 
 ```sh
-sudo cp -r output/NovakeyR.app "/Library/Input Methods"
+mise run install
 ```
 
-再起動（または、ログアウト→再ログイン）することで有効になります。
+This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
 
-環境設定 > キーボード > 入力ソース の英語から`NovakeyR`を追加してください。
+## Keys
 
-日本語モードについては開発中です。
+| Key | What it does |
+|---|---|
+| Space | Convert / next candidate. A plain space in the middle of English |
+| Shift+Space | Previous candidate. Converts in the middle of English |
+| ↑ ↓ | Move through candidates |
+| 1–9 | Pick a candidate and commit |
+| Enter | Commit exactly what is shown |
+| Esc / Backspace | Cancel the conversion |
+| Ctrl+J / K / L / ; / : | Hiragana / katakana / full-width alphanumeric / half-width katakana / half-width alphanumeric |
+| F6–F10 | Same as above |
 
-## クレジット
+## AI reranking (optional)
 
-カタカナ語の英単語候補(`resources/loanwords.tsv`)は、[EDRDG](https://www.edrdg.org/) の JMdict から `tools/gen_loanwords.py` で生成しています。JMdict は [CC BY-SA 4.0](https://www.edrdg.org/edrdg/licence.html) で提供されています。
+NovakeyR can use Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) to reorder candidates. Turn on "AI並べ替え" in the input menu, then store your API token and account ID in the Keychain.
 
-絵文字の候補(`resources/emoji.tsv`)は、Unicode, Inc. の絵文字データと CLDR の日本語注釈([Unicode License v3](https://www.unicode.org/license.txt))を、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage)(commit 08f82252fb90ef8f0949a7e3c554e9e1787ce121)経由で取り込み、`tools/gen_emoji.py` で生成しています。
+```sh
+security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
+security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
+```
 
-ローマ字→ひらがなの変換表(`src/romaji_table.tsv`)は、[Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv`(BSD 3-Clause, Copyright Google Inc.)を元にしています。
+When it is on, NovakeyR sends the candidates, the reading, and up to 100 characters of preceding text. It sends nothing in these cases (`src/outbound.rs`):
 
-かな漢字変換(`src/kkc/`)は、[AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter)(MIT License, Copyright (c) 2023 Miwa / Ensan)を Rust に移植したものです。ライセンス全文は `NOTICE` を参照してください。
+- Secure input, such as password fields.
+- Password managers and terminals (1Password, Bitwarden, Keychain Access, Terminal, iTerm2, Ghostty, and others).
+- When the preceding text contains an API key, a private key, an email address, a long number, and the like, the preceding text is left out.
 
-変換辞書(`dictionary/`)は、[azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage)(Apache License 2.0)のデータを、予測用の `p/` を除いてそのまま収録しています。詳細は `dictionary/NOTICE` を参照してください。
+## Where data lives
+
+Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it.
+
+## Credits
+
+- Kana-kanji conversion (`src/kkc/`) is a Rust port of [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) (MIT, © 2023 Miwa / Ensan).
+- The conversion dictionary (`dictionary/`) is data from [azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage) (Apache-2.0).
+- The romaji table (`src/romaji_table.tsv`) is [Mozc](https://github.com/google/mozc)'s `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.).
+- English words for loanwords (`resources/loanwords.tsv`) are built from [EDRDG](https://www.edrdg.org/)'s JMdict (CC BY-SA 4.0).
+- Emoji (`resources/emoji.tsv`) are built from Unicode emoji data and CLDR Japanese annotations (Unicode License v3) via [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage).
+- The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
+
+Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
