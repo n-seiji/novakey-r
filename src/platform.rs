@@ -74,6 +74,15 @@ fn guarded(f: fn()) -> std::thread::Result<()> {
     std::panic::catch_unwind(f)
 }
 
+/// IMK から呼ばれるコールバック本体を panic から守る。panic が extern "C" の境界を越えると IME ごと abort するので、
+/// ここで止めて `fallback()` を返す。ペイロードにはユーザーの入力が入りうるので、ログには出さない。
+pub fn guard<T>(fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        log("panic in IMK callback (ignored)");
+        fallback()
+    })
+}
+
 /// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。
 pub fn run_on_main(f: fn()) {
     extern "C" fn trampoline(context: *mut std::ffi::c_void) {
@@ -315,6 +324,12 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guard_returns_fallback_on_panic_and_value_otherwise() {
+        assert_eq!(super::guard(|| 0, || 7), 7);
+        assert_eq!(super::guard(|| 0, || -> i32 { panic!("boom") }), 0);
+    }
+
     use super::guarded;
 
     #[test]

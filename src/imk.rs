@@ -121,200 +121,220 @@ declare_class!(
             delegate: *mut AnyObject,
             client: *mut AnyObject,
         ) -> Option<Id<Self>> {
-            let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
-            let this = this.set_ivars(Ivars {
-                session: RefCell::new(Session::new(
-                    Composer::new(RustEngine::new())
-                        .with_english(crate::loanword::english_for)
-                        .with_english_word(crate::loanword::is_english_word)
-                        .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
-                        .with_emoji(crate::emoji::emoji_for),
-                )),
-                mode: RefCell::new(ConversionMode::Space),
-                controller_id,
-                last_client: RefCell::new(None),
-                syncing: Cell::new(false),
-                panel_line: Cell::new(0),
-                bundle_id: OnceCell::new(),
-            });
-            // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
-            let this: Option<Id<Self>> = unsafe {
-                msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
-            };
-            if let Some(ref obj) = this {
-                CONTROLLERS.with(|c| match c.try_borrow_mut() {
-                    Ok(mut controllers) => {
-                        controllers.insert(controller_id, obj.clone());
-                    }
-                    Err(_) => platform::log("controller registry busy; AI results disabled for this controller"),
+            platform::guard(|| None, || {
+                let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
+                let this = this.set_ivars(Ivars {
+                    session: RefCell::new(Session::new(
+                        Composer::new(RustEngine::new())
+                            .with_english(crate::loanword::english_for)
+                            .with_english_word(crate::loanword::is_english_word)
+                            .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
+                            .with_emoji(crate::emoji::emoji_for),
+                    )),
+                    mode: RefCell::new(ConversionMode::Space),
+                    controller_id,
+                    last_client: RefCell::new(None),
+                    syncing: Cell::new(false),
+                    panel_line: Cell::new(0),
+                    bundle_id: OnceCell::new(),
                 });
-            }
-            this
+                // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。
+                let this: Option<Id<Self>> = unsafe {
+                    msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
+                };
+                if let Some(ref obj) = this {
+                    CONTROLLERS.with(|c| match c.try_borrow_mut() {
+                        Ok(mut controllers) => {
+                            controllers.insert(controller_id, obj.clone());
+                        }
+                        Err(_) => platform::log("controller registry busy; AI results disabled for this controller"),
+                    });
+                }
+                this
+            })
         }
 
         #[method(recognizedEvents:)]
         fn recognized_events(&self, _client: Option<&AnyObject>) -> usize {
-            platform::NS_EVENT_MASK_KEY_DOWN
+            platform::guard(|| 0, || {
+                platform::NS_EVENT_MASK_KEY_DOWN
+            })
         }
 
         /// キー入力の唯一の入口。候補パネル表示中も先にここへ届く (make_panel 参照)。
         #[method(handleEvent:client:)]
         fn handle_event(&self, event: Option<&AnyObject>, client: Option<&AnyObject>) -> Bool {
-            let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
-                return Bool::NO;
-            };
-            let translit = (!event.is_command_or_option)
-                .then(|| {
-                    keymap::translit_form(
-                        event.key_code,
-                        event.is_control,
-                        &event.characters_ignoring_modifiers,
-                    )
-                })
-                .flatten();
-            if translit.is_none() && (event.is_control || event.is_command_or_option) {
-                trace::record("handleEvent", "key=Shortcut action=PassThrough");
-                return Bool::NO;
-            }
-            let client = Client::new(client);
-            *self.ivars().last_client.borrow_mut() = Some(client.clone());
-            if let Some(form) = translit {
-                return Bool::new(self.dispatch(Key::Translit(form), "", &client));
-            }
-            let handled = match keymap::stroke(event.key_code, &event.characters, event.is_shift) {
-                Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
-                    self.dispatch(*key, text, &client) || handled
-                }),
-                Stroke::Navigation => {
-                    let has_pending = {
-                        let session = self.ivars().session.borrow();
-                        !session.converter.buffer().is_empty() || !session.composer.is_empty()
-                    };
-                    trace::record(
-                        "handleEvent",
-                        &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
-                    );
-                    has_pending
+            platform::guard(|| Bool::NO, || {
+                let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
+                    return Bool::NO;
+                };
+                let translit = (!event.is_command_or_option)
+                    .then(|| {
+                        keymap::translit_form(
+                            event.key_code,
+                            event.is_control,
+                            &event.characters_ignoring_modifiers,
+                        )
+                    })
+                    .flatten();
+                if translit.is_none() && (event.is_control || event.is_command_or_option) {
+                    trace::record("handleEvent", "key=Shortcut action=PassThrough");
+                    return Bool::NO;
                 }
-            };
-            Bool::new(handled)
+                let client = Client::new(client);
+                *self.ivars().last_client.borrow_mut() = Some(client.clone());
+                if let Some(form) = translit {
+                    return Bool::new(self.dispatch(Key::Translit(form), "", &client));
+                }
+                let handled = match keymap::stroke(event.key_code, &event.characters, event.is_shift) {
+                    Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
+                        self.dispatch(*key, text, &client) || handled
+                    }),
+                    Stroke::Navigation => {
+                        let has_pending = {
+                            let session = self.ivars().session.borrow();
+                            !session.converter.buffer().is_empty() || !session.composer.is_empty()
+                        };
+                        trace::record(
+                            "handleEvent",
+                            &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
+                        );
+                        has_pending
+                    }
+                };
+                Bool::new(handled)
+            })
         }
 
         #[method_id(candidates:)]
         fn candidates(&self, _sender: Option<&AnyObject>) -> Id<NSArray<NSString>> {
-            let session = self.ivars().session.borrow();
-            let texts: Vec<Id<NSString>> = session
-                .composer
-                .candidates()
-                .iter()
-                .map(|cand| NSString::from_str(&cand.text))
-                .collect();
-            NSArray::from_vec(texts)
+            platform::guard(|| NSArray::from_vec(Vec::new()), || {
+                let session = self.ivars().session.borrow();
+                let texts: Vec<Id<NSString>> = session
+                    .composer
+                    .candidates()
+                    .iter()
+                    .map(|cand| NSString::from_str(&cand.text))
+                    .collect();
+                NSArray::from_vec(texts)
+            })
         }
 
         #[method(candidateSelectionChanged:)]
         fn candidate_selection_changed(&self, candidate_string: Option<&AnyObject>) {
-            if self.ivars().syncing.get() {
-                return;
-            }
-            let Some(client) = self.client() else { return };
-            let Some(text) = candidate_string.and_then(platform::candidate_text) else {
-                return;
-            };
-            trace::record("candidateSelectionChanged", &format!("phase={:?}", self.phase()));
-            let marked = {
-                let mut session = self.ivars().session.borrow_mut();
-                session
-                    .composer
-                    .select_candidate_text(&text)
-                    .then(|| session.composer.display().to_string())
-            };
-            if let Phase::Converting { selected, .. } = self.phase() {
-                self.ivars().panel_line.set(selected);
-            }
-            if let Some(marked) = marked {
-                client.set_marked(&marked);
-            }
+            platform::guard(|| (), || {
+                if self.ivars().syncing.get() {
+                    return;
+                }
+                let Some(client) = self.client() else { return };
+                let Some(text) = candidate_string.and_then(platform::candidate_text) else {
+                    return;
+                };
+                trace::record("candidateSelectionChanged", &format!("phase={:?}", self.phase()));
+                let marked = {
+                    let mut session = self.ivars().session.borrow_mut();
+                    session
+                        .composer
+                        .select_candidate_text(&text)
+                        .then(|| session.composer.display().to_string())
+                };
+                if let Phase::Converting { selected, .. } = self.phase() {
+                    self.ivars().panel_line.set(selected);
+                }
+                if let Some(marked) = marked {
+                    client.set_marked(&marked);
+                }
+            })
         }
 
         #[method(candidateSelected:)]
         fn candidate_selected(&self, candidate_string: Option<&AnyObject>) {
-            let Some(client) = self.client() else { return };
-            let Some(text) = candidate_string.and_then(platform::candidate_text) else {
-                return;
-            };
-            trace::record("candidateSelected", &format!("phase={:?}", self.phase()));
-            self.sync_learning_flag(Some(&client));
-            let effects = self.ivars().session.borrow_mut().commit_selected(&text);
-            self.run(effects, Some(&client));
+            platform::guard(|| (), || {
+                let Some(client) = self.client() else { return };
+                let Some(text) = candidate_string.and_then(platform::candidate_text) else {
+                    return;
+                };
+                trace::record("candidateSelected", &format!("phase={:?}", self.phase()));
+                self.sync_learning_flag(Some(&client));
+                let effects = self.ivars().session.borrow_mut().commit_selected(&text);
+                self.run(effects, Some(&client));
+            })
         }
 
         #[method_id(menu)]
         fn menu(&self) -> Id<AnyObject> {
-            let mode_title = match *self.ivars().mode.borrow() {
-                ConversionMode::Live => "ライブ変換: オン",
-                ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
-            };
-            let ai_title = if ai_rerank_enabled() {
-                "AI並べ替え: オン"
-            } else {
-                "AI並べ替え: オフ"
-            };
-            let warning = (ai_rerank_enabled() && credentials_missing())
-                .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
-            platform::build_menu(
-                &[
-                    (mode_title, sel!(toggleConversionMode:)),
-                    (ai_title, sel!(toggleAIRerank:)),
-                ],
-                warning,
-            )
+            platform::guard(|| platform::build_menu(&[], None), || {
+                let mode_title = match *self.ivars().mode.borrow() {
+                    ConversionMode::Live => "ライブ変換: オン",
+                    ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
+                };
+                let ai_title = if ai_rerank_enabled() {
+                    "AI並べ替え: オン"
+                } else {
+                    "AI並べ替え: オフ"
+                };
+                let warning = (ai_rerank_enabled() && credentials_missing())
+                    .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
+                platform::build_menu(
+                    &[
+                        (mode_title, sel!(toggleConversionMode:)),
+                        (ai_title, sel!(toggleAIRerank:)),
+                    ],
+                    warning,
+                )
+            })
         }
 
         #[method(toggleAIRerank:)]
         fn toggle_ai_rerank(&self, _sender: *mut AnyObject) {
-            let enabled = !ai_rerank_enabled();
-            AI_RERANK.with(|e| e.set(enabled));
-            platform::set_defaults_bool(AI_RERANK_KEY, enabled);
-            if !enabled {
-                llm_bridge::cancel_all();
-            }
-            if enabled {
-                let avail = llm_bridge::availability();
-                set_credentials_missing(avail != llm_bridge::Availability::Available);
-                if credentials_missing() {
-                    platform::log(&format!("LLM unavailable: {:?}", avail));
+            platform::guard(|| (), || {
+                let enabled = !ai_rerank_enabled();
+                AI_RERANK.with(|e| e.set(enabled));
+                platform::set_defaults_bool(AI_RERANK_KEY, enabled);
+                if !enabled {
+                    llm_bridge::cancel_all();
                 }
-            }
+                if enabled {
+                    let avail = llm_bridge::availability();
+                    set_credentials_missing(avail != llm_bridge::Availability::Available);
+                    if credentials_missing() {
+                        platform::log(&format!("LLM unavailable: {:?}", avail));
+                    }
+                }
+            })
         }
 
         #[method(toggleConversionMode:)]
         fn toggle_conversion_mode(&self, _sender: *mut AnyObject) {
-            let new_mode = {
-                let mut mode = self.ivars().mode.borrow_mut();
-                *mode = match *mode {
-                    ConversionMode::Live => ConversionMode::Space,
-                    ConversionMode::Space => ConversionMode::Live,
+            platform::guard(|| (), || {
+                let new_mode = {
+                    let mut mode = self.ivars().mode.borrow_mut();
+                    *mode = match *mode {
+                        ConversionMode::Live => ConversionMode::Space,
+                        ConversionMode::Space => ConversionMode::Live,
+                    };
+                    *mode
                 };
-                *mode
-            };
-            let marked = {
-                let mut session = self.ivars().session.borrow_mut();
-                session.composer.set_live(new_mode == ConversionMode::Live);
-                (!session.composer.is_empty()).then(|| session.marked_text())
-            };
-            if let (Some(client), Some(marked)) = (self.client(), marked) {
-                client.set_marked(&marked);
-            }
+                let marked = {
+                    let mut session = self.ivars().session.borrow_mut();
+                    session.composer.set_live(new_mode == ConversionMode::Live);
+                    (!session.composer.is_empty()).then(|| session.marked_text())
+                };
+                if let (Some(client), Some(marked)) = (self.client(), marked) {
+                    client.set_marked(&marked);
+                }
+            })
         }
 
         #[method(commitComposition:)]
         fn commit_composition(&self, client: Option<&AnyObject>) {
-            let client = client.map(Client::new);
-            self.sync_rerank_flag();
-            self.sync_learning_flag(client.as_ref());
-            let effects = self.ivars().session.borrow_mut().commit_composition();
-            self.run(effects, client.as_ref());
+            platform::guard(|| (), || {
+                let client = client.map(Client::new);
+                self.sync_rerank_flag();
+                self.sync_learning_flag(client.as_ref());
+                let effects = self.ivars().session.borrow_mut().commit_composition();
+                self.run(effects, client.as_ref());
+            })
         }
     }
 );
