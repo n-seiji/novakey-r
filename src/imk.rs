@@ -546,6 +546,10 @@ impl NovakeyRInputController {
     }
 
     fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
+        self.guard_session(|| (), || self.apply_llm_result(generation, status, text));
+    }
+
+    fn apply_llm_result(&self, generation: u64, status: i32, text: &str) {
         if !accepts_llm_result(ai_rerank_enabled()) {
             return;
         }
