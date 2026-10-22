@@ -8,6 +8,7 @@ use regex::Regex;
 pub enum Reason {
     SecureInput,
     DeniedApp,
+    UnknownApp,
     SecretPattern(&'static str),
 }
 
@@ -17,6 +18,7 @@ impl Reason {
         match self {
             Reason::SecureInput => "secure_input",
             Reason::DeniedApp => "denied_app",
+            Reason::UnknownApp => "unknown_app",
             Reason::SecretPattern(name) => name,
         }
     }
@@ -45,6 +47,7 @@ const PASSWORD_MANAGERS: &[&str] = &[
     "com.bitwarden.desktop",
     "com.apple.keychainaccess",
     "com.apple.Passwords",
+    "org.keepassxc.keepassxc",
 ];
 
 /// 外へ送らないアプリ (パスワード管理 + ターミナル)。ターミナルは学習は止めない。
@@ -54,12 +57,14 @@ const DENIED_APPS: &[&str] = &[
     "com.bitwarden.desktop",
     "com.apple.keychainaccess",
     "com.apple.Passwords",
+    "org.keepassxc.keepassxc",
     "com.apple.Terminal",
     "com.googlecode.iterm2",
     "dev.warp.Warp-Stable",
     "com.mitchellh.ghostty",
     "net.kovidgoyal.kitty",
     "org.alacritty",
+    "com.github.wez.wezterm",
 ];
 
 const SENTENCE_ENDS: &[char] = &['。', '．', '！', '？', '!', '?', '\n'];
@@ -143,7 +148,11 @@ pub fn decide(s: &Snapshot) -> Outbound {
     if s.secure_input {
         return Outbound::Skip(Reason::SecureInput);
     }
-    if s.bundle_id.is_some_and(|id| DENIED_APPS.contains(&id)) {
+    // 送信元アプリが分からないときは、拒否リストに当たるか確認できないので送らない。
+    let Some(bundle_id) = s.bundle_id else {
+        return Outbound::Skip(Reason::UnknownApp);
+    };
+    if DENIED_APPS.contains(&bundle_id) {
         return Outbound::Skip(Reason::DeniedApp);
     }
     if let Some(name) = find_secret(s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(c))) {
@@ -206,9 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_missing_bundle_id_is_allowed() {
+    fn unknown_bundle_id_is_allowed_but_missing_one_is_skipped() {
         let missing = Snapshot { secure_input: false, bundle_id: None, preceding: "こんにちは", reading: "", candidates: &[] };
-        assert_eq!(decide(&missing), Outbound::WithContext("こんにちは".to_string()));
+        assert_eq!(decide(&missing), Outbound::Skip(Reason::UnknownApp));
         assert_eq!(decide_text("こんにちは"), Outbound::WithContext("こんにちは".to_string()));
     }
 
@@ -345,6 +354,7 @@ mod tests {
     fn reason_names_do_not_contain_input() {
         assert_eq!(Reason::SecureInput.name(), "secure_input");
         assert_eq!(Reason::DeniedApp.name(), "denied_app");
+        assert_eq!(Reason::UnknownApp.name(), "unknown_app");
         assert_eq!(Reason::SecretPattern("jwt").name(), "jwt");
     }
 }
