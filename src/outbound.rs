@@ -86,7 +86,7 @@ fn has_letter_and_digit(s: &str) -> bool {
 }
 
 fn has_ten_digits(s: &str) -> bool {
-    s.chars().filter(char::is_ascii_digit).count() >= 10
+    s.chars().filter(|c| c.is_ascii_digit() || ('０'..='９').contains(c)).count() >= 10
 }
 
 macro_rules! key_prefixes {
@@ -113,7 +113,7 @@ const SECRET_PATTERNS: &[Pattern] = &[
         regex: r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
         accept: any_match,
     },
-    Pattern { name: "long_digits", regex: r"\d[\d \-]{8,}\d", accept: has_ten_digits },
+    Pattern { name: "long_digits", regex: r"\d[\d \-　]{8,}\d", accept: has_ten_digits },
     Pattern {
         name: "high_entropy_token",
         regex: r"[A-Za-z0-9_\-+/=]{24,}",
@@ -128,14 +128,18 @@ const CONTEXT_ONLY_PATTERNS: &[Pattern] = &[Pattern {
     accept: any_match,
 }];
 
-/// 読みと候補だけにかける。確定前の入力途中 (打ちかけの鍵や番号) を送らないための早めの検査。
+/// 鍵の接頭辞だけが打たれた状態 (token 先頭、大文字小文字区別)。かな入力では接頭辞が先に確定して文脈に入るので、文脈にも読みにもかける。
+const PARTIAL_KEY_PATTERNS: &[Pattern] = &[Pattern {
+    name: "partial_key_prefix",
+    regex: concat!(r"(?:^|[^A-Za-z0-9])(?:", key_prefixes!(), ")"),
+    accept: any_match,
+}];
+
+/// 読みだけにかける。確定前の入力途中 (打ちかけの番号や長い英数字) を送らないための早めの検査。
+/// 候補にかけると「さんびゃくまん」→ 3000000、「いんたーなしょなる」→ international のような普通の変換結果で止まるので、候補には使わない。
+/// 6 桁は「100000えん」のような数字入力も止める代わりに、カード番号などの打ちかけを早く拾うための割り切り。
 const IN_PROGRESS_PATTERNS: &[Pattern] = &[
-    Pattern { name: "partial_digits", regex: r"\d(?:[ \-]?\d){5,}", accept: any_match },
-    Pattern {
-        name: "partial_key_prefix",
-        regex: concat!(r"(?:^|[^A-Za-z0-9])(?:", key_prefixes!(), ")"),
-        accept: any_match,
-    },
+    Pattern { name: "partial_digits", regex: r"\d(?:[ \-　]?\d){5,}", accept: any_match },
     Pattern { name: "long_token", regex: r"[A-Za-z0-9_\-]{12,}", accept: any_match },
 ];
 
@@ -150,9 +154,10 @@ fn compile(patterns: &[&'static [Pattern]]) -> Compiled {
 }
 
 static CONTEXT_PATTERNS: LazyLock<Compiled> =
-    LazyLock::new(|| compile(&[SECRET_PATTERNS, CONTEXT_ONLY_PATTERNS]));
-static PAYLOAD_PATTERNS: LazyLock<Compiled> =
-    LazyLock::new(|| compile(&[SECRET_PATTERNS, IN_PROGRESS_PATTERNS]));
+    LazyLock::new(|| compile(&[SECRET_PATTERNS, PARTIAL_KEY_PATTERNS, CONTEXT_ONLY_PATTERNS]));
+static READING_PATTERNS: LazyLock<Compiled> =
+    LazyLock::new(|| compile(&[SECRET_PATTERNS, PARTIAL_KEY_PATTERNS, IN_PROGRESS_PATTERNS]));
+static CANDIDATE_PATTERNS: LazyLock<Compiled> = LazyLock::new(|| compile(&[SECRET_PATTERNS]));
 
 /// 直近の文 (最後の文末記号より後ろ) の末尾 CONTEXT_MAX_CHARS 文字を trim して返す。
 fn current_sentence(preceding: &str) -> &str {
@@ -187,8 +192,9 @@ pub fn decide(s: &Snapshot) -> Outbound {
     if DENIED_APPS.contains(&bundle_id) {
         return Outbound::Skip(Reason::DeniedApp);
     }
-    let payload = &*PAYLOAD_PATTERNS;
-    if let Some(name) = find_secret(payload, s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(payload, c))) {
+    let hit = find_secret(&READING_PATTERNS, s.reading)
+        .or_else(|| s.candidates.iter().find_map(|c| find_secret(&CANDIDATE_PATTERNS, c)));
+    if let Some(name) = hit {
         return Outbound::Skip(Reason::SecretPattern(name));
     }
     // 文区切りや切り詰めの前に窓全体を検査する (境界をまたぐ鍵や改行をまたぐ「パスワード\nxxx」を逃さない)。
@@ -393,9 +399,41 @@ mod tests {
         let skip = |name| Outbound::Skip(Reason::SecretPattern(name));
         assert_eq!(decide_payload("0901234", &[]), skip("partial_digits"));
         assert_eq!(decide_payload("090-123", &[]), skip("partial_digits"));
-        assert_eq!(decide_payload("あ", &["sk-abc".to_string()]), skip("partial_key_prefix"));
-        assert_eq!(decide_payload("あ", &["ghp_".to_string()]), skip("partial_key_prefix"));
-        assert_eq!(decide_payload("あ", &["abcdefghijkl".to_string()]), skip("long_token"));
+        assert_eq!(decide_payload("sk-abc", &[]), skip("partial_key_prefix"));
+        assert_eq!(decide_payload("ghp_", &[]), skip("partial_key_prefix"));
+        assert_eq!(decide_payload("abcdefghijkl", &[]), skip("long_token"));
+        assert_eq!(decide_payload("100000えん", &[]), skip("partial_digits"));
+        assert_eq!(decide_payload("０９０１２３４", &[]), skip("partial_digits"));
+        assert_eq!(decide_payload("０９０　１２３", &[]), skip("partial_digits"));
+    }
+
+    #[test]
+    fn kana_typing_whose_candidates_look_like_digits_or_words_is_not_skipped() {
+        let ctx = Outbound::WithContext("こんにちは".to_string());
+        let c = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(decide_payload("さんびゃくまん", &c(&["300万", "3000000"])), ctx);
+        assert_eq!(decide_payload("いんたーなしょなる", &c(&["インターナショナル", "international"])), ctx);
+    }
+
+    #[test]
+    fn full_width_digits_are_counted_as_long_digits() {
+        assert_eq!(decide_text("カード４１１１ １１１１ １１１１ １１１１"), secret("long_digits"));
+        assert_eq!(decide_text("電話は０９０１２３４５６７８です"), secret("long_digits"));
+    }
+
+    #[test]
+    fn key_prefix_committed_before_the_reading_blocks_context() {
+        let candidates = vec!["abcdefghijk".to_string()];
+        let s = Snapshot {
+            secure_input: false,
+            bundle_id: Some("com.apple.TextEdit"),
+            preceding: "トークンは ghp_",
+            reading: "abcdefghijk",
+            candidates: &candidates,
+        };
+        assert!(!matches!(decide(&s), Outbound::WithContext(_)));
+        assert_eq!(decide_text("鍵は sk-a1b2"), secret("partial_key_prefix"));
+        assert!(matches!(decide_text("task-force を組む"), Outbound::WithContext(_)));
     }
 
     #[test]
