@@ -2,3 +2,6 @@
 output
 target
 .serena/
+
+# 計画・設計メモはコミットしない
+docs/superpowers/
