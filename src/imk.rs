@@ -394,8 +394,14 @@ impl NovakeyRInputController {
         // ここで再び panic すると abort するので、これ自体も守る。
         platform::guard(|| (), || {
             let ivars = self.ivars();
-            if let Ok(mut session) = ivars.session.try_borrow_mut() {
-                *session = new_session();
+            match ivars.session.try_borrow_mut() {
+                Ok(mut session) => {
+                    *session = new_session();
+                    // 新しい composer は非 live で始まるので、メニューの表示と同じ現在のモードに合わせ直す。
+                    let live = ivars.mode.try_borrow().is_ok_and(|m| *m == ConversionMode::Live);
+                    session.composer.set_live(live);
+                }
+                Err(_) => platform::log("reset_after_panic: session is borrowed, not recreated"),
             }
             llm_bridge::cancel(ivars.controller_id);
             platform::hide_candidates();
