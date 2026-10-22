@@ -85,10 +85,21 @@ fn has_letter_and_digit(s: &str) -> bool {
     s.chars().any(|c| c.is_ascii_alphabetic()) && s.chars().any(|c| c.is_ascii_digit())
 }
 
+fn has_ten_digits(s: &str) -> bool {
+    s.chars().filter(char::is_ascii_digit).count() >= 10
+}
+
+macro_rules! key_prefixes {
+    () => {
+        "sk-|sk_live_|pk_live_|ghp_|gho_|ghs_|github_pat_|xox[abposr]-|AKIA|ASIA|AIza|cfut_|glpat-"
+    };
+}
+
+/// 文脈 (preceding)、読み、候補のどれにもかける。
 const SECRET_PATTERNS: &[Pattern] = &[
     Pattern {
         name: "api_key_prefix",
-        regex: r"(sk-|sk_live_|pk_live_|ghp_|gho_|ghs_|github_pat_|xox[abposr]-|AKIA|ASIA|AIza|cfut_|glpat-)[A-Za-z0-9_\-]{8,}",
+        regex: concat!("(", key_prefixes!(), r")[A-Za-z0-9_\-]{8,}"),
         accept: any_match,
     },
     Pattern { name: "private_key", regex: r"-----BEGIN", accept: any_match },
@@ -102,25 +113,46 @@ const SECRET_PATTERNS: &[Pattern] = &[
         regex: r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
         accept: any_match,
     },
-    Pattern { name: "long_digits", regex: r"\d[\d \-]{8,}\d", accept: any_match },
+    Pattern { name: "long_digits", regex: r"\d[\d \-]{8,}\d", accept: has_ten_digits },
     Pattern {
         name: "high_entropy_token",
         regex: r"[A-Za-z0-9_\-+/=]{24,}",
         accept: has_letter_and_digit,
     },
-    Pattern {
-        name: "secret_word",
-        regex: r"(?i)(password|passwd|passcode|secret|token|api[ _-]?key)|パスワード|暗証番号|合言葉|秘密鍵|認証コード|ワンタイム",
-        accept: any_match,
-    },
 ];
 
-static COMPILED: LazyLock<Vec<(&'static Pattern, Regex)>> = LazyLock::new(|| {
-    SECRET_PATTERNS
+/// 直前の文字列だけにかける。読みや候補に「パスワード」と打つのは普通なので、そちらには使わない。
+const CONTEXT_ONLY_PATTERNS: &[Pattern] = &[Pattern {
+    name: "secret_word",
+    regex: r"(?i)(password|passwd|passcode|secret|token|api[ _-]?key)|パスワード|暗証番号|合言葉|秘密鍵|認証コード|ワンタイム",
+    accept: any_match,
+}];
+
+/// 読みと候補だけにかける。確定前の入力途中 (打ちかけの鍵や番号) を送らないための早めの検査。
+const IN_PROGRESS_PATTERNS: &[Pattern] = &[
+    Pattern { name: "partial_digits", regex: r"\d(?:[ \-]?\d){5,}", accept: any_match },
+    Pattern {
+        name: "partial_key_prefix",
+        regex: concat!(r"(?:^|[^A-Za-z0-9])(?:", key_prefixes!(), ")"),
+        accept: any_match,
+    },
+    Pattern { name: "long_token", regex: r"[A-Za-z0-9_\-]{12,}", accept: any_match },
+];
+
+type Compiled = Vec<(&'static Pattern, Regex)>;
+
+fn compile(patterns: &[&'static [Pattern]]) -> Compiled {
+    patterns
         .iter()
-        .map(|p| (p, Regex::new(p.regex).expect("SECRET_PATTERNS の正規表現は有効")))
+        .flat_map(|table| table.iter())
+        .map(|p| (p, Regex::new(p.regex).expect("秘密パターンの正規表現は有効")))
         .collect()
-});
+}
+
+static CONTEXT_PATTERNS: LazyLock<Compiled> =
+    LazyLock::new(|| compile(&[SECRET_PATTERNS, CONTEXT_ONLY_PATTERNS]));
+static PAYLOAD_PATTERNS: LazyLock<Compiled> =
+    LazyLock::new(|| compile(&[SECRET_PATTERNS, IN_PROGRESS_PATTERNS]));
 
 /// 直近の文 (最後の文末記号より後ろ) の末尾 CONTEXT_MAX_CHARS 文字を trim して返す。
 fn current_sentence(preceding: &str) -> &str {
@@ -132,8 +164,8 @@ fn current_sentence(preceding: &str) -> &str {
         .trim()
 }
 
-fn find_secret(text: &str) -> Option<&'static str> {
-    COMPILED
+fn find_secret(patterns: &Compiled, text: &str) -> Option<&'static str> {
+    patterns
         .iter()
         .find(|(p, re)| re.find_iter(text).any(|m| (p.accept)(m.as_str())))
         .map(|(p, _)| p.name)
@@ -155,11 +187,12 @@ pub fn decide(s: &Snapshot) -> Outbound {
     if DENIED_APPS.contains(&bundle_id) {
         return Outbound::Skip(Reason::DeniedApp);
     }
-    if let Some(name) = find_secret(s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(c))) {
+    let payload = &*PAYLOAD_PATTERNS;
+    if let Some(name) = find_secret(payload, s.reading).or_else(|| s.candidates.iter().find_map(|c| find_secret(payload, c))) {
         return Outbound::Skip(Reason::SecretPattern(name));
     }
     // 文区切りや切り詰めの前に窓全体を検査する (境界をまたぐ鍵や改行をまたぐ「パスワード\nxxx」を逃さない)。
-    if let Some(name) = find_secret(s.preceding) {
+    if let Some(name) = find_secret(&CONTEXT_PATTERNS, s.preceding) {
         return Outbound::WithoutContext(Reason::SecretPattern(name));
     }
     Outbound::WithContext(current_sentence(s.preceding).to_string())
@@ -264,6 +297,10 @@ mod tests {
             "3人で12345円",
             "2026年10月18日 12時30分",
             "123456789円",
+            "2026-10-23",
+            "2020 - 2026年",
+            "1000 - 2000円",
+            "1 2 3 4 5 6",
             "abcdefghijklmnopqrstuvwxyz",
             "This is a normal English sentence",
             "",
@@ -339,7 +376,34 @@ mod tests {
         let skip = |name| Outbound::Skip(Reason::SecretPattern(name));
         assert_eq!(decide_payload("090123456789", &[]), skip("long_digits"));
         assert_eq!(decide_payload("あんしょうばんごう 1234 5678 9012", &[]), skip("long_digits"));
-        assert_eq!(decide_payload("ぱすわーど", &[]), Outbound::WithContext("こんにちは".to_string()));
+    }
+
+    #[test]
+    fn typing_a_secret_word_as_reading_or_candidate_is_not_skipped() {
+        let ctx = Outbound::WithContext("こんにちは".to_string());
+        let candidates = vec!["パスワード".to_string(), "ぱすわーど".to_string()];
+        assert_eq!(decide_payload("ぱすわーど", &candidates), ctx);
+        assert_eq!(decide_payload("ひみつかぎ", &["秘密鍵".to_string()]), ctx);
+        assert_eq!(decide_payload("あいことば", &["合言葉".to_string()]), ctx);
+        assert_eq!(decide_payload("わんたいむ", &["ワンタイム".to_string()]), ctx);
+    }
+
+    #[test]
+    fn secret_being_typed_skips_request() {
+        let skip = |name| Outbound::Skip(Reason::SecretPattern(name));
+        assert_eq!(decide_payload("0901234", &[]), skip("partial_digits"));
+        assert_eq!(decide_payload("090-123", &[]), skip("partial_digits"));
+        assert_eq!(decide_payload("あ", &["sk-abc".to_string()]), skip("partial_key_prefix"));
+        assert_eq!(decide_payload("あ", &["ghp_".to_string()]), skip("partial_key_prefix"));
+        assert_eq!(decide_payload("あ", &["abcdefghijkl".to_string()]), skip("long_token"));
+    }
+
+    #[test]
+    fn ordinary_typing_is_not_skipped() {
+        let ctx = Outbound::WithContext("こんにちは".to_string());
+        assert_eq!(decide_payload("2026ねん", &["2026年".to_string()]), ctx);
+        assert_eq!(decide_payload("ひゃくえん", &["100円".to_string()]), ctx);
+        assert_eq!(decide_payload("ですくとっぷ", &["desktop".to_string(), "task-force".to_string()]), ctx);
     }
 
     #[test]
