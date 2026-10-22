@@ -74,8 +74,18 @@ fn guarded(f: fn()) -> std::thread::Result<()> {
     std::panic::catch_unwind(f)
 }
 
+/// panic の場所 (file:line) だけを NSLog に出す panic hook を入れる。標準の hook はペイロードを stderr に出し、
+/// 文字境界の panic などはユーザーの文字列を引用してしまう。IME として起動する経路でだけ呼ぶ (開発用フラグは標準のままでよい)。
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let place = info.location().map_or_else(String::new, |l| format!("{}:{}", l.file(), l.line()));
+        log(&format!("panic at {place}"));
+    }));
+}
+
 /// IMK から呼ばれるコールバック本体を panic から守る。panic が extern "C" の境界を越えると IME ごと abort するので、
-/// ここで止めて `fallback()` を返す。ペイロードにはユーザーの入力が入りうるので、ログには出さない。
+/// ここで止めて `fallback()` を返す。ペイロードにはユーザーの入力が入りうるので、ログには出さない
+/// (標準の panic hook も payload を stderr に出すため、起動時に `install_panic_hook` で差し替える)。
 pub fn guard<T>(fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         log("panic in IMK callback (ignored)");

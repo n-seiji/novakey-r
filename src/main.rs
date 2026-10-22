@@ -47,6 +47,7 @@ fn main() {
         return;
     }
 
+    platform::install_panic_hook();
     imk::register_controller();
     imk::init_llm_dispatch();
     imk::run();
