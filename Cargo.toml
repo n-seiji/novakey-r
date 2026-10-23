@@ -7,7 +7,7 @@ rust-version = "1.85"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-objc2 = "0.5"
+objc2 = { version = "0.5", features = ["exception"] }
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSAutoreleasePool", "NSBundle", "NSRange", "NSObjCRuntime"] }
 regex = "1"
 unicode-segmentation = "1"

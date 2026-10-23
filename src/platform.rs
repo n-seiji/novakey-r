@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 //! Cocoa / InputMethodKit への薄い境界。unsafe はこのモジュールと imk_client.rs に閉じ込める。
 use std::cell::RefCell;
+use std::sync::Mutex;
 
 use objc2::rc::{autoreleasepool, Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
@@ -93,6 +94,73 @@ pub fn guard<T>(fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
         log("panic in IMK callback (ignored)");
         fallback()
     })
+}
+
+/// ホストアプリや候補パネルへの Objective-C 呼び出し `f` を実行し、NSException が投げられたら `None` にする。
+/// 例外が Rust のフレームに届くと "Rust cannot catch foreign exceptions" で IME ごと abort するので、呼び出しごとに止める。
+/// ログには例外の名前だけを、名前ごとに 1 度出す (reason にはホストのテキストが入りうるので読まない)。
+pub fn catch_objc<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let mut result = None;
+    let mut call = Some(|| result = Some(f()));
+    let mut exception: *mut objc2::ffi::objc_object = std::ptr::null_mut();
+    // 例外が通る関数は C-unwind でなければならない (extern "C" だと巻き戻しで abort する)。objc2 の catch は
+    // C-unwind を nightly 専用の feature でしか使わないので、同じ objc-sys の try_catch を直接呼ぶ。
+    let function = function_for(&call);
+    // SAFETY: C-unwind と C は呼び出し規約が同じで、違いは巻き戻しを許すかだけ。trampoline は巻き戻しを許すので、
+    // try_catch の @try が例外を受け止める。context は call への有効な可変参照で呼び出し中生存する。
+    // 返った例外は +1 retain 済みなので Id::from_raw が所有する。
+    let caught = unsafe {
+        let function = std::mem::transmute::<extern "C-unwind" fn(*mut std::ffi::c_void), extern "C" fn(*mut std::ffi::c_void)>(function);
+        objc2::ffi::try_catch(function, (&raw mut call).cast(), &raw mut exception)
+    };
+    drop(call);
+    if caught == 0 {
+        return result;
+    }
+    // SAFETY: 例外は有効な ObjC オブジェクトか NULL で、try_catch が +1 retain している。
+    let exception: Option<Id<AnyObject>> = unsafe { Id::from_raw(exception.cast()) };
+    let name = exception.as_deref().and_then(exception_name).unwrap_or_else(|| "(unknown)".to_string());
+    log_exception_once(&name);
+    None
+}
+
+extern "C-unwind" fn trampoline<G: FnOnce()>(context: *mut std::ffi::c_void) {
+    // SAFETY: context は catch_objc が渡している `&mut Option<G>` で、try_catch は 1 回しか呼ばない。
+    let call = unsafe { &mut *context.cast::<Option<G>>() };
+    if let Some(call) = call.take() {
+        call();
+    }
+}
+
+fn function_for<G: FnOnce()>(_: &Option<G>) -> extern "C-unwind" fn(*mut std::ffi::c_void) {
+    trampoline::<G>
+}
+
+fn exception_name(exception: &AnyObject) -> Option<String> {
+    // SAFETY: isKindOfClass: は Class を取り BOOL を返し、NSException の name は NSString を返す (確かめた後にだけ送る)。
+    unsafe {
+        let is_exception: Bool = msg_send![exception, isKindOfClass: class!(NSException)];
+        if !is_exception.as_bool() {
+            return None;
+        }
+        let name: Option<Id<NSString>> = msg_send_id![exception, name];
+        name.map(|n| lossy_string(&n))
+    }
+}
+
+fn log_exception_once(name: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = !seen.iter().any(|n| n == name);
+        if first {
+            seen.push(name.to_string());
+        }
+        first
+    };
+    if first {
+        log(&format!("ObjC exception in host/panel call (ignored): {name}"));
+    }
 }
 
 /// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。
@@ -255,15 +323,16 @@ pub fn show_candidates() -> bool {
         };
         // SAFETY: panel は生成済みの IMKCandidates。isVisible は BOOL を返し、updateCandidates と show: は
         // 引数の型が一致する。updateCandidates は candidates: を同期で呼び戻すので、借用を外してから呼ぶ。
-        unsafe {
+        catch_objc(|| unsafe {
             let visible: Bool = msg_send![&*panel, isVisible];
             if visible.as_bool() {
                 return false;
             }
             let _: () = msg_send![&*panel, updateCandidates];
             let _: () = msg_send![&*panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
-        }
-        true
+            true
+        })
+        .unwrap_or(false)
     })
 }
 
@@ -271,9 +340,9 @@ pub fn hide_candidates() {
     CANDIDATES_PANEL.with(|cell| {
         if let Some(panel) = cell.borrow().as_deref() {
             // SAFETY: panel は生成済みの IMKCandidates で、hide は引数なし。
-            unsafe {
+            catch_objc(|| unsafe {
                 let _: () = msg_send![panel, hide];
-            }
+            });
         }
     });
 }
@@ -288,9 +357,12 @@ pub fn move_candidate_highlight(delta: isize) {
     let action = if delta > 0 { sel!(moveDown:) } else { sel!(moveUp:) };
     for _ in 0..delta.unsigned_abs() {
         // SAFETY: panel は生成済みの IMKCandidates (NSResponder) で、moveDown: / moveUp: は sender (nil 可) を取る。
-        unsafe {
+        let moved = catch_objc(|| unsafe {
             let _: *mut AnyObject =
                 msg_send![&*panel, performSelector: action, withObject: std::ptr::null::<AnyObject>()];
+        });
+        if moved.is_none() {
+            return;
         }
     }
 }
@@ -364,6 +436,22 @@ mod tests {
         assert_eq!(lossy_string(&ns_from_units(&[0xD83D, 0xDE00, 0x3042])), "\u{1F600}あ");
         assert_eq!(lossy_string(&ns_from_units(&[])), "");
     }
+    #[test]
+    fn catch_objc_returns_the_value_when_nothing_is_thrown() {
+        assert_eq!(catch_objc(|| 7), Some(7));
+    }
+
+    #[test]
+    fn catch_objc_turns_an_nsexception_into_none() {
+        // SAFETY: NSArray の array は空配列を返し、objectAtIndex: は NSUInteger を取る。範囲外なので NSRangeException が投げられる。
+        let caught = catch_objc(|| unsafe {
+            let array: Id<AnyObject> = msg_send_id![class!(NSArray), array];
+            let _: *mut AnyObject = msg_send![&*array, objectAtIndex: 3usize];
+        });
+        assert_eq!(caught, None);
+        assert_eq!(catch_objc(|| "still works"), Some("still works"));
+    }
+
     #[test]
     fn guard_returns_fallback_on_panic_and_value_otherwise() {
         assert_eq!(super::guard(|| 0, || 7), 7);
