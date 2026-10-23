@@ -13,6 +13,8 @@ use crate::llm_bridge;
 use crate::platform;
 use crate::registry::Registry;
 use crate::outbound::Screened;
+use crate::rerank::Availability;
+use crate::rerank_gate::AiStatus;
 use crate::session::ConversionMode;
 use crate::trace;
 
@@ -21,8 +23,7 @@ static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CONTROLLERS: Registry<WeakId<NovakeyRInputController>> = Registry::new();
-    static CREDENTIALS_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static AI_RERANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AI_STATUS: std::cell::Cell<AiStatus> = const { std::cell::Cell::new(AiStatus::Off) };
 }
 
 const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
@@ -36,30 +37,16 @@ fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &
 }
 
 pub fn init_llm_dispatch() {
-    AI_RERANK.with(|e| e.set(platform::defaults_bool(AI_RERANK_KEY)));
+    set_ai_status(if platform::defaults_bool(AI_RERANK_KEY) { AiStatus::On(Availability::Ready) } else { AiStatus::Off });
     llm_bridge::set_result_handler(dispatch_llm_result);
 }
 
-fn ai_rerank_enabled() -> bool {
-    AI_RERANK.with(|e| e.get())
+fn ai_status() -> AiStatus {
+    AI_STATUS.with(|e| e.get())
 }
 
-fn credentials_missing() -> bool {
-    CREDENTIALS_MISSING.with(|e| e.get())
-}
-
-fn set_credentials_missing(missing: bool) {
-    CREDENTIALS_MISSING.with(|e| e.set(missing));
-}
-
-/// 無効時は Keychain に触れる経路(llm_bridge)へ一切進まないための門番。
-fn rerank_allowed(ai_enabled: bool, credentials_missing: bool) -> bool {
-    ai_enabled && !credentials_missing
-}
-
-/// AI をオフにした後に届いた結果は、取り消し前に配信が済んでいたものでも反映しない。
-fn accepts_llm_result(ai_enabled: bool) -> bool {
-    ai_enabled
+fn set_ai_status(status: AiStatus) {
+    AI_STATUS.with(|e| e.set(status));
 }
 
 extern_class!(
@@ -97,7 +84,7 @@ impl Environment for PlatformEnv {
     }
 
     fn rerank_allowed(&self) -> bool {
-        rerank_allowed(ai_rerank_enabled(), credentials_missing())
+        ai_status().allows_requests()
     }
 
     fn log(&self, line: &str) {
@@ -246,16 +233,13 @@ declare_class!(
                     ConversionMode::Live => "ライブ変換: オン",
                     ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
                 };
-                let ai_title = if ai_rerank_enabled() {
+                let ai_title = if ai_status().is_on() {
                     "AI並べ替え: オン"
                 } else {
                     "AI並べ替え: オフ"
                 };
-                if ai_rerank_enabled() {
-                    set_credentials_missing(llm_bridge::availability() != llm_bridge::Availability::Available);
-                }
-                let warning = (ai_rerank_enabled() && credentials_missing())
-                    .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
+                set_ai_status(ai_status().observe(llm_bridge::availability()));
+                let warning = ai_status().warning();
                 platform::build_menu(
                     &[
                         (mode_title, sel!(toggleConversionMode:)),
@@ -269,8 +253,8 @@ declare_class!(
         #[method(toggleAIRerank:)]
         fn toggle_ai_rerank(&self, _sender: *mut AnyObject) {
             platform::guard(|| (), || {
-                let enabled = !ai_rerank_enabled();
-                AI_RERANK.with(|e| e.set(enabled));
+                let enabled = !ai_status().is_on();
+                set_ai_status(if enabled { AiStatus::On(Availability::Ready) } else { AiStatus::Off });
                 platform::set_defaults_bool(AI_RERANK_KEY, enabled);
                 if !enabled {
                     llm_bridge::cancel_all();
@@ -278,7 +262,6 @@ declare_class!(
                 if enabled {
                     // Keychain の読み出しは止まりうるので待たない。結果は、メニューを開いたとき (menu) か
                     // 最初の送信の結果で警告に反映される。
-                    set_credentials_missing(false);
                     llm_bridge::prepare();
                 }
             })
@@ -323,11 +306,11 @@ impl NovakeyRInputController {
     }
 
     fn apply_llm_result(&self, generation: u64, status: i32, text: &str) {
-        if !accepts_llm_result(ai_rerank_enabled()) {
+        if !ai_status().accepts_results() {
             return;
         }
         if status == llm_bridge::STATUS_CREDENTIALS_MISSING {
-            set_credentials_missing(true);
+            set_ai_status(ai_status().observe(Availability::CredentialsMissing));
         }
         if status != llm_bridge::STATUS_OK {
             platform::log(&format!("LLM rerank error status={}", status));
@@ -357,7 +340,7 @@ pub fn run() {
 mod tests {
     use objc2::ClassType;
 
-    use super::{accepts_llm_result, rerank_allowed, NovakeyRInputController};
+    use super::NovakeyRInputController;
 
     #[test]
     fn the_controller_class_registers_with_imk_overrides() {
@@ -384,23 +367,5 @@ mod tests {
         assert_eq!(CONTROLLERS.with(|c| c.len()), before + 1);
         drop(controller);
         assert_eq!(CONTROLLERS.with(|c| c.len()), before);
-    }
-
-    #[test]
-    fn results_are_ignored_once_ai_is_turned_off() {
-        assert!(accepts_llm_result(true));
-        assert!(!accepts_llm_result(false));
-    }
-
-    #[test]
-    fn rerank_never_runs_when_ai_toggle_is_off() {
-        assert!(!rerank_allowed(false, false));
-        assert!(!rerank_allowed(false, true));
-    }
-
-    #[test]
-    fn rerank_is_blocked_when_credentials_are_missing() {
-        assert!(!rerank_allowed(true, true));
-        assert!(rerank_allowed(true, false));
     }
 }

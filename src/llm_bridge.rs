@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -16,12 +15,19 @@ use crate::rerank::{
     self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport,
 };
 
-pub use crate::rerank::{STATUS_CREDENTIALS_MISSING, STATUS_OK};
+pub use crate::rerank::{Availability, STATUS_CREDENTIALS_MISSING, STATUS_OK};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Availability {
-    Available,
-    CredentialsMissing,
+/// 時刻の取得元。デバウンスや待ち時間をテストで進められるようにする。
+trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// errSecItemNotFound。項目がない (未登録) ことを表す。
@@ -90,9 +96,6 @@ impl Transport for UreqTransport {
     }
 }
 
-/// 同時に飛ばす送信の上限。古い送信が 3 秒詰まっても、新しい (Space の) 送信を待たせないための余地。
-const MAX_IN_FLIGHT: usize = 2;
-
 /// 送信の管理。状態機械 (`State`)・Keychain・通信を差し替えられるようにして、スレッドの扱いをテストする。
 struct Engine<S: CredentialStore, T: Transport> {
     state: Mutex<State>,
@@ -100,10 +103,7 @@ struct Engine<S: CredentialStore, T: Transport> {
     store: S,
     wake: Condvar,
     transport: T,
-    /// 送信中のスレッド数。減らすときは必ず `state` のロックを持ち、ワーカーの待機を取りこぼさない。
-    in_flight: AtomicUsize,
-    /// ワーカーや送信スレッドが落ちたら立てる。以後は何も送らず、ジョブを溜めない (AI は使えない扱い)。
-    disabled: AtomicBool,
+    clock: Box<dyn Clock>,
     /// ワーカーが作った結果。メインキューの drain が取り出す。
     results: Mutex<VecDeque<Delivery>>,
     /// 結果が積まれたことをメインスレッドへ知らせる。
@@ -130,7 +130,7 @@ pub fn set_result_handler(f: ResultHandler) {
 /// 共有状態。初回にワーカースレッドを起こす。
 fn shared() -> &'static Arc<KeychainEngine> {
     SHARED.get_or_init(|| {
-        let engine = Arc::new(Engine::new(KeychainStore, UreqTransport::new(), Box::new(notify_main), Box::new(platform::log)));
+        let engine = Arc::new(Engine::new(KeychainStore, UreqTransport::new(), Box::new(SystemClock), Box::new(notify_main), Box::new(platform::log)));
         engine.start();
         engine
     })
@@ -150,14 +150,13 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
 }
 
 impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> Engine<S, T> {
-    fn new(store: S, transport: T, notify_main: Box<dyn Fn() + Send + Sync>, log: Box<dyn Fn(&str) + Send + Sync>) -> Self {
+    fn new(store: S, transport: T, clock: Box<dyn Clock>, notify_main: Box<dyn Fn() + Send + Sync>, log: Box<dyn Fn(&str) + Send + Sync>) -> Self {
         Self {
             state: Mutex::new(State::new()),
             store,
             wake: Condvar::new(),
             transport,
-            in_flight: AtomicUsize::new(0),
-            disabled: AtomicBool::new(false),
+            clock,
             results: Mutex::new(VecDeque::new()),
             notify_main,
             log,
@@ -179,20 +178,14 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
 
     /// AI を使えない扱いにする。ログは 1 度だけ (依頼内容・認証情報は含めない)。
     fn disable(&self, why: &str) {
-        if !self.disabled.swap(true, Ordering::SeqCst) {
+        if lock(&self.state).disable() {
             (self.log)(&format!("LLM rerank disabled: {why}"));
         }
-        lock(&self.state).cancel_all();
         self.wake.notify_all();
     }
 
-    fn is_disabled(&self) -> bool {
-        self.disabled.load(Ordering::SeqCst)
-    }
-
     fn release_slot(&self) {
-        let _state = lock(&self.state);
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        lock(&self.state).release_slot();
         self.wake.notify_all();
     }
 
@@ -202,7 +195,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
             let due = {
                 let mut state = lock(&self.state);
                 loop {
-                    if self.is_disabled() {
+                    if state.is_disabled() {
                         return;
                     }
                     if state.take_load_request() {
@@ -211,18 +204,14 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
                         state = lock(&self.state);
                         continue;
                     }
-                    let free = MAX_IN_FLIGHT.saturating_sub(self.in_flight.load(Ordering::SeqCst));
-                    let now = Instant::now();
-                    if free > 0 {
-                        let due = state.take_due_up_to(now, free);
-                        if !due.is_empty() {
-                            self.in_flight.fetch_add(due.len(), Ordering::SeqCst);
-                            break due;
-                        }
+                    let now = self.clock.now();
+                    let due = state.take_due(now);
+                    if !due.is_empty() {
+                        break due;
                     }
                     state = match state.next_deadline() {
                         // 空きがないときは、送信スレッドの完了通知まで待つ。
-                        Some(deadline) if free > 0 => {
+                        Some(deadline) if state.has_free_slot() => {
                             self.wake
                                 .wait_timeout(state, deadline.saturating_duration_since(now))
                                 .unwrap_or_else(PoisonError::into_inner)
@@ -264,9 +253,6 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
 
     /// 認証情報の読み出しを先に始めさせる (トグル ON 時)。
     fn prepare(&self) {
-        if self.is_disabled() {
-            return;
-        }
         lock(&self.state).request_credentials();
         self.wake.notify_one();
     }
@@ -303,10 +289,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
     }
 
     fn submit(&self, job: Job) {
-        if self.is_disabled() {
-            return;
-        }
-        let submitted = lock(&self.state).submit(Instant::now(), job);
+        let submitted = lock(&self.state).submit(self.clock.now(), job);
         if submitted.log_missing {
             (self.log)("Cloudflare認証情報なし");
         }
@@ -351,12 +334,8 @@ pub fn prepare() {
 
 /// 今分かっている状態を返すだけで、Keychain には触れない (読み出し中・未読込は使えるとみなす)。
 pub fn availability() -> Availability {
-    let Some(engine) = SHARED.get() else { return Availability::Available };
-    if lock(&engine.state).availability() {
-        Availability::Available
-    } else {
-        Availability::CredentialsMissing
-    }
+    let Some(engine) = SHARED.get() else { return Availability::Ready };
+    lock(&engine.state).availability()
 }
 
 /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済み・キャッシュ命中なら何もしない)。
@@ -446,14 +425,60 @@ mod tests {
         }
     }
 
+    /// 進めるまで動かない時計。
+    struct ManualClock(Mutex<Instant>);
+
+    impl Clock for Arc<ManualClock> {
+        fn now(&self) -> Instant {
+            *lock(&self.0)
+        }
+    }
+
+    impl ManualClock {
+        fn advance(&self, by: Duration) {
+            let mut t = lock(&self.0);
+            *t += by;
+        }
+    }
+
     struct Harness {
         engine: Arc<Engine<Store, Gate>>,
+        clock: Arc<ManualClock>,
         slow_started: mpsc::Receiver<()>,
         release: mpsc::Sender<()>,
         delivered: mpsc::Receiver<()>,
         logs: Arc<Mutex<Vec<String>>>,
         store_entered: mpsc::Receiver<()>,
         store_release: mpsc::Sender<()>,
+    }
+
+    impl Harness {
+        /// 時計を進めてワーカーを起こす。
+        fn advance(&self, by: Duration) {
+            self.clock.advance(by);
+            let _state = lock(&self.engine.state);
+            self.engine.wake.notify_all();
+        }
+
+        /// 状態が条件を満たすまで待つ。ワーカー自身が変えた状態には通知がないので、短い間隔でも見直す。
+        /// 「何も起きないこと」を待つためには使わない。
+        fn wait_until(&self, what: &str, ready: impl Fn(&State) -> bool) {
+            let deadline = Instant::now() + WAIT;
+            let mut state = lock(&self.engine.state);
+            while !ready(&state) {
+                assert!(Instant::now() < deadline, "待っていた状態にならなかった: {what}");
+                state = self
+                    .engine
+                    .wake
+                    .wait_timeout(state, Duration::from_millis(20))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+
+        fn wait_idle(&self) {
+            self.wait_until("送信中がなくなる", |s| s.in_flight() == 0);
+        }
     }
 
     fn harness(panic_on: Option<&'static str>) -> Harness {
@@ -469,6 +494,7 @@ mod tests {
         let del_tx = Mutex::new(del_tx);
         let logs = Arc::new(Mutex::new(Vec::new()));
         let log_sink = logs.clone();
+        let clock = Arc::new(ManualClock(Mutex::new(Instant::now())));
         let store = Store {
             threads: Mutex::new(Vec::new()),
             entered: Mutex::new(entered_tx),
@@ -477,13 +503,14 @@ mod tests {
         let engine = Arc::new(Engine::new(
             store,
             Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on },
+            Box::new(clock.clone()),
             Box::new(move || {
                 let _ = lock(&del_tx).send(());
             }),
             Box::new(move |m| lock(&log_sink).push(m.to_string())),
         ));
         engine.start();
-        Harness { engine, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs, store_entered: entered_rx, store_release: store_rel_tx }
+        Harness { engine, clock, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs, store_entered: entered_rx, store_release: store_rel_tx }
     }
 
     fn job(id: u64, generation: u64, reading: &str) -> Job {
@@ -533,10 +560,10 @@ mod tests {
         });
         done_rx.recv_timeout(WAIT).expect("読み出しが止まっていても、ロックで待たされない");
         let _ = h.store_release.send(());
-        assert!(h.delivered.recv_timeout(Duration::from_millis(300)).is_err(), "取り消した要求の結果は届かない");
         h.engine.submit(job(1, 3, "fast3"));
         h.delivered.recv_timeout(WAIT).expect("読み出しが済めば送れる");
-        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(3));
+        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(3), "取り消した世代 2 の結果は届かない");
+        assert!(h.engine.pop_result().is_none());
     }
 
     #[test]
@@ -549,8 +576,8 @@ mod tests {
         let d = h.engine.pop_result().expect("結果");
         assert_eq!((d.generation, d.status), (2, rerank::STATUS_OK));
         let _ = h.release.send(());
-        // 古い世代の結果は、返ってきても配信されない。
-        std::thread::sleep(Duration::from_millis(200));
+        // 古い世代の結果は、返ってきても配信されない。送信スレッドが終わる (枠が返る) のを待ってから確かめる。
+        h.wait_idle();
         assert!(h.engine.pop_result().is_none());
     }
 
@@ -561,15 +588,18 @@ mod tests {
         h.slow_started.recv_timeout(WAIT).unwrap();
         h.engine.cancel(1);
         let _ = h.release.send(());
-        std::thread::sleep(Duration::from_millis(200));
+        h.wait_idle();
         assert!(h.engine.pop_result().is_none(), "送信中だった要求の結果は採用しない");
-        // デバウンス中 (まだ送っていない) の要求も消える。
+        // デバウンス中 (まだ送っていない) の要求も消える。時計を十分進めても何も送られない。
         let mut j = job(2, 1, "fast");
         j.urgent = false;
         h.engine.submit(j);
         h.engine.cancel(2);
-        assert!(lock(&h.engine.state).next_deadline().is_none());
-        std::thread::sleep(Duration::from_millis(400));
+        h.advance(Duration::from_millis(400));
+        let mut state = lock(&h.engine.state);
+        assert!(state.next_deadline().is_none());
+        assert!(state.take_due(h.clock.now()).is_empty());
+        drop(state);
         assert!(h.engine.pop_result().is_none());
     }
 
@@ -583,8 +613,27 @@ mod tests {
         h.engine.submit(a);
         h.engine.submit(b);
         h.engine.cancel_all();
-        std::thread::sleep(Duration::from_millis(400));
+        h.advance(Duration::from_millis(400));
+        let mut state = lock(&h.engine.state);
+        assert!(state.next_deadline().is_none());
+        assert!(state.take_due(h.clock.now()).is_empty());
+        drop(state);
         assert!(h.engine.pop_result().is_none());
+    }
+
+    #[test]
+    fn a_debounced_request_is_sent_when_the_injected_clock_reaches_its_deadline() {
+        let h = harness(None);
+        let t0 = h.clock.now();
+        let mut j = job(1, 1, "fast");
+        j.urgent = false;
+        h.engine.submit(j);
+        // 先に認証情報の読み出しが済むのを待ち、送信待機に入ったことを確かめる。
+        h.wait_until("送信待機に入る", |s| s.next_deadline().is_some());
+        assert_eq!(lock(&h.engine.state).next_deadline(), Some(t0 + rerank::DEBOUNCE), "期限は注入した時計から決まる");
+        h.advance(rerank::DEBOUNCE);
+        h.delivered.recv_timeout(WAIT).expect("時計が期限に達すると送られる");
+        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(1));
     }
 
     #[test]
@@ -595,8 +644,13 @@ mod tests {
         }
         h.slow_started.recv_timeout(WAIT).unwrap();
         h.slow_started.recv_timeout(WAIT).unwrap();
-        assert!(h.slow_started.recv_timeout(Duration::from_millis(300)).is_err(), "3 件目は空きを待つ");
-        assert_eq!(h.engine.in_flight.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+        {
+            // 送信スレッドが動き出した時点で、枠は 2 つとも埋まっている。3 件目は待機に残る。
+            let state = lock(&h.engine.state);
+            assert_eq!(state.in_flight(), rerank::MAX_IN_FLIGHT);
+            assert!(!state.has_free_slot());
+            assert!(state.next_deadline().is_some(), "3 件目は空きを待つ");
+        }
         let _ = h.release.send(());
         h.slow_started.recv_timeout(WAIT).expect("空きができたら 3 件目が始まる");
         let _ = h.release.send(());
@@ -607,14 +661,10 @@ mod tests {
     fn a_panicking_sender_disables_ai_and_logs_once() {
         let h = harness(Some("boom"));
         h.engine.submit(job(1, 1, "boom"));
-        let deadline = Instant::now() + WAIT;
-        while !h.engine.is_disabled() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(h.engine.is_disabled());
+        h.wait_until("無効化される", State::is_disabled);
+        assert_eq!(lock(&h.engine.state).availability(), Availability::Disabled);
         h.engine.submit(job(1, 2, "fast"));
         h.engine.submit(job(1, 3, "fast"));
-        std::thread::sleep(Duration::from_millis(100));
         assert!(h.engine.pop_result().is_none(), "無効化後は何も送らない");
         assert!(lock(&h.engine.state).next_deadline().is_none(), "ジョブを溜めない");
         let logs = lock(&h.logs);
