@@ -36,3 +36,23 @@ kyouTokyo<enter>	きょうTokyo
 kyouT<bs><enter>	きょう
 iPhone<space><bs><enter>	いPhone
 neko<space><enter>	猫
+# IMK 側のイベントのトークン (<pick:N> <highlight:N> <live> <space-mode> <commit-all> <ai-on> <rerank:N> <rerank-old:N>) を使う行。番号は 1 起点。
+kyou<space><space><pick:1>	強
+kyou<space><space><pick:3>	今日
+kyou<space><space><highlight:3><enter>	今日
+kyou<space><space><down><highlight:1><enter>	強
+kyou<space><highlight:2><enter>	kyou
+kyou<live><enter>	強
+kyou<live>a<enter>	強あ
+kyou<space><live><enter>	強
+kyou<space><space><live><enter>	kyou
+kyou<live><space-mode><enter>	きょう
+kyou<commit-all>	きょう
+kyou<space><space><down><commit-all>	今日
+<commit-all>l<enter>	l
+<ai-on>kyou<rerank:2><space><enter>	今日
+<ai-on>kyou<rerank:1><space><enter>	強
+<ai-on>kyou<space><space><rerank:3><enter>	kyou
+<ai-on>kyou<live><rerank:3><enter>	きょう
+<ai-on>kyo<rerank:3>u<rerank-old:3><space><enter>	強
+<ai-on>kyo<rerank-old:3>u<rerank:3><space><enter>	きょう

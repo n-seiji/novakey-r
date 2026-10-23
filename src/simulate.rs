@@ -5,6 +5,13 @@
 //
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
 // <C-k> (Ctrl+文字) <F6>..<F10> <lt> (`<`) <gt> (`>`)。
+//
+// IMK 側のイベント (番号は candidates 表示と同じ 1 起点):
+// <pick:N> 候補パネルで N 番目をクリック / <highlight:N> パネルのハイライトを N 番目へ /
+// <live> <space-mode> 変換モードをライブ変換 / スペース変換へ / <commit-all> 入力ソース切替などで組成を確定 /
+// <ai-on> AI 並べ替えを有効にした体にする (最初に置く。送信は記録するだけでネットワークは呼ばない) /
+// <rerank:N> 直近の AI 要求に「候補 N を選んだ」結果が届く (1 は先頭なので何も起きない) / <rerank-old:N> 最初の AI 要求に対して同じことをする
+// (要求が無ければ何もしない。世代が古ければ composer が捨てる)。
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -71,7 +78,40 @@ fn token_event(name: &str) -> Result<Event, String> {
     Ok(ev)
 }
 
-fn parse_keys(keys: &str) -> Result<Vec<(String, Event)>, String> {
+/// シナリオ 1 手。物理キーか、IMK のコールバックの再現。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Key(Event),
+    Pick(usize),
+    Highlight(usize),
+    Live,
+    SpaceMode,
+    CommitAll,
+    AiOn,
+    Rerank { n: usize, oldest: bool },
+}
+
+fn token_step(name: &str) -> Result<Step, String> {
+    let number = |arg: &str| {
+        arg.parse::<usize>().ok().filter(|&n| n >= 1).ok_or_else(|| format!("bad number in <{name}>"))
+    };
+    let step = match name.split_once(':') {
+        Some(("pick", arg)) => Step::Pick(number(arg)?),
+        Some(("highlight", arg)) => Step::Highlight(number(arg)?),
+        Some(("rerank", arg)) => Step::Rerank { n: number(arg)?, oldest: false },
+        Some(("rerank-old", arg)) => Step::Rerank { n: number(arg)?, oldest: true },
+        _ => match name {
+            "live" => Step::Live,
+            "space-mode" => Step::SpaceMode,
+            "commit-all" => Step::CommitAll,
+            "ai-on" => Step::AiOn,
+            _ => Step::Key(token_event(name)?),
+        },
+    };
+    Ok(step)
+}
+
+fn parse_keys(keys: &str) -> Result<Vec<(String, Step)>, String> {
     let mut events = Vec::new();
     let mut rest = keys;
     while let Some(ch) = rest.chars().next() {
@@ -79,12 +119,12 @@ fn parse_keys(keys: &str) -> Result<Vec<(String, Event)>, String> {
             .then(|| rest.find('>').map(|end| &rest[1..end]))
             .flatten();
         if let Some(name) = named {
-            events.push((format!("<{name}>"), token_event(name)?));
+            events.push((format!("<{name}>"), token_step(name)?));
             rest = &rest[name.len() + 2..];
         } else {
             let mut ev = Event::new(0, &ch.to_string());
             ev.shift = ch.is_ascii_uppercase();
-            events.push((ch.to_string(), ev));
+            events.push((ch.to_string(), Step::Key(ev)));
             rest = &rest[ch.len_utf8()..];
         }
     }
@@ -99,6 +139,7 @@ pub(crate) struct FakeClient(Rc<RefCell<ClientState>>);
 pub(crate) struct ClientState {
     pub committed: String,
     pub marked: String,
+    pub bundle: Option<String>,
 }
 
 impl TextClient for FakeClient {
@@ -117,7 +158,7 @@ impl TextClient for FakeClient {
     }
 
     fn bundle_id(&self) -> Option<String> {
-        None
+        self.0.borrow().bundle.clone()
     }
 }
 
@@ -190,8 +231,17 @@ impl FakePanel {
     }
 }
 
-/// 環境の代わり。セキュア入力も AI もなく、ログ・トレースは捨てる。
-pub(crate) struct FakeEnv;
+/// 環境の代わり。セキュア入力はなく、ログ・トレースは捨てる。AI は `<ai-on>` まで無効で、
+/// 有効でも送信は世代番号を記録するだけ (ネットワークは呼ばない)。
+#[derive(Clone, Default)]
+pub(crate) struct FakeEnv(Rc<RefCell<EnvState>>);
+
+#[derive(Default)]
+pub(crate) struct EnvState {
+    pub rerank: bool,
+    /// 送られて、まだ取り消されていない AI 要求の世代 (古い順)。
+    pub sent: Vec<u64>,
+}
 
 impl Environment for FakeEnv {
     fn secure_input(&self) -> bool {
@@ -199,16 +249,20 @@ impl Environment for FakeEnv {
     }
 
     fn rerank_allowed(&self) -> bool {
-        false
+        self.0.borrow().rerank
     }
 
     fn log(&self, _line: &str) {}
 
     fn trace(&self, _entry: &str, _fields: &str) {}
 
-    fn send_rerank(&self, _controller_id: u64, _job: &RerankJob, _context: &str, _urgent: bool) {}
+    fn send_rerank(&self, _controller_id: u64, job: &RerankJob, _context: &str, _urgent: bool) {
+        self.0.borrow_mut().sent.push(job.generation);
+    }
 
-    fn cancel_rerank(&self, _controller_id: u64) {}
+    fn cancel_rerank(&self, _controller_id: u64) {
+        self.0.borrow_mut().sent.clear();
+    }
 }
 
 pub(crate) type SimController = Controller<FakeClient, FakePanel, FakeEnv>;
@@ -218,6 +272,7 @@ struct Sim {
     controller: SimController,
     client: FakeClient,
     panel: FakePanel,
+    env: FakeEnv,
     /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
     stale: Vec<String>,
 }
@@ -228,10 +283,12 @@ impl Sim {
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
         let panel = FakePanel::default();
+        let env = FakeEnv::default();
         Self {
-            controller: Controller::new(0, session, panel.clone(), FakeEnv),
+            controller: Controller::new(0, session, panel.clone(), env.clone()),
             client: FakeClient::default(),
             panel,
+            env,
             stale: Vec::new(),
         }
     }
@@ -256,6 +313,49 @@ impl Sim {
         if !self.controller.on_key(input::route(&ev.to_input()), self.client.clone()) {
             self.pass_through(ev);
         }
+    }
+
+    /// 1 起点の番号 n の候補の文字列。無ければエラー (rerank も同じ 1 起点)。
+    fn candidate_at(&self, label: &str, n: usize) -> Result<String, String> {
+        self.controller.candidate_texts().get(n - 1).cloned().ok_or_else(|| format!("{label}: no candidate {n}"))
+    }
+
+    fn apply(&mut self, label: &str, step: &Step) -> Result<(), String> {
+        match step {
+            Step::Key(ev) => self.press(ev),
+            Step::Pick(n) => {
+                let text = self.candidate_at(label, *n)?;
+                self.controller.on_candidate_selected(&text);
+            }
+            Step::Highlight(n) => {
+                let text = self.candidate_at(label, *n)?;
+                self.controller.on_selection_changed(&text);
+            }
+            Step::Live => {
+                if self.controller.mode() != ConversionMode::Live {
+                    self.controller.on_toggle_conversion_mode();
+                }
+            }
+            Step::SpaceMode => {
+                if self.controller.mode() == ConversionMode::Live {
+                    self.controller.on_toggle_conversion_mode();
+                }
+            }
+            Step::CommitAll => self.controller.on_commit_composition(Some(self.client.clone())),
+            Step::AiOn => {
+                self.env.0.borrow_mut().rerank = true;
+                // 送信元アプリが分からないと outbound が送らないので、許可される側のアプリに見せる。
+                self.client.0.borrow_mut().bundle = Some("com.apple.TextEdit".to_string());
+            }
+            Step::Rerank { n, oldest } => {
+                let sent = self.env.0.borrow().sent.clone();
+                let generation = if *oldest { sent.first() } else { sent.last() };
+                if let Some(&generation) = generation {
+                    self.controller.on_rerank_result(generation, *n - 1);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn candidates_line(&self) -> String {
@@ -319,8 +419,8 @@ struct Run {
 
 fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
     let mut sim = Sim::new();
-    for (label, ev) in parse_keys(keys)? {
-        sim.press(&ev);
+    for (label, step) in parse_keys(keys)? {
+        sim.apply(&label, &step)?;
         if sim.client.marked() != sim.controller.marked_text() {
             sim.stale.push(label.clone());
         }
@@ -432,7 +532,37 @@ mod tests {
         let keys = parse_keys("a<S-space><C-k><lt>").unwrap();
         let labels: Vec<_> = keys.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, ["a", "<S-space>", "<C-k>", "<lt>"]);
-        assert!(keys[1].1.shift && keys[2].1.control);
+        assert!(matches!(&keys[1].1, Step::Key(ev) if ev.shift));
+        assert!(matches!(&keys[2].1, Step::Key(ev) if ev.control));
+    }
+
+    #[test]
+    fn imk_イベントのトークンを解釈する() {
+        let steps: Vec<_> = parse_keys("<pick:2><highlight:3><live><space-mode><commit-all><ai-on><rerank:1><rerank-old:2>")
+            .unwrap()
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                Step::Pick(2),
+                Step::Highlight(3),
+                Step::Live,
+                Step::SpaceMode,
+                Step::CommitAll,
+                Step::AiOn,
+                Step::Rerank { n: 1, oldest: false },
+                Step::Rerank { n: 2, oldest: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn 番号が不正なトークンはエラー() {
+        assert!(parse_keys("<pick:0>").is_err());
+        assert!(parse_keys("<pick:x>").is_err());
+        assert!(parse_keys("<pick>").is_err());
     }
 
     #[test]
