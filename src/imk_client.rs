@@ -18,9 +18,10 @@ impl TextClient for Client {
     fn insert(&self, text: &str) {
         let ns = NSString::from_str(text);
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
+        let action = sel!(insertText:replacementRange:);
         // SAFETY: IMKTextInput の insertText:replacementRange: は (NSString, NSRange) を取り、戻り値なし。
         catch_objc(|s| unsafe {
-            send!(s, &*self.0, sel!(insertText:replacementRange:); (&*ns => *const NSString, replacement => NSRange) -> ())
+            send!(s, &*self.0, action; (&*ns => *const NSString, replacement => NSRange) -> ())
         });
     }
 
@@ -28,12 +29,13 @@ impl TextClient for Client {
         let ns = NSString::from_str(text);
         let selection = NSRange { location: ns.len_utf16(), length: 0 };
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
+        let action = sel!(setMarkedText:selectionRange:replacementRange:);
         // SAFETY: IMKTextInput の setMarkedText:selectionRange:replacementRange: は (NSString, NSRange, NSRange) を取る。
         catch_objc(|s| unsafe {
             send!(
                 s,
                 &*self.0,
-                sel!(setMarkedText:selectionRange:replacementRange:);
+                action;
                 (&*ns => *const NSString, selection => NSRange, replacement => NSRange) -> ()
             )
         });
@@ -48,8 +50,9 @@ impl TextClient for Client {
     }
 
     fn bundle_id(&self) -> Option<String> {
+        let action = sel!(bundleIdentifier);
         // SAFETY: IMKTextInput の bundleIdentifier は NSString (nil 可) を返す。
-        let id = catch_objc(|s| unsafe { send!(s, &*self.0, sel!(bundleIdentifier); () -> *mut AnyObject) })?;
+        let id = catch_objc(|s| unsafe { send!(s, &*self.0, action; () -> *mut AnyObject) })?;
         // SAFETY: bundleIdentifier は NSString (nil 可) を返す。+0 の戻り値を retain して所有する。
         let id: Option<Id<NSString>> = unsafe { Id::retain(id.cast()) };
         id.map(|s| lossy_string(&s))
@@ -65,11 +68,12 @@ impl Client {
     }
 
     fn anchor(&self) -> Option<usize> {
+        let (marked_range, selected_range) = (sel!(markedRange), sel!(selectedRange));
         // SAFETY: markedRange / selectedRange は引数なしで NSRange を返す。
         let (marked, selected) = catch_objc(|s| unsafe {
             (
-                send!(s, &*self.0, sel!(markedRange); () -> NSRange),
-                send!(s, &*self.0, sel!(selectedRange); () -> NSRange),
+                send!(s, &*self.0, marked_range; () -> NSRange),
+                send!(s, &*self.0, selected_range; () -> NSRange),
             )
         })?;
         [marked, selected]
@@ -81,10 +85,11 @@ impl Client {
     fn substring(&self, range: NSRange) -> Option<String> {
         // SAFETY: attributedSubstringFromRange: は NSRange を取り NSAttributedString (nil 可) を返し、`string` は NSString (nil 可) を返す。
         // どちらも +0 の戻り値なので retain して所有する。変換は f の外で行う。
+        let (substring, to_string) = (sel!(attributedSubstringFromRange:), sel!(string));
         let string = catch_objc(|s| unsafe {
-            let attributed = send!(s, &*self.0, sel!(attributedSubstringFromRange:); (range => NSRange) -> *mut AnyObject);
+            let attributed = send!(s, &*self.0, substring; (range => NSRange) -> *mut AnyObject);
             let attributed: Option<Id<AnyObject>> = Id::retain(attributed);
-            let string = send!(s, &**attributed.as_ref()?, sel!(string); () -> *mut AnyObject);
+            let string = send!(s, &**attributed.as_ref()?, to_string; () -> *mut AnyObject);
             Id::retain(string.cast::<NSString>())
         })??;
         let units = utf16_units(&string);
