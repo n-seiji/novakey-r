@@ -123,7 +123,7 @@ pub trait MainQueue: Send + Sync {
 /// 配信されようとしている結果が、いまも最新の世代のものか。
 type IsCurrent = Arc<dyn Fn(&Delivery) -> bool + Send + Sync>;
 
-/// メインスレッドで動く処理を投入する関数 (本番は `platform::post_to_main`)。
+/// メインスレッドで動く処理を投入する関数 (本番は `platform::run_on_main_boxed`)。
 type Post = Box<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
 /// 結果を「メインスレッドで handler を呼ぶ処理」として `post` で投入する。
@@ -331,7 +331,7 @@ impl RerankService {
     /// ワーカースレッドを起こす。`handler` は、メインスレッドで、まだ最新の世代の結果に対してだけ呼ばれる。
     pub fn start(handler: fn(Delivery)) -> Arc<Self> {
         let engine = Engine::new(KeychainStore, UreqTransport::new(), Box::new(SystemClock), Box::new(platform::log), |is_current| {
-            Arc::new(TaskQueue { is_current, post: Box::new(platform::post_to_main), handler: Arc::new(handler) })
+            Arc::new(TaskQueue { is_current, post: Box::new(platform::run_on_main_boxed), handler: Arc::new(handler) })
         });
         engine.start();
         Arc::new(Self { engine })

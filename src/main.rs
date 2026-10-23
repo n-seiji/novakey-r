@@ -49,6 +49,10 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--check-main-queue") {
+        platform::check_main_queue();
+    }
+
     if args.iter().any(|a| a == "--test-llm") {
         llm_bridge::smoke_test();
         return;
