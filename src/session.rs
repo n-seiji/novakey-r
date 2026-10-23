@@ -43,19 +43,27 @@ pub struct Outcome {
     pub effects: Vec<Effect>,
 }
 
+/// 変換モード。持ち主は Session だけ (実体は composer の live)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConversionMode {
+    Live,
+    Space,
+}
+
 pub struct Session<E: CandidateEngine> {
-    pub converter: RomajiConverter,
-    pub composer: Composer<E>,
+    converter: RomajiConverter,
+    composer: Composer<E>,
     /// true のときだけ RequestRerank を出す。
-    pub rerank: bool,
+    rerank: bool,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
-    pub playful: fn(&str) -> Option<String>,
+    playful: fn(&str) -> Option<String>,
     /// RequestRerank を出してから、まだ CancelRerank を出していない。
     rerank_outstanding: bool,
 }
 
 impl<E: CandidateEngine> Session<E> {
-    pub fn new(composer: Composer<E>) -> Self {
+    pub fn new(mut composer: Composer<E>, mode: ConversionMode) -> Self {
+        composer.set_live(mode == ConversionMode::Live);
         Self {
             converter: RomajiConverter::new(),
             composer,
@@ -67,6 +75,57 @@ impl<E: CandidateEngine> Session<E> {
 
     pub fn phase(&self) -> Phase {
         self.composer.phase()
+    }
+
+    pub fn mode(&self) -> ConversionMode {
+        if self.composer.is_live() {
+            ConversionMode::Live
+        } else {
+            ConversionMode::Space
+        }
+    }
+
+    pub fn set_rerank(&mut self, enabled: bool) {
+        self.rerank = enabled;
+    }
+
+    pub fn set_playful(&mut self, playful: fn(&str) -> Option<String>) {
+        self.playful = playful;
+    }
+
+    /// 未確定のローマ字か組成中の文がある。
+    pub fn has_pending(&self) -> bool {
+        !self.converter.buffer().is_empty() || !self.composer.is_empty()
+    }
+
+    pub fn candidate_texts(&self) -> Vec<String> {
+        self.composer.candidates().iter().map(|c| c.text.clone()).collect()
+    }
+
+    /// 変換モードを切り替える。組成中なら表示を新しいモードに合わせ直す。
+    pub fn set_live(&mut self, live: bool) -> Vec<Effect> {
+        self.composer.set_live(live);
+        if self.composer.is_empty() {
+            return Vec::new();
+        }
+        vec![Effect::SetMarked(self.marked_text())]
+    }
+
+    /// 候補ウィンドウのハイライト移動 (candidateSelectionChanged:)。選べたときだけ表示を更新する。
+    pub fn select_highlight(&mut self, text: &str) -> Vec<Effect> {
+        if self.composer.select_candidate_text(text) {
+            vec![Effect::SetMarked(self.composer.display().to_string())]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// AI の並べ替え結果を反映する。世代が古いなどで反映されなければ空。
+    pub fn apply_rerank(&mut self, generation: u64, index: usize) -> Vec<Effect> {
+        match self.composer.apply_rerank(generation, index) {
+            Some(_) => vec![Effect::SetMarked(self.marked_text())],
+            None => Vec::new(),
+        }
     }
 
     /// 表示中の変換結果(またはかな) + 未変換のローマ字。
@@ -391,7 +450,7 @@ mod tests {
 
     /// 打鍵列を流して、最後に Enter で確定した文字列を返す。
     fn typed(keys: &str) -> String {
-        let mut session = Session::new(Composer::new(NullEngine));
+        let mut session = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         let mut out = String::new();
         for ch in keys.chars().chain(['\r']) {
             let outcome = session.handle(classify(ch), &ch.to_string());
@@ -407,6 +466,7 @@ mod tests {
     fn english_session() -> Session<NullEngine> {
         Session::new(
             Composer::new(NullEngine).with_english_word(|w| matches!(w, "enter" | "rain" | "in")),
+            ConversionMode::Space,
         )
     }
 
@@ -466,7 +526,7 @@ mod tests {
         Session::new(Composer::new(NullEngine).with_english_memory(
             |w| LEARNED.with(|l| l.borrow().iter().any(|x| x == w)),
             |w| LEARNED.with(|l| l.borrow_mut().push(w.to_string())),
-        ))
+        ), ConversionMode::Space)
     }
 
     fn shown_after(session: &mut Session<NullEngine>, keys: &str) -> String {
@@ -557,8 +617,8 @@ mod tests {
 
     /// 打鍵列を流し、(アプリへ確定済みの文字列, 下線付きの未確定文字列) を返す。Enter は付けない。
     fn after(keys: &str) -> (String, String) {
-        let mut session = Session::new(Composer::new(NullEngine));
-        session.playful = |text| Some(text.to_string());
+        let mut session = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        session.set_playful(|text| Some(text.to_string()));
         let (mut committed, mut marked) = (String::new(), String::new());
         for ch in keys.chars() {
             let outcome = session.handle(classify(ch), &ch.to_string());
@@ -624,8 +684,8 @@ mod tests {
 
     #[test]
     fn 確定したらai要求の取り消しを1度だけ出す() {
-        let mut session = Session::new(Composer::new(TwoEngine));
-        session.rerank = true;
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        session.set_rerank(true);
         let typing = effects_of(&mut session, "kyou");
         assert!(typing.iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
         assert!(!typing.contains(&Effect::CancelRerank), "組成中は取り消さない");
@@ -637,23 +697,60 @@ mod tests {
 
     #[test]
     fn escで組成を捨てても取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine));
-        session.rerank = true;
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        session.set_rerank(true);
         effects_of(&mut session, "kyou");
         assert!(effects_of(&mut session, "\u{1b}").contains(&Effect::CancelRerank));
     }
 
     #[test]
     fn commit_compositionでも取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine));
-        session.rerank = true;
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        session.set_rerank(true);
         effects_of(&mut session, "kyou");
         assert!(session.commit_composition().contains(&Effect::CancelRerank));
     }
 
     #[test]
+    fn 作った時のモードを返し_set_liveで組成中の表示が作り直される() {
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Live);
+        assert_eq!(session.mode(), ConversionMode::Live);
+        assert!(session.set_live(false).is_empty(), "組成が空なら表示は触らない");
+        assert_eq!(session.mode(), ConversionMode::Space);
+        effects_of(&mut session, "kyou");
+        let fx = session.set_live(true);
+        assert_eq!(session.mode(), ConversionMode::Live);
+        assert_eq!(fx, vec![Effect::SetMarked(session.marked_text())]);
+    }
+
+    #[test]
+    fn has_pendingとcandidate_textsは組成の状態を映す() {
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        assert!(!session.has_pending());
+        effects_of(&mut session, "ky");
+        assert!(session.has_pending(), "未変換のローマ字だけでも保留中");
+        effects_of(&mut session, "ou ");
+        assert_eq!(session.candidate_texts().last().map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn select_highlightは候補にあるときだけ表示を更新する() {
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        effects_of(&mut session, "kyou ");
+        assert!(session.select_highlight("無い").is_empty());
+        assert_eq!(session.select_highlight("x"), vec![Effect::SetMarked("x".to_string())]);
+    }
+
+    #[test]
+    fn 世代が違うapply_rerankは何も出さない() {
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        effects_of(&mut session, "kyou");
+        assert!(session.apply_rerank(u64::MAX, 1).is_empty());
+    }
+
+    #[test]
     fn aiが無効なら取り消しも出さない() {
-        let mut session = Session::new(Composer::new(TwoEngine));
+        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
         effects_of(&mut session, "kyou");
         assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));
     }
@@ -696,7 +793,7 @@ mod tests {
 
     #[test]
     fn 現挙動_変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
-        let mut s = Session::new(Composer::new(NullEngine));
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<space><bs><bs>"), ("きょうT".to_string(), String::new()));
         // 見た目は きょうT だが、確定は kyouT (変換なしで打った kyouT は きょうT を確定する)
         assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
@@ -704,27 +801,27 @@ mod tests {
 
     #[test]
     fn 現挙動_字種変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
-        let mut s = Session::new(Composer::new(NullEngine));
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<F7><esc><bs>"), ("きょうT".to_string(), String::new()));
         assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
     }
 
     #[test]
     fn 現挙動_取り消し後に打った文字で履歴依存の確定になる_段3_3で直す予定() {
-        let mut s = Session::new(Composer::new(NullEngine));
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "iPhone<space><esc>s").0, "いPhones");
         assert_eq!(drive(&mut s, "<enter>").1, "iPhones");
     }
 
     #[test]
     fn 現挙動_取り消し後のbsと打鍵が英字を読み直す_段3_3で直す予定() {
-        let mut s = Session::new(Composer::new(NullEngine));
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "Tokyo<F7><esc><bs>a").0, "Tokyあ");
     }
 
     #[test]
     fn 現挙動_取り消し後のspaceで英字が変換に入る_段3_3で直す予定() {
-        let mut s = Session::new(Composer::new(NullEngine));
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         let (shown, committed) = drive(&mut s, "Tokyo<F7><esc><space>");
         assert_eq!((shown.as_str(), committed.as_str()), ("Tokyo", ""));
         assert!(matches!(s.phase(), Phase::Converting { .. }));

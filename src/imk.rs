@@ -17,7 +17,7 @@ use crate::kkc::{self, RustEngine};
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
 use crate::platform;
-use crate::session::{Effect, Outcome, RerankJob, Session};
+use crate::session::{ConversionMode, Effect, Outcome, RerankJob, Session};
 use crate::trace;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,19 +83,14 @@ extern_class!(
     }
 );
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ConversionMode {
-    Live,
-    Space,
-}
-
-fn new_session() -> Session<RustEngine> {
+fn new_session(mode: ConversionMode) -> Session<RustEngine> {
     Session::new(
         Composer::new(RustEngine::new())
             .with_english(crate::loanword::english_for)
             .with_english_word(crate::loanword::is_english_word)
             .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
             .with_emoji(crate::emoji::emoji_for),
+        mode,
     )
 }
 
@@ -117,7 +112,6 @@ impl Drop for FlagGuard<'_> {
 
 pub struct Ivars {
     session: RefCell<Session<RustEngine>>,
-    mode: RefCell<ConversionMode>,
     controller_id: u64,
     last_client: RefCell<Option<Client>>,
     /// show_selection がパネルを更新している間 true。パネルが同期で呼び戻す candidateSelectionChanged: を無視する。
@@ -155,8 +149,7 @@ declare_class!(
             platform::guard(|| None, || {
                 let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
                 let this = this.set_ivars(Ivars {
-                    session: RefCell::new(new_session()),
-                    mode: RefCell::new(ConversionMode::Space),
+                    session: RefCell::new(new_session(ConversionMode::Space)),
                     controller_id,
                     last_client: RefCell::new(None),
                     syncing: Cell::new(false),
@@ -208,10 +201,7 @@ declare_class!(
                         self.dispatch(*key, text, &client) || handled
                     }),
                     Route::Navigation => {
-                        let has_pending = {
-                            let session = self.ivars().session.borrow();
-                            !session.converter.buffer().is_empty() || !session.composer.is_empty()
-                        };
+                        let has_pending = self.ivars().session.borrow().has_pending();
                         trace::record(
                             "handleEvent",
                             &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
@@ -226,12 +216,13 @@ declare_class!(
         #[method_id(candidates:)]
         fn candidates(&self, _sender: Option<&AnyObject>) -> Id<NSArray<NSString>> {
             platform::guard(|| NSArray::from_vec(Vec::new()), || {
-                let session = self.ivars().session.borrow();
-                let texts: Vec<Id<NSString>> = session
-                    .composer
-                    .candidates()
+                let texts: Vec<Id<NSString>> = self
+                    .ivars()
+                    .session
+                    .borrow()
+                    .candidate_texts()
                     .iter()
-                    .map(|cand| NSString::from_str(&cand.text))
+                    .map(|text| NSString::from_str(text))
                     .collect();
                 NSArray::from_vec(texts)
             })
@@ -248,19 +239,11 @@ declare_class!(
                     return;
                 };
                 trace::record("candidateSelectionChanged", &format!("phase={:?}", self.phase()));
-                let marked = {
-                    let mut session = self.ivars().session.borrow_mut();
-                    session
-                        .composer
-                        .select_candidate_text(&text)
-                        .then(|| session.composer.display().to_string())
-                };
+                let effects = self.ivars().session.borrow_mut().select_highlight(&text);
                 if let Phase::Converting { selected, .. } = self.phase() {
                     self.ivars().panel_line.set(selected);
                 }
-                if let Some(marked) = marked {
-                    client.set_marked(&marked);
-                }
+                self.run(effects, Some(&client));
             })
         }
 
@@ -281,7 +264,7 @@ declare_class!(
         #[method_id(menu)]
         fn menu(&self) -> Id<AnyObject> {
             platform::guard(|| platform::build_menu(&[], None), || {
-                let mode_title = match *self.ivars().mode.borrow() {
+                let mode_title = match self.ivars().session.borrow().mode() {
                     ConversionMode::Live => "ライブ変換: オン",
                     ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
                 };
@@ -324,21 +307,13 @@ declare_class!(
         #[method(toggleConversionMode:)]
         fn toggle_conversion_mode(&self, _sender: *mut AnyObject) {
             self.guard_session(|| (), || {
-                let new_mode = {
-                    let mut mode = self.ivars().mode.borrow_mut();
-                    *mode = match *mode {
-                        ConversionMode::Live => ConversionMode::Space,
-                        ConversionMode::Space => ConversionMode::Live,
-                    };
-                    *mode
-                };
-                let marked = {
+                let effects = {
                     let mut session = self.ivars().session.borrow_mut();
-                    session.composer.set_live(new_mode == ConversionMode::Live);
-                    (!session.composer.is_empty()).then(|| session.marked_text())
+                    let live = session.mode() != ConversionMode::Live;
+                    session.set_live(live)
                 };
-                if let (Some(client), Some(marked)) = (self.client(), marked) {
-                    client.set_marked(&marked);
+                if let Some(client) = self.client() {
+                    self.run(effects, Some(&client));
                 }
             })
         }
@@ -367,8 +342,10 @@ impl NovakeyRInputController {
 
     /// 無効時は RequestRerank が作られず、Keychain に触れる経路へ進まない。
     fn sync_rerank_flag(&self) {
-        self.ivars().session.borrow_mut().rerank =
-            rerank_allowed(ai_rerank_enabled(), credentials_missing());
+        self.ivars()
+            .session
+            .borrow_mut()
+            .set_rerank(rerank_allowed(ai_rerank_enabled(), credentials_missing()));
     }
 
     /// session を触るコールバックを panic から守る。panic した時点で session / composer は中途半端かもしれないので、
@@ -389,10 +366,8 @@ impl NovakeyRInputController {
             let ivars = self.ivars();
             match ivars.session.try_borrow_mut() {
                 Ok(mut session) => {
-                    *session = new_session();
-                    // 新しい composer は非 live で始まるので、メニューの表示と同じ現在のモードに合わせ直す。
-                    let live = ivars.mode.try_borrow().is_ok_and(|m| *m == ConversionMode::Live);
-                    session.composer.set_live(live);
+                    // 作り直した session にも、メニューの表示と同じ現在のモードを引き継ぐ。
+                    *session = new_session(session.mode());
                 }
                 Err(_) => platform::log("reset_after_panic: session is borrowed, not recreated"),
             }
@@ -557,19 +532,14 @@ impl NovakeyRInputController {
             return;
         };
         let Some(client) = self.client() else { return };
-        let marked = {
+        let effects = {
             // 変換処理の途中に run loop が再入した場合は、結果を捨てる (借用の二重取得で落とさない)。
             let Ok(mut session) = self.ivars().session.try_borrow_mut() else {
                 return;
             };
-            session
-                .composer
-                .apply_rerank(generation, index)
-                .map(|_| session.marked_text())
+            session.apply_rerank(generation, index)
         };
-        if let Some(marked) = marked {
-            client.set_marked(&marked);
-        }
+        self.run(effects, Some(&client));
     }
 }
 

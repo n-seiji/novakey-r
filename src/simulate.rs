@@ -12,7 +12,7 @@ use crate::composer::{Composer, Phase};
 use crate::input::{self, KeyInput, Modifiers, Route};
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
-use crate::session::{Effect, Session};
+use crate::session::{ConversionMode, Effect, Session};
 use crate::translit::Form;
 
 /// 物理キー 1 打鍵。imk.rs の handleEvent が受け取るものと同じ粒度。
@@ -110,9 +110,9 @@ impl Sim {
                 .with_english(crate::loanword::english_for)
                 .with_english_word(crate::loanword::is_english_word)
                 .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
-                .with_emoji(crate::emoji::emoji_for));
+                .with_emoji(crate::emoji::emoji_for), ConversionMode::Space);
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
-        session.playful = |text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string());
+        session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
         Self {
             session,
             committed: String::new(),
@@ -167,7 +167,7 @@ impl Sim {
                 self.dispatch(*key, text) || handled
             }),
             Route::Navigation => {
-                !self.session.converter.buffer().is_empty() || !self.session.composer.is_empty()
+                self.session.has_pending()
             }
         };
         if !handled {
@@ -186,13 +186,12 @@ impl Sim {
             return String::new();
         };
         self.session
-            .composer
-            .candidates()
+            .candidate_texts()
             .iter()
             .enumerate()
-            .map(|(i, c)| {
+            .map(|(i, text)| {
                 let mark = if i == selected { "*" } else { "" };
-                format!("{}.{}{mark}", i + 1, c.text)
+                format!("{}.{text}{mark}", i + 1)
             })
             .collect::<Vec<_>>()
             .join(" ")
