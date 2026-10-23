@@ -54,7 +54,15 @@ pub fn init(config: Config) {
 
 /// `init` 済みならその設定、まだなら `inert()` (ユニットテストが環境や HOME に触れないように)。
 pub fn get() -> &'static Config {
-    CONFIG.get().unwrap_or_else(|| INERT.get_or_init(Config::inert))
+    CONFIG.get().unwrap_or_else(|| {
+        // init 前に読んだ値は LazyLock の表や学習ストアに残り、後から init しても直らない。黙って無効にならないよう 1 度だけ残す。
+        #[cfg(not(test))]
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| crate::platform::log("config: read before init; learning and tables are disabled"));
+        }
+        INERT.get_or_init(Config::inert)
+    })
 }
 
 #[cfg(test)]
