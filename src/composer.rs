@@ -97,29 +97,49 @@ struct Selection {
     window: bool,
 }
 
-/// 組成の段階。局面ごとにしか意味のないデータは variant の中に置く。
+/// 組成の段階。局面ごとにしか意味のないデータは variant の中に置く。打鍵の解釈 (Typing) は段階をまたいで Composer が持つ。
 #[derive(Debug)]
 enum Stage {
-    Editing(Typing),
+    Editing,
+    /// 変換を取り消して読みを表示している。Typing::Kana のときだけ。
     /// kept は、取り消す直前に見えていた (飾り付きの) 候補列。再変換はこの列から続ける。
     Reverted { kept: Option<Vec<Candidate>> },
     Selecting(Selection),
-    /// 字種変換の結果を表示している。base はスペースで変換に戻るときの打鍵の解釈。
+    /// 字種変換の結果を表示している。
     Transliterated {
         form: Form,
         text: String,
-        base: Typing,
         kept: Option<Vec<Candidate>>,
     },
 }
 
-/// 1 回の入力で生まれた (打鍵, かな) の組。部分削除後は raw をかなで置き換える。
+/// 組成の 1 区切り。
 #[derive(Debug, Clone)]
-struct Unit {
-    raw: String,
-    kana: String,
+enum Segment {
+    /// 1 回の入力で生まれた (打鍵, かな) の組。部分削除後は keys をかなで置き換える。
+    Kana { keys: String, kana: String },
     /// 大文字から始めた英単語など、かな変換せずそのまま入れた部分。
-    literal: bool,
+    Literal(String),
+}
+
+impl Segment {
+    fn keys(&self) -> &str {
+        match self {
+            Segment::Kana { keys, .. } => keys,
+            Segment::Literal(text) => text,
+        }
+    }
+
+    fn reading(&self) -> &str {
+        match self {
+            Segment::Kana { kana, .. } => kana,
+            Segment::Literal(text) => text,
+        }
+    }
+
+    fn is_literal(&self) -> bool {
+        matches!(self, Segment::Literal(_))
+    }
 }
 
 /// 1 回の変換で入れる絵文字の上限
@@ -129,9 +149,10 @@ const EMOJI_AFTER_ENGINE: usize = 3;
 
 pub struct Composer<E: CandidateEngine> {
     engine: E,
-    units: Vec<Unit>,
+    segments: Vec<Segment>,
     pending_raw: String,
     hiragana: String,
+    typing: Typing,
     reading: ReadingCands,
     stage: Stage,
     live: bool,
@@ -151,11 +172,12 @@ impl<E: CandidateEngine> Composer<E> {
     pub fn new(engine: E) -> Self {
         Self {
             engine,
-            units: Vec::new(),
+            segments: Vec::new(),
             pending_raw: String::new(),
             hiragana: String::new(),
+            typing: Typing::Empty,
             reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
-            stage: Stage::Editing(Typing::Empty),
+            stage: Stage::Editing,
             live: false,
             english_for: |_| Vec::new(),
             is_english_word: |_| false,
@@ -206,11 +228,13 @@ impl<E: CandidateEngine> Composer<E> {
 
     pub fn phase(&self) -> Phase {
         match &self.stage {
-            Stage::Editing(Typing::Empty) => Phase::Empty,
-            Stage::Editing(Typing::Kana) => Phase::Composing,
-            Stage::Editing(Typing::Dangling) => Phase::Dangling,
-            Stage::Editing(Typing::Literal) => Phase::Literal,
-            Stage::Editing(Typing::Mixed) => Phase::Mixed,
+            Stage::Editing => match self.typing {
+                Typing::Empty => Phase::Empty,
+                Typing::Kana => Phase::Composing,
+                Typing::Dangling => Phase::Dangling,
+                Typing::Literal => Phase::Literal,
+                Typing::Mixed => Phase::Mixed,
+            },
             Stage::Reverted { .. } => Phase::Reverted,
             Stage::Selecting(s) => Phase::Converting { selected: s.cursor, window: s.window },
             Stage::Transliterated { form, .. } => Phase::Transliterated(*form),
@@ -240,9 +264,9 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 打鍵したままの ASCII 文字列(かなに変換済みの分と未変換の分)。
     pub fn raw(&self) -> String {
-        self.units
+        self.segments
             .iter()
-            .map(|u| u.raw.as_str())
+            .map(Segment::keys)
             .chain(std::iter::once(self.pending_raw.as_str()))
             .collect()
     }
@@ -250,7 +274,7 @@ impl<E: CandidateEngine> Composer<E> {
     pub fn display(&self) -> &str {
         match &self.stage {
             Stage::Selecting(s) => &s.list[s.cursor].text,
-            Stage::Editing(Typing::Kana) if self.live => self
+            Stage::Editing if self.typing == Typing::Kana && self.live => self
                 .reading
                 .list
                 .first()
@@ -277,18 +301,21 @@ impl<E: CandidateEngine> Composer<E> {
             *text = rendered;
             return true;
         }
-        let (base, kept) = match std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty)) {
-            Stage::Editing(typing) => (typing, None),
-            Stage::Reverted { kept } => (Typing::Kana, kept),
-            Stage::Selecting(s) => (Typing::Kana, Some(s.list)),
+        let kept = match std::mem::replace(&mut self.stage, Stage::Editing) {
+            Stage::Editing => None,
+            Stage::Reverted { kept } => kept,
+            Stage::Selecting(s) => {
+                self.leave_english();
+                Some(s.list)
+            }
             Stage::Transliterated { .. } => unreachable!("handled above"),
         };
-        self.stage = Stage::Transliterated { form, text: rendered, base, kept };
+        self.stage = Stage::Transliterated { form, text: rendered, kept };
         true
     }
 
     fn sync_hiragana(&mut self) {
-        self.hiragana = self.units.iter().map(|u| u.kana.as_str()).collect();
+        self.hiragana = self.segments.iter().map(Segment::reading).collect();
     }
 
     fn reset_candidates(&mut self) {
@@ -303,11 +330,12 @@ impl<E: CandidateEngine> Composer<E> {
     fn refresh(&mut self) {
         self.reset_candidates();
         self.sync_hiragana();
+        self.stage = Stage::Editing;
         if self.hiragana.is_empty() {
-            self.stage = Stage::Editing(Typing::Empty);
+            self.typing = Typing::Empty;
             return;
         }
-        self.stage = Stage::Editing(Typing::Kana);
+        self.typing = Typing::Kana;
         if let Some(forms) = self.symbol_variants() {
             self.reading.list = forms
                 .iter()
@@ -331,7 +359,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 組成全体が記号 1 つだけのときの異体候補。かなと混ざれば None(辞書変換に任せる)。
     fn symbol_variants(&self) -> Option<&'static [&'static str]> {
-        match self.units.as_slice() {
+        match self.segments.as_slice() {
             [_] => symbols::variants(&self.hiragana),
             _ => None,
         }
@@ -354,12 +382,19 @@ impl<E: CandidateEngine> Composer<E> {
             return;
         }
         if self.is_kana_editing() && (english || self.has_ascii_kana()) {
-            self.stage = Stage::Editing(Typing::Dangling);
+            self.typing = Typing::Dangling;
         }
     }
 
     fn is_kana_editing(&self) -> bool {
-        matches!(self.stage, Stage::Editing(Typing::Kana))
+        matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana
+    }
+
+    /// 取り消しや字種変換で読みに戻るとき、英語の判定は持ち越さない。
+    fn leave_english(&mut self) {
+        if self.typing == Typing::Dangling {
+            self.typing = Typing::Kana;
+        }
     }
 
     /// 英単語のあとに助詞などが続く組成 (artifactni → artifact + に)。finished は打ち終えたとき。
@@ -374,13 +409,14 @@ impl<E: CandidateEngine> Composer<E> {
     /// 変換候補は、かなの部分をエンジンで変換したものに英単語を前に付けたもの (artifactを使う)。
     fn fix_english_split(&mut self, split: english_split::Split) {
         let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
-        let head = Unit { kana: split.head.clone(), raw: split.head.clone(), literal: true };
-        let tail = split.tail.into_iter().map(|(raw, kana)| Unit { raw, kana, literal: false });
-        self.units = std::iter::once(head).chain(tail).collect();
+        let head = Segment::Literal(split.head.clone());
+        let tail = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
+        self.segments = std::iter::once(head).chain(tail).collect();
         self.pending_raw.clear();
         self.sync_hiragana();
         self.reset_candidates();
-        self.stage = Stage::Editing(Typing::Mixed);
+        self.stage = Stage::Editing;
+        self.typing = Typing::Mixed;
         let texts = self.engine.convert(self.reading.generation, &tail_kana);
         for (engine_index, text) in texts.into_iter().enumerate() {
             let text = format!("{}{text}", split.head);
@@ -408,11 +444,12 @@ impl<E: CandidateEngine> Composer<E> {
             && (self.has_ascii_kana() || word())
     }
 
-    /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。
+    /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。英字の区切りは数えない。
     fn has_ascii_kana(&self) -> bool {
-        self.units
-            .iter()
-            .any(|u| u.kana.chars().any(|c| c.is_ascii_alphabetic()))
+        self.segments.iter().any(|s| match s {
+            Segment::Kana { kana, .. } => kana.chars().any(|c| c.is_ascii_alphabetic()),
+            Segment::Literal(_) => false,
+        })
     }
 
     /// 打鍵 raw と、それで確定したかな kana を追加する。kana が空なら raw は次のかなに持ち越す。
@@ -427,10 +464,9 @@ impl<E: CandidateEngine> Composer<E> {
             .strip_suffix(carry)
             .map_or(self.pending_raw.len(), str::len);
         let carried = self.pending_raw.split_off(split);
-        self.units.push(Unit {
-            raw: std::mem::replace(&mut self.pending_raw, carried),
+        self.segments.push(Segment::Kana {
+            keys: std::mem::replace(&mut self.pending_raw, carried),
             kana: kana.to_string(),
-            literal: false,
         });
         self.refresh();
     }
@@ -440,19 +476,17 @@ impl<E: CandidateEngine> Composer<E> {
         if !self.candidates().is_empty() {
             self.engine.cancel();
         }
-        let raw = format!("{}{}", std::mem::take(&mut self.pending_raw), text);
-        self.units.push(Unit {
-            raw,
-            kana: text.to_string(),
-            literal: true,
-        });
+        debug_assert!(self.pending_raw.is_empty());
+        self.pending_raw.clear();
+        self.segments.push(Segment::Literal(text.to_string()));
         self.sync_hiragana();
         self.reset_candidates();
-        self.stage = Stage::Editing(if self.units.iter().all(|u| u.literal) {
+        self.stage = Stage::Editing;
+        self.typing = if self.segments.iter().all(Segment::is_literal) {
             Typing::Literal
         } else {
             Typing::Mixed
-        });
+        };
     }
 
     pub fn pop_pending_raw(&mut self) {
@@ -464,23 +498,26 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     pub fn backspace(&mut self) -> bool {
-        let Some(last) = self.units.last_mut() else {
+        let Some(last) = self.segments.last_mut() else {
             return false;
         };
-        last.kana.pop();
-        if last.kana.is_empty() {
-            self.units.pop();
-        } else {
-            last.raw = last.kana.clone();
-        }
-        let is_literal = |typing| matches!(typing, Typing::Literal | Typing::Mixed);
-        let was_literal = match &self.stage {
-            Stage::Editing(typing) => is_literal(*typing),
-            Stage::Transliterated { base, .. } => is_literal(*base),
-            _ => false,
+        let emptied = match last {
+            Segment::Kana { keys, kana } => {
+                kana.pop();
+                *keys = kana.clone();
+                kana.is_empty()
+            }
+            Segment::Literal(text) => {
+                text.pop();
+                text.is_empty()
+            }
         };
+        if emptied {
+            self.segments.pop();
+        }
+        let was_literal = matches!(self.typing, Typing::Literal | Typing::Mixed);
         // 英単語の部分を消しきったら、残ったかなは通常の組成に戻す。
-        if was_literal && self.units.iter().any(|u| u.literal) {
+        if was_literal && self.segments.iter().any(Segment::is_literal) {
             self.sync_hiragana();
             self.reset_candidates();
         } else {
@@ -493,10 +530,7 @@ impl<E: CandidateEngine> Composer<E> {
     pub fn begin_conversion(&mut self) -> bool {
         let mut kept = None;
         if matches!(self.stage, Stage::Transliterated { .. }) {
-            if let Stage::Transliterated { base, kept: k, .. } =
-                std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty))
-            {
-                self.stage = Stage::Editing(base);
+            if let Stage::Transliterated { kept: k, .. } = std::mem::replace(&mut self.stage, Stage::Editing) {
                 kept = k;
             }
         }
@@ -577,22 +611,28 @@ impl<E: CandidateEngine> Composer<E> {
     /// 組成を捨てて空に戻す(何も確定しない)。
     pub fn discard(&mut self) {
         self.engine.cancel();
-        self.units.clear();
+        self.segments.clear();
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();
-        self.stage = Stage::Editing(Typing::Empty);
+        self.stage = Stage::Editing;
+        self.typing = Typing::Empty;
     }
 
     pub fn revert(&mut self) {
         if self.phase() == Phase::Empty {
             return;
         }
-        let kept = match std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty)) {
+        let kept = match std::mem::replace(&mut self.stage, Stage::Editing) {
             Stage::Selecting(s) => Some(s.list),
             Stage::Reverted { kept } | Stage::Transliterated { kept, .. } => kept,
-            Stage::Editing(_) => None,
+            Stage::Editing => None,
         };
+        // 英字入力 (Literal / Mixed) は局面を保って入力中に戻る。読みだけを表示する Reverted に入れるのはかなだけ。
+        if matches!(self.typing, Typing::Literal | Typing::Mixed) {
+            return;
+        }
+        self.leave_english();
         self.stage = Stage::Reverted { kept };
     }
 
@@ -605,12 +645,12 @@ impl<E: CandidateEngine> Composer<E> {
         if learn && phase == Phase::Dangling {
             (self.learn_english)(&out);
         }
-        for unit in self.units.iter().filter(|u| u.literal && learn) {
-            (self.learn_english)(&unit.raw);
+        for segment in self.segments.iter().filter(|s| s.is_literal() && learn) {
+            (self.learn_english)(segment.keys());
         }
         let learned = match &self.stage {
             Stage::Selecting(s) => s.list[s.cursor].engine_rank(),
-            Stage::Editing(Typing::Kana) if self.live => {
+            Stage::Editing if self.typing == Typing::Kana && self.live => {
                 self.reading.list.first().and_then(Candidate::engine_rank)
             }
             _ => None,
@@ -621,11 +661,12 @@ impl<E: CandidateEngine> Composer<E> {
             }
             None => self.engine.cancel(),
         }
-        self.units.clear();
+        self.segments.clear();
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();
-        self.stage = Stage::Editing(Typing::Empty);
+        self.stage = Stage::Editing;
+        self.typing = Typing::Empty;
         out
     }
 
@@ -637,7 +678,7 @@ impl<E: CandidateEngine> Composer<E> {
             return None;
         }
         match &self.stage {
-            Stage::Editing(Typing::Kana) if display_index < self.reading.list.len() => {
+            Stage::Editing if self.typing == Typing::Kana && display_index < self.reading.list.len() => {
                 if self.live {
                     Self::promote(&mut self.reading.list, display_index);
                     Some(self.display().to_string())
@@ -1613,16 +1654,27 @@ mod tests {
     }
 
     #[test]
-    fn 取り消しからの再変換は直前の候補列から続く_mixed() {
+    fn 取り消しても_mixed_のままで再変換は同じ候補列になる() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         c.push_literal("T");
         assert!(c.begin_conversion());
         assert_eq!(texts(&c), vec!["きょうT", "kyouT"]);
         c.revert();
-        assert_eq!(texts(&c), vec!["きょうT", "kyouT"]);
+        assert_eq!(c.phase(), Phase::Mixed);
+        assert_eq!(c.display(), "きょうT");
         assert!(c.begin_conversion());
-        assert_eq!(texts(&c), vec!["きょうT", "kyouT", "キョウT"]);
+        assert_eq!(texts(&c), vec!["きょうT", "kyouT"]);
+    }
+
+    #[test]
+    fn 取り消しても_literal_のままで確定は英字になる() {
+        let (mut c, _) = composer();
+        c.push_literal("Tokyo");
+        c.transliterate(Form::Katakana);
+        c.revert();
+        assert_eq!(c.phase(), Phase::Literal);
+        assert_eq!(c.commit(true), "Tokyo");
     }
 
     #[test]
