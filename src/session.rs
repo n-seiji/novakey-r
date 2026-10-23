@@ -8,8 +8,6 @@ use std::sync::LazyLock;
 
 use crate::composer::{CandidateEngine, Composer, Phase};
 use crate::keymap::{self, Action, Key};
-use crate::romaji_converter::{Flush, RomajiConverter};
-use crate::symbols;
 
 /// リランキング要求の中身。送信は Effect の実行側が決める。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +59,6 @@ pub struct Gates {
 }
 
 pub struct Session<E: CandidateEngine> {
-    converter: RomajiConverter,
     composer: Composer<E>,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
     playful: fn(&str) -> Option<String>,
@@ -73,7 +70,6 @@ impl<E: CandidateEngine> Session<E> {
     pub fn new(mut composer: Composer<E>, mode: ConversionMode) -> Self {
         composer.set_live(mode == ConversionMode::Live);
         Self {
-            converter: RomajiConverter::new(),
             composer,
             playful: playful_convert,
             rerank_outstanding: false,
@@ -102,7 +98,7 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 未確定のローマ字か組成中の文がある。
     pub fn has_pending(&self) -> bool {
-        !self.converter.buffer().is_empty() || !self.composer.is_empty()
+        self.composer.has_romaji() || !self.composer.is_empty()
     }
 
     pub fn candidate_texts(&self) -> Vec<String> {
@@ -135,19 +131,19 @@ impl<E: CandidateEngine> Session<E> {
         }
     }
 
-    /// 表示中の変換結果(またはかな) + 未変換のローマ字。
+    /// 下線付きで見せる文字列。
     pub fn marked_text(&self) -> String {
-        if let Some(split) = self.composer.english_split(false) {
-            return split.display();
-        }
-        if self.composer.is_typing_english() {
-            return self.composer.raw();
-        }
-        format!(
-            "{}{}",
-            self.composer.display(),
-            self.converter.pending_display()
-        )
+        self.composer.preedit()
+    }
+
+    /// いま確定したら挿入される文字列 (状態は変えない)。未確定ローマ字は含めない。
+    pub fn commit_preview(&self) -> String {
+        self.composer.commit_preview()
+    }
+
+    /// 未確定のローマ字があるか。
+    pub fn has_romaji(&self) -> bool {
+        self.composer.has_romaji()
     }
 
     /// キー処理の入口。キーを動作表で解決して実行する。
@@ -156,7 +152,7 @@ impl<E: CandidateEngine> Session<E> {
         let phase = self.phase();
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
         let key = match text.chars().collect::<Vec<_>>()[..] {
-            [ch] if !ch.is_ascii_alphabetic() && self.converter.accepts(ch) => {
+            [ch] if !ch.is_ascii_alphabetic() && self.composer.accepts_romaji(ch) => {
                 Key::Letter { upper: false }
             }
             _ => key,
@@ -202,7 +198,7 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 組成が空になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
     fn finish(&mut self, fx: &mut Vec<Effect>) {
-        if self.rerank_outstanding && self.composer.is_empty() && self.converter.buffer().is_empty() {
+        if self.rerank_outstanding && self.composer.is_empty() && !self.composer.has_romaji() {
             self.rerank_outstanding = false;
             fx.push(Effect::CancelRerank);
         }
@@ -236,18 +232,14 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 未変換のローマ字を確定かなとして composer へ流す。
     fn flush_romaji(&mut self, gates: &Gates, rerank: bool, fx: &mut Vec<Effect>) {
-        let flush = self.converter.flush();
-        let ranks = matches!(flush, Flush::Kana(_));
-        self.composer.push_flush(flush);
+        let ranks = self.composer.flush_romaji();
         if ranks && rerank {
             self.request_rerank(gates, false, fx);
         }
     }
 
-    fn push_input(&mut self, gates: &Gates, raw: &str, kana: &str, fx: &mut Vec<Effect>) {
-        let carry = self.converter.buffer().to_string();
-        self.composer.push_input(raw, kana, &carry);
-        if !kana.is_empty() {
+    fn after_typed(&mut self, gates: &Gates, produced_kana: bool, fx: &mut Vec<Effect>) {
+        if produced_kana {
             self.request_rerank(gates, false, fx);
         }
     }
@@ -295,17 +287,15 @@ impl<E: CandidateEngine> Session<E> {
         if flushes {
             self.flush_romaji(gates, !matches!(key, Key::Translit(_)), fx);
         }
-        let has_romaji = !self.converter.buffer().is_empty();
+        let has_romaji = self.composer.has_romaji();
         match key {
             Key::Backspace if has_romaji => {
-                self.converter.handle_backspace();
-                self.composer.pop_pending_raw();
+                self.composer.backspace_romaji();
                 self.refresh_marked(fx);
                 Some(true)
             }
             Key::Escape => {
-                self.converter.clear();
-                self.composer.clear_pending_raw();
+                self.composer.clear_romaji();
                 if has_romaji && self.composer.is_empty() {
                     fx.push(Effect::SetMarked(String::new()));
                     return Some(true);
@@ -327,11 +317,8 @@ impl<E: CandidateEngine> Session<E> {
                 .map(|converted| fx.push(Effect::Insert(converted)))
                 .is_some(),
             Action::TypeRomaji => {
-                let kana = text
-                    .chars()
-                    .filter_map(|ch| self.converter.process_input(ch.to_ascii_lowercase()))
-                    .collect::<String>();
-                self.push_input(gates, text, &kana, fx);
+                let produced = self.composer.type_romaji(text);
+                self.after_typed(gates, produced, fx);
                 self.show_typing(fx)
             }
             Action::StartLiteral | Action::TypeLiteral => {
@@ -339,7 +326,8 @@ impl<E: CandidateEngine> Session<E> {
                 self.show_typing(fx)
             }
             Action::TypeText => {
-                self.push_input(gates, text, symbols::default_form(text).unwrap_or(text), fx);
+                let produced = self.composer.type_text(text);
+                self.after_typed(gates, produced, fx);
                 self.show_typing(fx)
             }
             Action::Convert => {
@@ -386,7 +374,6 @@ impl<E: CandidateEngine> Session<E> {
             Action::CommitThenRestart => false,
             Action::Clear => {
                 self.composer.discard();
-                self.converter.clear();
                 self.show_typing(fx)
             }
             Action::Revert => {

@@ -5,7 +5,7 @@
 // ローマ字そのまま(raw)など engine 以外の候補は順位を持たず、確定しても学習しない。
 
 use crate::english_split;
-use crate::romaji_converter::Flush;
+use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::symbols;
 use crate::translit::{self, Form};
 
@@ -79,6 +79,14 @@ enum Typing {
     Mixed,
 }
 
+/// flush 後の組成の扱い。
+enum Settle {
+    /// 英単語とかなの混在 (Mixed) に組み替える。
+    Mixed(english_split::Split),
+    Dangling,
+    Unchanged,
+}
+
 /// 読みが変わらない間 (= 同じ generation の間) 生き続ける、飾りなしの候補列。
 #[derive(Debug)]
 struct ReadingCands {
@@ -150,7 +158,8 @@ const EMOJI_AFTER_ENGINE: usize = 3;
 pub struct Composer<E: CandidateEngine> {
     engine: E,
     segments: Vec<Segment>,
-    pending_raw: String,
+    /// 未確定のローマ字 (まだかなにならない打鍵) の唯一の持ち主。
+    romaji: RomajiConverter,
     hiragana: String,
     typing: Typing,
     /// 英語分割で英単語にまとめる前の区切りと未確定の打鍵。取り消しで分割前の打鍵中に戻すために持つ。
@@ -175,7 +184,7 @@ impl<E: CandidateEngine> Composer<E> {
         Self {
             engine,
             segments: Vec::new(),
-            pending_raw: String::new(),
+            romaji: RomajiConverter::new(),
             hiragana: String::new(),
             typing: Typing::Empty,
             split_origin: None,
@@ -270,7 +279,7 @@ impl<E: CandidateEngine> Composer<E> {
         self.segments
             .iter()
             .map(Segment::keys)
-            .chain(std::iter::once(self.pending_raw.as_str()))
+            .chain(std::iter::once(self.romaji.buffer()))
             .collect()
     }
 
@@ -284,6 +293,28 @@ impl<E: CandidateEngine> Composer<E> {
                 .map_or(self.hiragana.as_str(), |c| c.text.as_str()),
             Stage::Transliterated { text, .. } => text,
             _ => &self.hiragana,
+        }
+    }
+
+    /// 下線付きで見せる文字列。表示の決定はここだけ。
+    pub fn preedit(&self) -> String {
+        if let Some(split) = self.english_split(false) {
+            return split.display();
+        }
+        if self.is_typing_english() {
+            return self.raw();
+        }
+        format!("{}{}", self.display(), self.romaji.buffer())
+    }
+
+    /// Enter で確定される文字列 (状態は変えない)。未確定ローマ字は確定済みとして扱わない。
+    /// かな入力中は、確定の前に行う flush が局面を英語に変える分 (merge, artifactni) も見込む。
+    pub fn commit_preview(&self) -> String {
+        match self.settle(self.is_typing_english()) {
+            Settle::Mixed(split) => split.head + &split.tail.iter().map(|(_, kana)| kana.as_str()).collect::<String>(),
+            Settle::Dangling => self.raw(),
+            Settle::Unchanged if self.phase() == Phase::Dangling => self.raw(),
+            Settle::Unchanged => self.display().to_string(),
         }
     }
 
@@ -375,20 +406,39 @@ impl<E: CandidateEngine> Composer<E> {
         self.symbol_variants().is_some()
     }
 
-    /// ローマ字バッファの確定結果を取り込む。Dangling なら局面を Dangling にする。
-    pub fn push_flush(&mut self, flush: Flush) {
+    /// 未確定のローマ字を確定かなとして取り込む。Dangling なら局面を Dangling にする。
+    /// かなが増えたとき (Flush::Kana) だけ true。
+    pub fn flush_romaji(&mut self) -> bool {
         let english = self.is_typing_english();
+        let keys = self.romaji.buffer().to_string();
+        let flush = self.romaji.flush();
+        let ranks = matches!(flush, Flush::Kana(_));
+        self.absorb_flush(english, keys, flush);
+        ranks
+    }
+
+    /// english は、未確定のローマ字を残した状態で英語と見なせていたか。
+    fn absorb_flush(&mut self, english: bool, keys: String, flush: Flush) {
         match flush {
             Flush::Empty => {}
-            Flush::Kana(kana) | Flush::Dangling(kana) => self.push_input("", &kana, ""),
+            Flush::Kana(kana) | Flush::Dangling(kana) => self.push_kana(keys, &kana),
         }
+        match self.settle(english) {
+            Settle::Mixed(split) => self.fix_english_split(split),
+            Settle::Dangling => self.typing = Typing::Dangling,
+            Settle::Unchanged => {}
+        }
+    }
+
+    /// ローマ字を確定し終えた組成が、英語として扱い直されるか。
+    fn settle(&self, english: bool) -> Settle {
         if let Some(split) = self.english_split(true) {
-            self.fix_english_split(split);
-            return;
+            return Settle::Mixed(split);
         }
         if self.is_kana_editing() && (english || self.has_ascii_kana()) {
-            self.typing = Typing::Dangling;
+            return Settle::Dangling;
         }
+        Settle::Unchanged
     }
 
     fn is_kana_editing(&self) -> bool {
@@ -414,11 +464,11 @@ impl<E: CandidateEngine> Composer<E> {
     /// 変換候補は、かなの部分をエンジンで変換したものに英単語を前に付けたもの (artifactを使う)。
     fn fix_english_split(&mut self, split: english_split::Split) {
         let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
-        let origin = (self.segments.clone(), self.pending_raw.clone());
+        let origin = (self.segments.clone(), self.romaji.buffer().to_string());
         let head = Segment::Literal(split.head.clone());
         let tail = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
         self.segments = std::iter::once(head).chain(tail).collect();
-        self.pending_raw.clear();
+        self.romaji.clear();
         self.sync_hiragana();
         self.reset_candidates();
         self.stage = Stage::Editing;
@@ -443,7 +493,7 @@ impl<E: CandidateEngine> Composer<E> {
         const MIN_LEN: usize = 4;
         let raw = self.raw();
         let word = || {
-            !self.pending_raw.is_empty()
+            !self.romaji.buffer().is_empty()
                 && ((self.knows_english)(&raw) || (raw.len() >= MIN_LEN && (self.is_english_word)(&raw)))
         };
         self.is_kana_editing()
@@ -459,24 +509,83 @@ impl<E: CandidateEngine> Composer<E> {
         })
     }
 
-    /// 打鍵 raw と、それで確定したかな kana を追加する。kana が空なら raw は次のかなに持ち越す。
-    /// carry はローマ字バッファに残っている未確定の打鍵で、確定した単位には含めず持ち越す。
-    pub fn push_input(&mut self, raw: &str, kana: &str, carry: &str) {
+    /// 小文字 1 文字ぶんの打鍵をローマ字として受ける。かなが増えたら true。
+    pub fn type_romaji(&mut self, text: &str) -> bool {
         self.split_origin = None;
-        self.pending_raw.push_str(raw);
+        let mut pending = self.romaji.buffer().to_string();
+        pending.push_str(text);
+        let kana: String = text
+            .chars()
+            .filter_map(|ch| self.romaji.process_input(ch.to_ascii_lowercase()))
+            .collect();
         if kana.is_empty() {
+            return false;
+        }
+        // 確定した単位の打鍵は、ローマ字に残った未確定の打鍵 (`tt` の 2 つ目の t など) を除いたもの。
+        let keys = pending.strip_suffix(self.romaji.buffer()).unwrap_or(&pending).to_string();
+        self.push_kana(keys, &kana);
+        true
+    }
+
+    /// 数字・記号をそのままの打鍵として追加する (既定の和文表記があればそれをかなとして使う)。
+    pub fn type_text(&mut self, text: &str) -> bool {
+        debug_assert!(self.romaji.buffer().is_empty(), "romaji is flushed before text keys");
+        let kana = symbols::default_form(text).unwrap_or(text);
+        if kana.is_empty() {
+            return false;
+        }
+        self.push_kana(text.to_string(), kana);
+        true
+    }
+
+    fn push_kana(&mut self, keys: String, kana: &str) {
+        self.segments.push(Segment::Kana { keys, kana: kana.to_string() });
+        self.refresh();
+    }
+
+    /// 記号 1 文字をローマ字の続きとして受け取れるか (`n'` → ん)。
+    pub fn accepts_romaji(&self, ch: char) -> bool {
+        self.romaji.accepts(ch)
+    }
+
+    /// 未確定のローマ字があるか。
+    pub fn has_romaji(&self) -> bool {
+        !self.romaji.buffer().is_empty()
+    }
+
+    /// 未確定のローマ字を 1 文字消す。
+    pub fn backspace_romaji(&mut self) {
+        self.romaji.handle_backspace();
+    }
+
+    /// 未確定のローマ字を捨てる。
+    pub fn clear_romaji(&mut self) {
+        self.romaji.clear();
+    }
+
+    /// テスト用: 打鍵 raw と、それで確定したかな kana を追加する (kana が空なら raw は次に持ち越す)。
+    /// carry は未確定のまま残る打鍵で、確定した単位には含めない。
+    #[cfg(test)]
+    pub fn push_input(&mut self, raw: &str, kana: &str, carry: &str) {
+        let mut pending = self.romaji.buffer().to_string();
+        pending.push_str(raw);
+        self.romaji.clear();
+        if kana.is_empty() {
+            self.romaji.set_buffer(&pending);
             return;
         }
-        let split = self
-            .pending_raw
-            .strip_suffix(carry)
-            .map_or(self.pending_raw.len(), str::len);
-        let carried = self.pending_raw.split_off(split);
-        self.segments.push(Segment::Kana {
-            keys: std::mem::replace(&mut self.pending_raw, carried),
-            kana: kana.to_string(),
-        });
-        self.refresh();
+        let split = pending.strip_suffix(carry).map_or(pending.len(), str::len);
+        self.romaji.set_buffer(&pending[split..]);
+        self.push_kana(pending[..split].to_string(), kana);
+    }
+
+    /// テスト用: 外の RomajiConverter が返した Flush を取り込む。
+    #[cfg(test)]
+    pub fn push_flush(&mut self, flush: Flush) {
+        let english = self.is_typing_english();
+        let keys = self.romaji.buffer().to_string();
+        self.romaji.clear();
+        self.absorb_flush(english, keys, flush);
     }
 
     /// 英単語としてそのまま追加する。かな変換も候補生成もしない。
@@ -484,9 +593,7 @@ impl<E: CandidateEngine> Composer<E> {
         if !self.candidates().is_empty() {
             self.engine.cancel();
         }
-        debug_assert!(self.pending_raw.is_empty());
         self.split_origin = None;
-        self.pending_raw.clear();
         self.segments.push(Segment::Literal(text.to_string()));
         self.sync_hiragana();
         self.reset_candidates();
@@ -496,14 +603,6 @@ impl<E: CandidateEngine> Composer<E> {
         } else {
             Typing::Mixed
         };
-    }
-
-    pub fn pop_pending_raw(&mut self) {
-        self.pending_raw.pop();
-    }
-
-    pub fn clear_pending_raw(&mut self) {
-        self.pending_raw.clear();
     }
 
     pub fn backspace(&mut self) -> bool {
@@ -628,7 +727,7 @@ impl<E: CandidateEngine> Composer<E> {
         self.engine.cancel();
         self.segments.clear();
         self.split_origin = None;
-        self.pending_raw.clear();
+        self.romaji.clear();
         self.hiragana.clear();
         self.reset_candidates();
         self.stage = Stage::Editing;
@@ -645,9 +744,9 @@ impl<E: CandidateEngine> Composer<E> {
             Stage::Editing => None,
         };
         // 英語分割でできた Mixed は、打った英字ではないので、分割前のかなの打鍵中に戻す (続きを打てば分割し直す)。
-        if let Some((segments, pending_raw)) = self.split_origin.take() {
+        if let Some((segments, pending)) = self.split_origin.take() {
             self.segments = segments;
-            self.pending_raw = pending_raw;
+            self.romaji.set_buffer(&pending);
             self.refresh();
             return;
         }
@@ -661,10 +760,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     pub fn commit(&mut self, learn: bool) -> String {
         let phase = self.phase();
-        let out = match phase {
-            Phase::Dangling => self.raw(),
-            _ => self.display().to_string(),
-        };
+        let out = self.commit_preview();
         if learn && phase == Phase::Dangling {
             (self.learn_english)(&out);
         }
@@ -686,7 +782,7 @@ impl<E: CandidateEngine> Composer<E> {
         }
         self.segments.clear();
         self.split_origin = None;
-        self.pending_raw.clear();
+        self.romaji.clear();
         self.hiragana.clear();
         self.reset_candidates();
         self.stage = Stage::Editing;
@@ -1061,7 +1157,7 @@ mod tests {
         c.push_input("gi", "ぎ", "");
         c.push_input("b", "", "");
         assert_eq!(c.raw(), "gib");
-        c.pop_pending_raw();
+        c.backspace_romaji();
         assert_eq!(c.raw(), "gi");
     }
 
@@ -1474,7 +1570,7 @@ mod tests {
         let mut conv = RomajiConverter::new();
         type_word(&mut c, &mut conv, "entery");
         conv.handle_backspace();
-        c.pop_pending_raw();
+        c.backspace_romaji();
         c.push_flush(conv.flush());
         assert_eq!(c.phase(), Phase::Dangling);
         assert_eq!(c.commit(true), "enter");
@@ -1994,5 +2090,62 @@ mod tests {
         assert_eq!(texts(&c), vec!["犬", "inu", "戌", "乾", "🐶", "伊奴"]);
         assert_eq!(c.apply_rerank(c.current_generation(), 1).as_deref(), Some("戌"));
         assert_eq!(texts(&c), vec!["戌", "inu", "犬", "乾", "🐶", "伊奴"]);
+    }
+
+    fn typed_romaji(keys: &str) -> Composer<MockEngine> {
+        let (mut c, _) = composer();
+        for ch in keys.chars() {
+            c.type_romaji(&ch.to_string());
+        }
+        c
+    }
+
+    #[test]
+    fn 未確定のローマ字は_preedit_に出るが_commit_preview_には入らない() {
+        let c = typed_romaji("kyout");
+        assert!(c.has_romaji());
+        assert_eq!(c.preedit(), "きょうt");
+        assert_eq!(c.commit_preview(), "きょう");
+    }
+
+    #[test]
+    fn 未確定のローマ字は_backspace_と_clear_で消える() {
+        let mut c = typed_romaji("kyout");
+        c.backspace_romaji();
+        assert!(!c.has_romaji());
+        assert_eq!(c.preedit(), "きょう");
+        let mut c = typed_romaji("kyout");
+        c.clear_romaji();
+        assert_eq!(c.preedit(), "きょう");
+    }
+
+    #[test]
+    fn tt_の_2_つ目の_t_は確定した単位に含めず持ち越す() {
+        let mut c = typed_romaji("katta");
+        assert_eq!(c.raw(), "katta");
+        assert_eq!(c.preedit(), "かった");
+        c.backspace();
+        assert_eq!(c.raw(), "kat");
+        assert_eq!(c.preedit(), "かっ");
+    }
+
+    #[test]
+    fn 英語と見なす入力中は_preedit_が打鍵のままで_commit_preview_も同じになる() {
+        let c = typed_romaji("merge");
+        assert!(!c.has_romaji());
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.display(), "めrげ");
+        assert_eq!(c.preedit(), "merge");
+        assert_eq!(c.commit_preview(), "merge");
+    }
+
+    #[test]
+    fn commit_preview_は状態を変えず_commit_と同じ文字列を返す() {
+        for keys in ["kyou", "merge", "kyouh", "entery"] {
+            let mut c = typed_romaji(keys);
+            c.flush_romaji();
+            let preview = c.commit_preview();
+            assert_eq!(c.commit(false), preview, "{keys}");
+        }
     }
 }

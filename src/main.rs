@@ -39,11 +39,11 @@ fn main() {
         std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
     }
     if let Some(i) = args.iter().position(|a| a == "--simulate") {
-        simulate::simulate(args.get(i + 1).map_or("", String::as_str));
+        simulate::simulate(args.get(i + 1).map_or("", String::as_str), args.iter().any(|a| a == "--check-preedit"));
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--simulate-file") {
-        simulate::simulate_file(args.get(i + 1).map_or("", String::as_str));
+        simulate::simulate_file(args.get(i + 1).map_or("", String::as_str), args.iter().any(|a| a == "--check-preedit"));
         return;
     }
 
