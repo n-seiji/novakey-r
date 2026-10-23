@@ -13,7 +13,7 @@ use crate::deps::{EnglishMemory, Lexicon, ProdLexicon, ProdMemory};
 use crate::input::Route;
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
-use crate::outbound::{self, Outbound, Snapshot};
+use crate::outbound::{self, Decision, Screened};
 use crate::session::{ConversionMode, Effect, Gates, Outcome, RerankJob, Session};
 
 /// 直前文脈として読む最大長 (UTF-16 単位)。
@@ -44,7 +44,7 @@ pub trait Environment {
     fn log(&self, line: &str);
     /// 名前と数値だけを渡すこと。
     fn trace(&self, entry: &str, fields: &str);
-    fn send_rerank(&self, controller_id: u64, job: &RerankJob, context: &str, urgent: bool);
+    fn send_rerank(&self, controller_id: u64, generation: u64, payload: &Screened, urgent: bool);
     fn cancel_rerank(&self, controller_id: u64);
 }
 
@@ -305,30 +305,24 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             .as_ref()
             .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
             .unwrap_or_default();
-        let snapshot = Snapshot {
-            secure_input: self.env.secure_input(),
-            bundle_id: self.bundle_id(client.as_ref()),
-            preceding: &preceding,
-            reading: &job.hiragana,
-            candidates: &job.candidates,
+        let decision = match outbound::gate_app(self.env.secure_input(), self.bundle_id(client.as_ref())) {
+            Ok(()) => outbound::screen(&job.hiragana, &job.candidates, &preceding),
+            Err(reason) => Decision::Skip(reason),
         };
-        let context = match outbound::decide(&snapshot) {
-            Outbound::Skip(reason) => {
+        match decision {
+            Decision::Skip(reason) => {
                 self.log_gate(Some(("skipped", reason.name())));
                 // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
                 self.env.cancel_rerank(self.id);
-                return;
             }
-            Outbound::WithoutContext(reason) => {
-                self.log_gate(Some(("without context", reason.name())));
-                String::new()
+            Decision::Send(screened) => {
+                match screened.context_dropped() {
+                    Some(reason) => self.log_gate(Some(("without context", reason.name()))),
+                    None => self.log_gate(None),
+                }
+                self.env.send_rerank(self.id, job.generation, &screened, urgent);
             }
-            Outbound::WithContext(context) => {
-                self.log_gate(None);
-                context
-            }
-        };
-        self.env.send_rerank(self.id, job, &context, urgent);
+        }
     }
 
     /// 理由が前回と変わったときだけログする (打鍵ごとに同じ行が出ないように)。名前だけで入力は含まない。
@@ -500,8 +494,8 @@ mod tests {
             self.logs.borrow_mut().push(line.to_string());
         }
         fn trace(&self, _entry: &str, _fields: &str) {}
-        fn send_rerank(&self, _id: u64, job: &RerankJob, _context: &str, _urgent: bool) {
-            self.sent.borrow_mut().push(job.generation);
+        fn send_rerank(&self, _id: u64, generation: u64, _payload: &Screened, _urgent: bool) {
+            self.sent.borrow_mut().push(generation);
         }
         fn cancel_rerank(&self, _id: u64) {
             self.cancels.set(self.cancels.get() + 1);

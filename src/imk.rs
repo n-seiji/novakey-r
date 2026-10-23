@@ -12,7 +12,8 @@ use crate::input::{self, Route};
 use crate::llm_bridge;
 use crate::platform;
 use crate::registry::Registry;
-use crate::session::{ConversionMode, RerankJob};
+use crate::outbound::Screened;
+use crate::session::ConversionMode;
 use crate::trace;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,8 +108,8 @@ impl Environment for PlatformEnv {
         trace::record(entry, fields);
     }
 
-    fn send_rerank(&self, controller_id: u64, job: &RerankJob, context: &str, urgent: bool) {
-        llm_bridge::rerank_async(controller_id, job.generation, &job.hiragana, context, &job.candidates, urgent);
+    fn send_rerank(&self, controller_id: u64, generation: u64, payload: &Screened, urgent: bool) {
+        llm_bridge::rerank_async(controller_id, generation, payload.clone(), urgent);
     }
 
     fn cancel_rerank(&self, controller_id: u64) {

@@ -20,7 +20,8 @@ use std::rc::Rc;
 use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
-use crate::session::{ConversionMode, RerankJob};
+use crate::outbound::Screened;
+use crate::session::ConversionMode;
 use crate::translit::Form;
 
 /// 物理キー 1 打鍵。imk.rs の handleEvent が受け取るものと同じ粒度。
@@ -256,8 +257,8 @@ impl Environment for FakeEnv {
 
     fn trace(&self, _entry: &str, _fields: &str) {}
 
-    fn send_rerank(&self, _controller_id: u64, job: &RerankJob, _context: &str, _urgent: bool) {
-        self.0.borrow_mut().sent.push(job.generation);
+    fn send_rerank(&self, _controller_id: u64, generation: u64, _payload: &Screened, _urgent: bool) {
+        self.0.borrow_mut().sent.push(generation);
     }
 
     fn cancel_rerank(&self, _controller_id: u64) {

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::outbound::Screened;
+
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_FAILED: i32 = 1;
 pub const STATUS_CREDENTIALS_MISSING: i32 = 4;
@@ -69,25 +71,17 @@ pub enum FetchError {
     InvalidResponse,
 }
 
-/// 同一リクエストの判定キー。
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RerankKey {
-    pub context: String,
-    pub reading: String,
-    pub candidates: Vec<String>,
-}
-
-pub fn build_request(creds: &Credentials, key: &RerankKey) -> HttpRequest {
+pub fn build_request(creds: &Credentials, key: &Screened) -> HttpRequest {
     let criteria: serde_json::Map<String, serde_json::Value> = key
-        .candidates
+        .candidates()
         .iter()
         .enumerate()
         .map(|(i, c)| (i.to_string(), serde_json::Value::String(c.clone())))
         .collect();
     let mut state = serde_json::Map::new();
-    state.insert("reading".into(), key.reading.clone().into());
-    if !key.context.is_empty() {
-        state.insert("context".into(), key.context.clone().into());
+    state.insert("reading".into(), key.reading().into());
+    if !key.context().is_empty() {
+        state.insert("context".into(), key.context().into());
     }
     let body = serde_json::json!({
         "model": "clef-flash",
@@ -128,20 +122,18 @@ pub fn parse_choice(body: &str, candidate_count: usize) -> Result<usize, FetchEr
     Ok(index)
 }
 
-pub fn fetch_choice(transport: &dyn Transport, creds: &Credentials, key: &RerankKey) -> Result<usize, FetchError> {
+pub fn fetch_choice(transport: &dyn Transport, creds: &Credentials, key: &Screened) -> Result<usize, FetchError> {
     let response = transport.post(&build_request(creds, key)).map_err(|_| FetchError::Transport)?;
     if response.status != 200 {
         return Err(FetchError::Status(response.status));
     }
-    parse_choice(&response.body, key.candidates.len())
+    parse_choice(&response.body, key.candidates().len())
 }
 
 pub struct Job {
     pub controller_id: u64,
     pub generation: u64,
-    pub reading: String,
-    pub context: String,
-    pub candidates: Vec<String>,
+    pub payload: Screened,
     /// Space 押下時。デバウンスを待たずに送る。
     pub urgent: bool,
 }
@@ -149,7 +141,7 @@ pub struct Job {
 struct Pending {
     due: Instant,
     generation: u64,
-    key: RerankKey,
+    key: Screened,
     creds: Credentials,
 }
 
@@ -159,7 +151,7 @@ pub struct InFlight {
     pub generation: u64,
     /// 送信の通し番号 ("Clef requests sent: N")。
     pub request_number: u64,
-    pub key: RerankKey,
+    pub key: Screened,
     pub creds: Credentials,
 }
 
@@ -188,7 +180,7 @@ pub struct State<S: CredentialStore> {
     /// 送信を始めた (または結果を配信した) 世代。urgent の重複送信を防ぐ。
     sent: HashMap<u64, u64>,
     /// 直近 1 件の成功結果。同一リクエストは通信せずこれを返す。
-    last_result: Option<(RerankKey, usize)>,
+    last_result: Option<(Screened, usize)>,
     request_count: u64,
     pending: HashMap<u64, Pending>,
 }
@@ -233,8 +225,8 @@ impl<S: CredentialStore> State<S> {
     }
 
     pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
-        let Job { controller_id: id, generation, reading, context, candidates, urgent } = job;
-        if candidates.len() < 2 {
+        let Job { controller_id: id, generation, payload: key, urgent } = job;
+        if key.candidates().len() < 2 {
             return Submitted::default();
         }
         let Some(creds) = self.credentials() else {
@@ -251,7 +243,6 @@ impl<S: CredentialStore> State<S> {
                 log_missing,
             };
         };
-        let key = RerankKey { context, reading, candidates };
         if let Some((cached_key, index)) = &self.last_result {
             if *cached_key == key {
                 let text = index.to_string();
@@ -341,6 +332,7 @@ impl<S: CredentialStore> State<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound::{self, Decision};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -366,15 +358,16 @@ mod tests {
         (State::new(store), loads)
     }
 
-    fn job(id: u64, generation: u64, reading: &str, urgent: bool) -> Job {
-        Job {
-            controller_id: id,
-            generation,
-            reading: reading.into(),
-            context: String::new(),
-            candidates: vec!["今日は".into(), "京は".into()],
-            urgent,
+    fn screened(context: &str, reading: &str, candidates: &[&str]) -> Screened {
+        let candidates: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
+        match outbound::screen(reading, &candidates, context) {
+            Decision::Send(s) => s,
+            Decision::Skip(reason) => panic!("テスト入力が検査で止まった: {}", reason.name()),
         }
+    }
+
+    fn job(id: u64, generation: u64, reading: &str, urgent: bool) -> Job {
+        Job { controller_id: id, generation, payload: screened("", reading, &["今日は", "京は"]), urgent }
     }
 
     fn ms(base: Instant, n: u64) -> Instant {
@@ -383,7 +376,7 @@ mod tests {
 
     #[test]
     fn request_has_endpoint_bearer_and_body() {
-        let key = RerankKey { context: "前文".into(), reading: "きょうは".into(), candidates: vec!["a".into(), "b".into()] };
+        let key = screened("前文", "きょうは", &["a", "b"]);
         let req = build_request(&creds(), &key);
         assert_eq!(
             req.url,
@@ -403,14 +396,14 @@ mod tests {
 
     #[test]
     fn request_omits_empty_context() {
-        let key = RerankKey { context: String::new(), reading: "あ".into(), candidates: vec!["a".into(), "b".into()] };
+        let key = screened("", "あ", &["a", "b"]);
         let body: serde_json::Value = serde_json::from_str(&build_request(&creds(), &key).body).unwrap();
         assert!(body["state"].get("context").is_none());
     }
 
     #[test]
     fn debug_output_hides_secrets() {
-        let key = RerankKey { context: String::new(), reading: "あ".into(), candidates: vec![] };
+        let key = screened("", "あ", &[]);
         let text = format!("{:?} {:?}", creds(), build_request(&creds(), &key));
         assert!(!text.contains("tok") && !text.contains("acct"), "{text}");
     }
@@ -439,7 +432,7 @@ mod tests {
 
     #[test]
     fn fetch_maps_transport_status_and_body() {
-        let key = RerankKey { context: String::new(), reading: "あ".into(), candidates: vec!["a".into(), "b".into()] };
+        let key = screened("", "あ", &["a", "b"]);
         let body = r#"{"success":true,"result":{"answers":{"rank":{"choice":"1"}}}}"#;
         let t = Fake(RefCell::default(), Ok((200, body)));
         assert_eq!(fetch_choice(&t, &creds(), &key), Ok(1));
@@ -485,7 +478,7 @@ mod tests {
     fn a_single_candidate_is_ignored() {
         let (mut s, loads) = state(true);
         let mut j = job(1, 1, "あ", false);
-        j.candidates.truncate(1);
+        j.payload = screened("", "あ", &["今日は"]);
         assert_eq!(s.submit(Instant::now(), j), Submitted::default());
         assert_eq!(loads.get(), 0);
         assert!(s.next_deadline().is_none());

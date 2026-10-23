@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
+use crate::outbound::{self, Decision, Screened};
 use crate::platform;
 use crate::rerank::{
     self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, Transport,
@@ -319,22 +320,13 @@ pub fn availability() -> Availability {
 pub fn rerank_async(
     controller_id: u64,
     generation: u64,
-    reading: &str,
-    context: &str,
-    candidates: &[String],
+    payload: Screened,
     urgent: bool,
 ) {
-    if candidates.len() < 2 {
+    if payload.candidates().len() < 2 {
         return;
     }
-    shared().submit(Job {
-        controller_id,
-        generation,
-        reading: reading.to_string(),
-        context: context.to_string(),
-        candidates: candidates.to_vec(),
-        urgent,
-    });
+    shared().submit(Job { controller_id, generation, payload, urgent });
 }
 
 static SMOKE_START: OnceLock<Instant> = OnceLock::new();
@@ -352,8 +344,12 @@ pub fn smoke_test() {
         std::process::exit(2);
     });
     let candidates = vec!["今日は医者に行く".to_string(), "今日歯医者に行く".to_string()];
+    let Decision::Send(payload) = outbound::screen("きょうはいしゃにいく", &candidates, "") else {
+        eprintln!("smoke test input was rejected by the outbound screen");
+        std::process::exit(2);
+    };
     let _ = SMOKE_START.set(Instant::now());
-    rerank_async(0, 0, "きょうはいしゃにいく", "", &candidates, true);
+    rerank_async(0, 0, payload, true);
     platform::run_main_run_loop();
 }
 
@@ -422,14 +418,9 @@ mod tests {
     }
 
     fn job(id: u64, generation: u64, reading: &str) -> Job {
-        Job {
-            controller_id: id,
-            generation,
-            reading: reading.into(),
-            context: String::new(),
-            candidates: vec!["a".into(), "b".into()],
-            urgent: true,
-        }
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let Decision::Send(payload) = outbound::screen(reading, &candidates, "") else { panic!("テスト入力が検査で止まった") };
+        Job { controller_id: id, generation, payload, urgent: true }
     }
 
     const WAIT: Duration = Duration::from_secs(5);
