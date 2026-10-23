@@ -9,6 +9,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
 use crate::composer::{Composer, Phase};
+use crate::deps::{EnglishMemory, Lexicon, ProdLexicon, ProdMemory};
 use crate::input::Route;
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
@@ -48,14 +49,10 @@ pub trait Environment {
 }
 
 /// `generation` は AI 結果の世代番号の開始値。作り直した session が、古い結果と同じ番号を再利用しないように渡す。
-pub fn new_session(mode: ConversionMode, generation: u64) -> Session<RustEngine> {
+pub fn new_session(mode: ConversionMode, generation: u64) -> Session<RustEngine, ProdLexicon, ProdMemory> {
     Session::new(
-        Composer::new(RustEngine::new())
-            .with_generation(generation)
-            .with_english(crate::loanword::english_for)
-            .with_english_word(crate::loanword::is_english_word)
-            .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
-            .with_emoji(crate::emoji::emoji_for),
+        Composer::new(RustEngine::new(), ProdLexicon).with_generation(generation),
+        ProdMemory,
         mode,
     )
 }
@@ -76,9 +73,10 @@ impl Drop for FlagGuard<'_> {
     }
 }
 
-pub struct Controller<C, P, E> {
+/// L / M の既定は本番の語彙と記憶。テストだけが fake に差し替える。
+pub struct Controller<C, P, E, L: Lexicon = ProdLexicon, M: EnglishMemory = ProdMemory> {
     id: u64,
-    session: RefCell<Session<RustEngine>>,
+    session: RefCell<Session<RustEngine, L, M>>,
     panel: P,
     env: E,
     last_client: RefCell<Option<C>>,
@@ -93,8 +91,8 @@ pub struct Controller<C, P, E> {
     last_gate: Cell<Option<(&'static str, &'static str)>>,
 }
 
-impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, E> {
-    pub fn new(id: u64, session: Session<RustEngine>, panel: P, env: E) -> Self {
+impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: EnglishMemory> Controller<C, P, E, L, M> {
+    pub fn new(id: u64, session: Session<RustEngine, L, M>, panel: P, env: E) -> Self {
         Self {
             id,
             session: RefCell::new(session),
@@ -213,25 +211,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
             session.apply_rerank(generation, index)
         };
         self.run(effects, Some(&client));
-    }
-
-    /// panic で session が中途半端かもしれないので、現在のモードで作り直して画面側も揃える。
-    /// 呼び出し側 (imk.rs) が、これ自体の panic を止める。
-    pub fn reset_after_panic(&self) {
-        match self.session.try_borrow_mut() {
-            Ok(mut session) => {
-                // 作り直した session にも、メニューの表示と同じ現在のモードを引き継ぐ。
-                *session = new_session(session.mode(), session.generation());
-            }
-            Err(_) => self.env.log("reset_after_panic: session is borrowed, not recreated"),
-        }
-        self.env.cancel_rerank(self.id);
-        self.panel.hide();
-        self.syncing.set(false);
-        self.panel_line.set(0);
-        if let Some(client) = self.client() {
-            client.set_marked("");
-        }
     }
 
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
@@ -362,10 +341,33 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
     }
 }
 
+// session の作り直しは本番の語彙と記憶に決まっている。
+impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, E> {
+    /// panic で session が中途半端かもしれないので、現在のモードで作り直して画面側も揃える。
+    /// 呼び出し側 (imk.rs) が、これ自体の panic を止める。
+    pub fn reset_after_panic(&self) {
+        match self.session.try_borrow_mut() {
+            Ok(mut session) => {
+                // 作り直した session にも、メニューの表示と同じ現在のモードを引き継ぐ。
+                *session = new_session(session.mode(), session.generation());
+            }
+            Err(_) => self.env.log("reset_after_panic: session is borrowed, not recreated"),
+        }
+        self.env.cancel_rerank(self.id);
+        self.panel.hide();
+        self.syncing.set(false);
+        self.panel_line.set(0);
+        if let Some(client) = self.client() {
+            client.set_marked("");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::rc::Rc;
+    use crate::deps::{FakeLexicon, FakeMemory};
     use crate::kkc::{learning::Learning, KkcCore};
 
     use crate::simulate::{FakeClient, FakeEnv, FakePanel};
@@ -545,37 +547,35 @@ mod tests {
         (controller, client, panel, env)
     }
 
-    fn rec_type(c: &RecController, client: &RecClient, letters: &str) {
+    fn rec_type<L: Lexicon, M: EnglishMemory>(c: &Controller<RecClient, HookPanel, RecEnv, L, M>, client: &RecClient, letters: &str) {
         for ch in letters.chars() {
             assert!(c.on_key(Route::Keys(vec![(Key::Letter { upper: false }, ch.to_string())]), client.clone()));
         }
     }
 
-    fn rec_press(c: &RecController, client: &RecClient, key: Key, text: &str) -> bool {
+    fn rec_press<L: Lexicon, M: EnglishMemory>(c: &Controller<RecClient, HookPanel, RecEnv, L, M>, client: &RecClient, key: Key, text: &str) -> bool {
         c.on_key(Route::Keys(vec![(key, text.to_string())]), client.clone())
     }
 
-    thread_local! {
-        static LEARNED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
+    type FakeDepsController = Controller<RecClient, HookPanel, RecEnv, FakeLexicon, FakeMemory>;
 
     /// 英語の記憶への書き込みを記録する session (本物の記憶ファイルには触れない)。
-    fn recording_controller(env: RecEnv) -> RecController {
-        let composer = Composer::new(RustEngine::new()).with_english_memory(|_| false, |w| {
-            LEARNED.with(|l| l.borrow_mut().push(w.to_string()));
-        });
-        Controller::new(8, Session::new(composer, ConversionMode::Space), HookPanel::default(), env)
+    fn recording_controller(env: RecEnv) -> (FakeDepsController, FakeMemory) {
+        let lexicon = FakeLexicon::default();
+        let memory = lexicon.memory();
+        let composer = Composer::new(RustEngine::new(), lexicon);
+        let session = Session::new(composer, memory.clone(), ConversionMode::Space);
+        (Controller::new(8, session, HookPanel::default(), env), memory)
     }
 
     /// 大文字 1 字を打って Enter で確定し、記憶に書かれた語を返す。
     fn learned_after_commit(env: RecEnv, bundle: Option<&str>) -> Vec<String> {
-        LEARNED.with(|l| l.borrow_mut().clear());
         let client = RecClient::default();
         client.set_bundle(bundle);
-        let c = recording_controller(env);
+        let (c, memory) = recording_controller(env);
         assert!(rec_press(&c, &client, Key::Letter { upper: true }, "G"));
         assert!(rec_press(&c, &client, Key::Enter, "\r"));
-        LEARNED.with(|l| l.borrow().clone())
+        memory.learned()
     }
 
     #[test]
@@ -602,29 +602,28 @@ mod tests {
 
     #[test]
     fn commit_composition_respects_the_learning_gate() {
-        LEARNED.with(|l| l.borrow_mut().clear());
         let env = RecEnv::default();
         env.secure.set(true);
         let client = RecClient::default();
-        let c = recording_controller(env.clone());
+        let (c, memory) = recording_controller(env.clone());
         rec_press(&c, &client, Key::Letter { upper: true }, "G");
         c.on_commit_composition(Some(client.clone()));
-        assert!(LEARNED.with(|l| l.borrow().is_empty()), "commit-all under secure input");
+        assert!(memory.learned().is_empty(), "commit-all under secure input");
 
         env.secure.set(false);
         rec_press(&c, &client, Key::Letter { upper: true }, "G");
         c.on_commit_composition(Some(client.clone()));
-        assert_eq!(LEARNED.with(|l| l.borrow().len()), 1, "commit-all learns when allowed");
+        assert_eq!(memory.learned().len(), 1, "commit-all learns when allowed");
     }
 
     /// 英語の記憶と engine の学習の両方を観測できる controller (どちらも本物のファイルには触れない)。
-    fn observing_controller(env: RecEnv) -> (RecController, Rc<KkcCore>) {
-        LEARNED.with(|l| l.borrow_mut().clear());
+    fn observing_controller(env: RecEnv) -> (FakeDepsController, Rc<KkcCore>, FakeMemory) {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
-        let composer = Composer::new(RustEngine::with_core(core.clone())).with_english_memory(|_| false, |w| {
-            LEARNED.with(|l| l.borrow_mut().push(w.to_string()));
-        });
-        (Controller::new(9, Session::new(composer, ConversionMode::Space), HookPanel::default(), env), core)
+        let lexicon = FakeLexicon::default();
+        let memory = lexicon.memory();
+        let composer = Composer::new(RustEngine::with_core(core.clone()), lexicon);
+        let session = Session::new(composer, memory.clone(), ConversionMode::Space);
+        (Controller::new(9, session, HookPanel::default(), env), core, memory)
     }
 
     fn engine_learned(core: &KkcCore) -> bool {
@@ -632,7 +631,7 @@ mod tests {
     }
 
     /// "kanji" を打ち、候補ウィンドウを開く。
-    fn open_candidate_window(c: &RecController, client: &RecClient) {
+    fn open_candidate_window(c: &FakeDepsController, client: &RecClient) {
         rec_type(c, client, "kanji");
         rec_press(c, client, Key::Space, " ");
         rec_press(c, client, Key::Space, " ");
@@ -643,7 +642,7 @@ mod tests {
         let env = RecEnv::default();
         env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core) = observing_controller(env);
+        let (c, core, _) = observing_controller(env);
         open_candidate_window(&c, &client);
         c.on_candidate_selected("幹事");
         engine_learned(&core)
@@ -663,7 +662,7 @@ mod tests {
         let env = RecEnv::default();
         env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core) = observing_controller(env);
+        let (c, core, _) = observing_controller(env);
         open_candidate_window(&c, &client);
         assert!(rec_press(&c, &client, Key::Digit(3), "3"));
         assert_eq!(c.phase(), Phase::Empty);
@@ -684,11 +683,11 @@ mod tests {
         let env = RecEnv::default();
         env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core) = observing_controller(env);
+        let (c, core, memory) = observing_controller(env);
         rec_type(&c, &client, "git");
         rec_press(&c, &client, Key::Enter, "\r");
         assert!(!engine_learned(&core));
-        LEARNED.with(|l| l.borrow().iter().any(|w| w == "git"))
+        memory.learned().iter().any(|w| w == "git")
     }
 
     #[test]

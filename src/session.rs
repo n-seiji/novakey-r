@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::composer::{CandidateEngine, Composer, Phase};
+use crate::composer::{CandidateEngine, Committed, Composer, Phase};
+use crate::deps::{EnglishMemory, Lexicon};
 use crate::keymap::{self, Action, Key};
 
 /// リランキング要求の中身。送信は Effect の実行側が決める。
@@ -58,19 +59,21 @@ pub struct Gates {
     pub rerank: bool,
 }
 
-pub struct Session<E: CandidateEngine> {
-    composer: Composer<E>,
+pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
+    composer: Composer<E, L>,
+    memory: M,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
     playful: fn(&str) -> Option<String>,
     /// RequestRerank を出してから、まだ CancelRerank を出していない。
     rerank_outstanding: bool,
 }
 
-impl<E: CandidateEngine> Session<E> {
-    pub fn new(mut composer: Composer<E>, mode: ConversionMode) -> Self {
+impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
+    pub fn new(mut composer: Composer<E, L>, memory: M, mode: ConversionMode) -> Self {
         composer.set_live(mode == ConversionMode::Live);
         Self {
             composer,
+            memory,
             playful: playful_convert,
             rerank_outstanding: false,
         }
@@ -189,11 +192,29 @@ impl<E: CandidateEngine> Session<E> {
         let mut fx = Vec::new();
         self.flush_romaji(gates, true, &mut fx);
         if !self.composer.is_empty() {
-            fx.push(Effect::Insert(self.composer.commit(gates.learning)));
+            fx.push(Effect::Insert(self.commit(gates)));
         }
         fx.push(Effect::HideCandidates);
         self.finish(&mut fx);
         fx
+    }
+
+    /// 確定して、学習してよければ学習する。学習の可否を判定するのはここだけ。
+    /// 学習しない (ゲートが閉じている / 学習対象の engine 候補が無い) ときは engine の保留を取り消す。
+    fn commit(&mut self, gates: &Gates) -> String {
+        let Committed { text, engine, english } = self.composer.commit();
+        match engine.filter(|_| gates.learning) {
+            Some((generation, rank)) => {
+                let _ = self.composer.engine_mut().select(generation, rank.0);
+            }
+            None => self.composer.engine_mut().cancel(),
+        }
+        if gates.learning {
+            for word in &english {
+                self.memory.learn(word);
+            }
+        }
+        text
     }
 
     /// 組成が空になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
@@ -246,7 +267,7 @@ impl<E: CandidateEngine> Session<E> {
 
     /// 現在の表示内容を確定して挿入する。suffix は確定直後に続けて入れる文字列。
     fn commit_and_insert(&mut self, gates: &Gates, suffix: &str, fx: &mut Vec<Effect>) {
-        let text = self.composer.commit(gates.learning);
+        let text = self.commit(gates);
         fx.push(Effect::SetMarked(String::new()));
         fx.push(Effect::Insert(format!("{text}{suffix}")));
         fx.push(Effect::HideCandidates);
@@ -429,6 +450,7 @@ mod tests {
             }
         }
     }
+    use crate::deps::{FakeLexicon, FakeMemory};
     use crate::keymap::classify;
 
     const ALLOW: Gates = Gates { learning: true, rerank: false };
@@ -447,7 +469,7 @@ mod tests {
 
     /// 打鍵列を流して、最後に Enter で確定した文字列を返す。
     fn typed(keys: &str) -> String {
-        let mut session = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         let mut out = String::new();
         for ch in keys.chars().chain(['\r']) {
             let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());
@@ -460,11 +482,10 @@ mod tests {
         out
     }
 
-    fn english_session() -> Session<NullEngine> {
-        Session::new(
-            Composer::new(NullEngine).with_english_word(|w| matches!(w, "enter" | "rain" | "in")),
-            ConversionMode::Space,
-        )
+    fn english_session() -> Session<NullEngine, FakeLexicon, FakeMemory> {
+        let lexicon = FakeLexicon::default().with_english_word(|w| matches!(w, "enter" | "rain" | "in"));
+        let memory = lexicon.memory();
+        Session::new(Composer::new(NullEngine, lexicon), memory, ConversionMode::Space)
     }
 
     /// 打鍵列を流し、各打鍵後の表示と、最後に Enter で確定した文字列を返す。
@@ -515,18 +536,13 @@ mod tests {
         assert_eq!(shown[2], "bra");
     }
 
-    thread_local! {
-        static LEARNED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    fn remembering_session() -> Session<NullEngine, FakeLexicon, FakeMemory> {
+        let lexicon = FakeLexicon::default();
+        let memory = lexicon.memory();
+        Session::new(Composer::new(NullEngine, lexicon), memory, ConversionMode::Space)
     }
 
-    fn remembering_session() -> Session<NullEngine> {
-        Session::new(Composer::new(NullEngine).with_english_memory(
-            |w| LEARNED.with(|l| l.borrow().iter().any(|x| x == w)),
-            |w| LEARNED.with(|l| l.borrow_mut().push(w.to_string())),
-        ), ConversionMode::Space)
-    }
-
-    fn shown_after(session: &mut Session<NullEngine>, keys: &str) -> String {
+    fn shown_after(session: &mut Session<NullEngine, FakeLexicon, FakeMemory>, keys: &str) -> String {
         for ch in keys.chars() {
             session.handle(&ALLOW, classify(ch), &ch.to_string());
         }
@@ -566,7 +582,7 @@ mod tests {
         assert_eq!(texts, ["artifactに", "artifactni"]);
     }
 
-    fn shown_after_english(session: &mut Session<NullEngine>, keys: &str) {
+    fn shown_after_english(session: &mut Session<NullEngine, FakeLexicon, FakeMemory>, keys: &str) {
         for ch in keys.chars() {
             session.handle(&ALLOW, classify(ch), &ch.to_string());
         }
@@ -614,7 +630,7 @@ mod tests {
 
     /// 打鍵列を流し、(アプリへ確定済みの文字列, 下線付きの未確定文字列) を返す。Enter は付けない。
     fn after(keys: &str) -> (String, String) {
-        let mut session = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         session.set_playful(|text| Some(text.to_string()));
         let (mut committed, mut marked) = (String::new(), String::new());
         for ch in keys.chars() {
@@ -673,11 +689,11 @@ mod tests {
         fn cancel(&mut self) {}
     }
 
-    fn effects_of(session: &mut Session<TwoEngine>, keys: &str) -> Vec<Effect> {
+    fn effects_of(session: &mut Session<TwoEngine, FakeLexicon, FakeMemory>, keys: &str) -> Vec<Effect> {
         effects_with(&ALLOW, session, keys)
     }
 
-    fn effects_with(gates: &Gates, session: &mut Session<TwoEngine>, keys: &str) -> Vec<Effect> {
+    fn effects_with(gates: &Gates, session: &mut Session<TwoEngine, FakeLexicon, FakeMemory>, keys: &str) -> Vec<Effect> {
         keys.chars()
             .flat_map(|ch| session.handle(gates, classify(ch), &ch.to_string()).effects)
             .collect()
@@ -685,7 +701,7 @@ mod tests {
 
     #[test]
     fn 確定したらai要求の取り消しを1度だけ出す() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         let typing = effects_with(&RERANK, &mut session, "kyou");
         assert!(typing.iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
         assert!(!typing.contains(&Effect::CancelRerank), "組成中は取り消さない");
@@ -697,21 +713,21 @@ mod tests {
 
     #[test]
     fn escで組成を捨てても取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_with(&RERANK, &mut session, "kyou");
         assert!(effects_with(&RERANK, &mut session, "\u{1b}").contains(&Effect::CancelRerank));
     }
 
     #[test]
     fn commit_compositionでも取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_with(&RERANK, &mut session, "kyou");
         assert!(session.commit_composition(&RERANK).contains(&Effect::CancelRerank));
     }
 
     #[test]
     fn 作った時のモードを返し_set_liveで組成中の表示が作り直される() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Live);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Live);
         assert_eq!(session.mode(), ConversionMode::Live);
         assert!(session.set_live(false).is_empty(), "組成が空なら表示は触らない");
         assert_eq!(session.mode(), ConversionMode::Space);
@@ -723,7 +739,7 @@ mod tests {
 
     #[test]
     fn has_pendingとcandidate_textsは組成の状態を映す() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert!(!session.has_pending());
         effects_of(&mut session, "ky");
         assert!(session.has_pending(), "未変換のローマ字だけでも保留中");
@@ -733,7 +749,7 @@ mod tests {
 
     #[test]
     fn select_highlightは候補にあるときだけ表示を更新する() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_of(&mut session, "kyou ");
         assert!(session.select_highlight("無い").is_empty());
         assert_eq!(session.select_highlight("x"), vec![Effect::SetMarked("x".to_string())]);
@@ -741,20 +757,20 @@ mod tests {
 
     #[test]
     fn 世代が違うapply_rerankは何も出さない() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_of(&mut session, "kyou");
         assert!(session.apply_rerank(u64::MAX, 1).is_empty());
     }
 
     #[test]
     fn aiが無効なら取り消しも出さない() {
-        let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
+        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_of(&mut session, "kyou");
         assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));
     }
 
     /// `<space>` `<bs>` `<esc>` `<enter>` `<F7>` を含む打鍵列を流し、(最後の表示, 確定した文字列) を返す。
-    fn drive(session: &mut Session<NullEngine>, keys: &str) -> (String, String) {
+    fn drive(session: &mut Session<NullEngine, FakeLexicon, FakeMemory>, keys: &str) -> (String, String) {
         let mut committed = String::new();
         let mut rest = keys;
         while !rest.is_empty() {
@@ -790,34 +806,34 @@ mod tests {
 
     #[test]
     fn 変換を取り消したあとも英字が確定に残る() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<space><bs><bs>"), ("きょうT".to_string(), String::new()));
         assert_eq!(drive(&mut s, "<enter>").1, "きょうT");
     }
 
     #[test]
     fn 字種変換を取り消したあとも英字が確定に残る() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<F7><esc><bs>"), ("きょうT".to_string(), String::new()));
         assert_eq!(drive(&mut s, "<enter>").1, "きょうT");
     }
 
     #[test]
     fn 取り消し後に打った文字も変換なしと同じ確定になる() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert_eq!(drive(&mut s, "iPhone<space><esc>s").0, "いPhones");
         assert_eq!(drive(&mut s, "<enter>").1, "いPhones");
     }
 
     #[test]
     fn 取り消し後のbsと打鍵は英字のまま続く() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert_eq!(drive(&mut s, "Tokyo<F7><esc><bs>a").0, "Tokya");
     }
 
     #[test]
     fn 取り消し後のspaceは変換せず英字を確定して空白を入れる() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         let (shown, committed) = drive(&mut s, "Tokyo<F7><esc><space>");
         assert_eq!((shown.as_str(), committed.as_str()), ("", "Tokyo "));
         assert_eq!(s.phase(), Phase::Empty);
@@ -847,7 +863,7 @@ mod tests {
 
     #[test]
     fn かなを消しきった後のbsと打鍵は英字のまま続く() {
-        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        let mut s = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         assert_eq!(drive(&mut s, "Tokyo<bs>a").0, "Tokya");
         assert_eq!(s.phase(), Phase::Literal);
     }
@@ -858,5 +874,66 @@ mod tests {
         assert_eq!(drive(&mut s, "enter").0, "enter");
         assert_eq!(drive(&mut s, "X").0, "えんてrX");
         assert_eq!(drive(&mut s, "<enter>").1, "えんてrX");
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEngine {
+        selects: std::rc::Rc<std::cell::RefCell<Vec<(u64, usize)>>>,
+        cancels: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl CandidateEngine for RecordingEngine {
+        fn convert(&mut self, _: u64, hiragana: &str) -> Vec<String> {
+            vec![hiragana.to_string(), "x".to_string()]
+        }
+        fn select(&mut self, revision: u64, index: usize) -> bool {
+            self.selects.borrow_mut().push((revision, index));
+            true
+        }
+        fn cancel(&mut self) {
+            self.cancels.set(self.cancels.get() + 1);
+        }
+    }
+
+    /// keys を打ち、Enter で確定する。engine と英語の記憶の両方を返す。
+    fn commit_with(gates: &Gates, keys: &str) -> (RecordingEngine, FakeMemory) {
+        let engine = RecordingEngine::default();
+        let lexicon = FakeLexicon::default();
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(engine.clone(), lexicon), memory.clone(), ConversionMode::Space);
+        for ch in keys.chars() {
+            session.handle(gates, classify(ch), &ch.to_string());
+        }
+        session.handle(gates, Key::Enter, "\r");
+        (engine, memory)
+    }
+
+    #[test]
+    fn 学習が許されれば確定した候補をengineに学習させる() {
+        let (engine, _) = commit_with(&ALLOW, "kyou ");
+        assert_eq!(engine.selects.borrow().len(), 1);
+        assert_eq!(engine.cancels.get(), 0);
+    }
+
+    #[test]
+    fn 学習が許されなければengineの保留を取り消して学習しない() {
+        let denied = Gates { learning: false, rerank: false };
+        let (engine, memory) = commit_with(&denied, "kyou ");
+        assert!(engine.selects.borrow().is_empty());
+        assert_eq!(engine.cancels.get(), 1);
+        assert!(memory.learned().is_empty());
+    }
+
+    #[test]
+    fn engine候補でない確定ではengineを取り消す() {
+        let (engine, _) = commit_with(&ALLOW, "kyou  ");
+        assert!(engine.selects.borrow().is_empty(), "raw 候補は学習しない");
+        assert_eq!(engine.cancels.get(), 1);
+    }
+
+    #[test]
+    fn 英字で確定した語は学習が許されるときだけ覚える() {
+        assert_eq!(commit_with(&ALLOW, "G").1.learned(), ["G"]);
+        let denied = Gates { learning: false, rerank: false };
+        assert!(commit_with(&denied, "G").1.learned().is_empty());
     }
 }

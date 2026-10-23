@@ -4,6 +4,7 @@
 // 候補は {text, source} で持ち、リランキング後も学習には Source::Engine の元の順位を渡す。
 // ローマ字そのまま(raw)など engine 以外の候補は順位を持たず、確定しても学習しない。
 
+use crate::deps::Lexicon;
 use crate::english_split;
 use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::symbols;
@@ -41,6 +42,17 @@ impl Candidate {
             _ => None,
         }
     }
+}
+
+/// 確定の結果。学習は「何を学習すべきか」だけを持ち、実行は Session が行う。
+/// `engine` が None なら Session は engine を取り消す (保留中の学習状態を残さない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    pub text: String,
+    /// engine に学習させる (確定時の世代, 元の順位)。
+    pub engine: Option<(u64, EngineRank)>,
+    /// 英語として確定した語。
+    pub english: Vec<String>,
 }
 
 pub trait CandidateEngine {
@@ -155,7 +167,7 @@ const EMOJI_LIMIT: usize = 5;
 /// 絵文字より前に並べるエンジン候補の数
 const EMOJI_AFTER_ENGINE: usize = 3;
 
-pub struct Composer<E: CandidateEngine> {
+pub struct Composer<E: CandidateEngine, L: Lexicon> {
     engine: E,
     segments: Vec<Segment>,
     /// 未確定のローマ字 (まだかなにならない打鍵) の唯一の持ち主。
@@ -167,20 +179,11 @@ pub struct Composer<E: CandidateEngine> {
     reading: ReadingCands,
     stage: Stage,
     live: bool,
-    /// カタカナ語に対応する英単語を引く関数。テストでは差し替える。
-    english_for: fn(&str) -> Vec<String>,
-    /// 打鍵列が英単語かを判定する関数。テストでは差し替える。
-    is_english_word: fn(&str) -> bool,
-    /// 英語として確定したことのある語か (english_memory)。テストでは差し替える。
-    knows_english: fn(&str) -> bool,
-    /// 英語として確定した語を覚える関数。
-    learn_english: fn(&str),
-    /// ひらがなの読み全体に対応する絵文字を引く関数。テストでは差し替える。
-    emoji_for: fn(&str) -> Vec<String>,
+    lexicon: L,
 }
 
-impl<E: CandidateEngine> Composer<E> {
-    pub fn new(engine: E) -> Self {
+impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
+    pub fn new(engine: E, lexicon: L) -> Self {
         Self {
             engine,
             segments: Vec::new(),
@@ -191,37 +194,8 @@ impl<E: CandidateEngine> Composer<E> {
             reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
             stage: Stage::Editing,
             live: false,
-            english_for: |_| Vec::new(),
-            is_english_word: |_| false,
-            knows_english: |_| false,
-            learn_english: |_| {},
-            emoji_for: |_| Vec::new(),
+            lexicon,
         }
-    }
-
-    /// カタカナ語の英単語候補 (desktop など) を引く関数を差し込む。
-    pub fn with_english(mut self, english_for: fn(&str) -> Vec<String>) -> Self {
-        self.english_for = english_for;
-        self
-    }
-
-    /// 打鍵列が英単語かを判定する関数 (enter など) を差し込む。
-    pub fn with_english_word(mut self, is_english_word: fn(&str) -> bool) -> Self {
-        self.is_english_word = is_english_word;
-        self
-    }
-
-    /// 英語として確定した語の記憶 (git など) を差し込む。
-    pub fn with_english_memory(mut self, knows: fn(&str) -> bool, learn: fn(&str)) -> Self {
-        self.knows_english = knows;
-        self.learn_english = learn;
-        self
-    }
-
-    /// 読みに対応する絵文字を引く関数を差し込む。
-    pub fn with_emoji(mut self, emoji_for: fn(&str) -> Vec<String>) -> Self {
-        self.emoji_for = emoji_for;
-        self
     }
 
     /// 世代番号の開始値。
@@ -457,7 +431,7 @@ impl<E: CandidateEngine> Composer<E> {
         if !self.is_kana_editing() {
             return None;
         }
-        english_split::split(&self.raw(), finished, self.knows_english)
+        english_split::split(&self.raw(), finished, |w| self.lexicon.knows_english(w))
     }
 
     /// 英単語を 1 つの単位にまとめ、かな混じり (Mixed) として確定・変換できるようにする。
@@ -494,7 +468,7 @@ impl<E: CandidateEngine> Composer<E> {
         let raw = self.raw();
         let word = || {
             !self.romaji.buffer().is_empty()
-                && ((self.knows_english)(&raw) || (raw.len() >= MIN_LEN && (self.is_english_word)(&raw)))
+                && (self.lexicon.knows_english(&raw) || (raw.len() >= MIN_LEN && self.lexicon.is_english_word(&raw)))
         };
         self.is_kana_editing()
             && raw.bytes().all(|b| b.is_ascii_lowercase())
@@ -758,28 +732,23 @@ impl<E: CandidateEngine> Composer<E> {
         self.stage = Stage::Reverted { kept };
     }
 
-    pub fn commit(&mut self, learn: bool) -> String {
+    /// 確定する。学習は実行せず、何を学習すべきかを返すだけ。実行と可否の判定は Session が行う。
+    pub fn commit(&mut self) -> Committed {
         let phase = self.phase();
-        let out = self.commit_preview();
-        if learn && phase == Phase::Dangling {
-            (self.learn_english)(&out);
+        let text = self.commit_preview();
+        let mut english = Vec::new();
+        if phase == Phase::Dangling {
+            english.push(text.clone());
         }
-        for segment in self.segments.iter().filter(|s| s.is_literal() && learn) {
-            (self.learn_english)(segment.keys());
-        }
-        let learned = match &self.stage {
+        english.extend(self.segments.iter().filter(|s| s.is_literal()).map(|s| s.keys().to_string()));
+        let engine = match &self.stage {
             Stage::Selecting(s) => s.list[s.cursor].engine_rank(),
             Stage::Editing if self.typing == Typing::Kana && self.live => {
                 self.reading.list.first().and_then(Candidate::engine_rank)
             }
             _ => None,
-        };
-        match learned.filter(|_| learn) {
-            Some(EngineRank(i)) => {
-                let _ = self.engine.select(self.reading.generation, i);
-            }
-            None => self.engine.cancel(),
         }
+        .map(|rank| (self.reading.generation, rank));
         self.segments.clear();
         self.split_origin = None;
         self.romaji.clear();
@@ -787,7 +756,12 @@ impl<E: CandidateEngine> Composer<E> {
         self.reset_candidates();
         self.stage = Stage::Editing;
         self.typing = Typing::Empty;
-        out
+        Committed { text, engine, english }
+    }
+
+    /// 学習の実行 (engine.select / cancel) のために Session が使う。
+    pub fn engine_mut(&mut self) -> &mut E {
+        &mut self.engine
     }
 
     /// LLM が選んだ表示位置 display_index を先頭へ昇格する。display_index は要求時の候補列(raw なし)での位置。
@@ -854,7 +828,7 @@ impl<E: CandidateEngine> Composer<E> {
         if matches!(phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
             return;
         }
-        let words = (self.english_for)(&translit::to_katakana(&self.hiragana));
+        let words = self.lexicon.english_for(&translit::to_katakana(&self.hiragana));
         let fresh: Vec<Candidate> = words
             .into_iter()
             .filter(|w| !list.iter().any(|c| &c.text == w))
@@ -872,7 +846,7 @@ impl<E: CandidateEngine> Composer<E> {
         if matches!(phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
             return;
         }
-        let fresh: Vec<Candidate> = (self.emoji_for)(&self.hiragana)
+        let fresh: Vec<Candidate> = self.lexicon.emoji_for(&self.hiragana)
             .into_iter()
             .filter(|e| !list.iter().any(|c| &c.text == e))
             .take(EMOJI_LIMIT)
@@ -933,6 +907,7 @@ impl<E: CandidateEngine> Composer<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deps::FakeLexicon;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -970,13 +945,25 @@ mod tests {
         }
     }
 
-    impl Composer<MockEngine> {
+    impl Composer<MockEngine, FakeLexicon> {
         fn engine_cancels(&self) -> std::cell::Ref<'_, usize> {
             self.engine.log.cancels.borrow()
         }
     }
 
-    fn composer() -> (Composer<MockEngine>, Log) {
+    /// Session が学習を許可して確定するときと同じ engine の扱い (select か cancel)。
+    fn commit_learning(c: &mut Composer<MockEngine, FakeLexicon>) -> String {
+        let Committed { text, engine, .. } = c.commit();
+        match engine {
+            Some((generation, EngineRank(i))) => {
+                c.engine_mut().select(generation, i);
+            }
+            None => c.engine_mut().cancel(),
+        }
+        text
+    }
+
+    fn composer() -> (Composer<MockEngine, FakeLexicon>, Log) {
         let log = Log::default();
         let engine = MockEngine {
             log: log.clone(),
@@ -985,16 +972,16 @@ mod tests {
                 vec!["今日".to_string(), "京".to_string(), "教".to_string()],
             )],
         };
-        (Composer::new(engine), log)
+        (Composer::new(engine, FakeLexicon::default()), log)
     }
 
-    fn type_kyou(c: &mut Composer<MockEngine>) {
+    fn type_kyou(c: &mut Composer<MockEngine, FakeLexicon>) {
         c.push_input("k", "", "");
         c.push_input("yo", "きょ", "");
         c.push_input("u", "う", "");
     }
 
-    fn texts(c: &Composer<MockEngine>) -> Vec<&str> {
+    fn texts(c: &Composer<MockEngine, FakeLexicon>) -> Vec<&str> {
         c.candidates().iter().map(|x| x.text.as_str()).collect()
     }
 
@@ -1116,7 +1103,7 @@ mod tests {
             log,
             table: vec![("ぎっとはぶ".to_string(), vec!["github".to_string()])],
         };
-        let mut c = Composer::new(engine);
+        let mut c = Composer::new(engine, FakeLexicon::default());
         c.push_input("github", "ぎっとはぶ", "");
         c.begin_conversion();
         assert_eq!(texts(&c), vec!["github"]);
@@ -1130,20 +1117,20 @@ mod tests {
             log,
             table: vec![("ぎ".to_string(), vec![])],
         };
-        let mut c = Composer::new(engine);
+        let mut c = Composer::new(engine, FakeLexicon::default());
         c.push_input("gi", "ぎ", "");
         assert!(c.begin_conversion());
         assert_eq!(c.display(), "ぎ");
         assert_eq!(texts(&c), vec!["ぎ", "gi", "ギ"]);
         assert!(c.candidates().iter().all(|cand| cand.engine_rank().is_none()));
-        assert_eq!(c.commit(true), "ぎ");
+        assert_eq!(commit_learning(&mut c), "ぎ");
         assert_eq!(*c.engine_cancels(), 1, "学習しない");
     }
 
     #[test]
     fn 変換候補が空でもdanglingならrawが先頭のまま() {
         let engine = MockEngine { log: Log::default(), table: vec![] };
-        let mut c = Composer::new(engine);
+        let mut c = Composer::new(engine, FakeLexicon::default());
         c.push_flush(Flush::Dangling("きょうh".to_string()));
         c.push_input("kyouh", "", "");
         assert_eq!(c.phase(), Phase::Dangling);
@@ -1183,7 +1170,7 @@ mod tests {
                 vec!["今日".to_string(), "京".to_string(), "今日".to_string()],
             )],
         };
-        let mut c = Composer::new(engine);
+        let mut c = Composer::new(engine, FakeLexicon::default());
         type_kyou(&mut c);
         assert_eq!(c.candidates().len(), 2);
         assert_eq!(c.candidates()[0].text, "今日");
@@ -1266,7 +1253,7 @@ mod tests {
     fn 未変換のままcommitすると生ひらがなを返しcancelする() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        assert_eq!(c.commit(true), "きょう");
+        assert_eq!(commit_learning(&mut c), "きょう");
         assert_eq!(*log.cancels.borrow(), 1);
         assert!(log.selects.borrow().is_empty());
         assert!(c.is_empty());
@@ -1279,24 +1266,14 @@ mod tests {
         type_kyou(&mut c);
         let generation = c.current_generation();
         c.begin_conversion();
-        assert_eq!(c.commit(true), "今日");
+        assert_eq!(commit_learning(&mut c), "今日");
         assert_eq!(*log.selects.borrow(), vec![(generation, 0)]);
 
         type_kyou(&mut c);
         c.begin_conversion();
         c.select_candidate(2);
-        assert_eq!(c.commit(true), "京");
+        assert_eq!(commit_learning(&mut c), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
-    }
-
-    #[test]
-    fn learnがfalseならcommitしても学習せずcancelする() {
-        let (mut c, log) = composer();
-        type_kyou(&mut c);
-        c.begin_conversion();
-        assert_eq!(c.commit(false), "今日");
-        assert!(log.selects.borrow().is_empty());
-        assert_eq!(*log.cancels.borrow(), 1);
     }
 
     #[test]
@@ -1305,7 +1282,7 @@ mod tests {
         type_kyou(&mut c);
         c.begin_conversion();
         c.advance();
-        assert_eq!(c.commit(true), "kyou");
+        assert_eq!(commit_learning(&mut c), "kyou");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(*log.cancels.borrow(), 1);
     }
@@ -1315,7 +1292,7 @@ mod tests {
         let (mut c, log) = composer();
         c.set_live(true);
         type_kyou(&mut c);
-        assert_eq!(c.commit(true), "今日");
+        assert_eq!(commit_learning(&mut c), "今日");
         assert_eq!(log.selects.borrow().last().unwrap().1, 0);
     }
 
@@ -1325,7 +1302,7 @@ mod tests {
         c.set_live(true);
         type_kyou(&mut c);
         c.revert();
-        assert_eq!(c.commit(true), "きょう");
+        assert_eq!(commit_learning(&mut c), "きょう");
         assert_eq!(*log.cancels.borrow(), 1);
     }
 
@@ -1338,7 +1315,7 @@ mod tests {
         assert_eq!(c.display(), "Git");
         assert!(log.converts.borrow().is_empty());
         assert!(!c.begin_conversion());
-        assert_eq!(c.commit(true), "Git");
+        assert_eq!(commit_learning(&mut c), "Git");
         assert_eq!(*log.cancels.borrow(), 1);
         assert_eq!(c.phase(), Phase::Empty);
     }
@@ -1366,7 +1343,7 @@ mod tests {
         c.begin_conversion();
         assert_eq!(c.display(), "京");
         assert_eq!(texts(&c), vec!["京", "kyou", "今日", "教"]);
-        assert_eq!(c.commit(true), "京");
+        assert_eq!(commit_learning(&mut c), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
     }
 
@@ -1407,7 +1384,7 @@ mod tests {
                 window: false
             }
         );
-        assert_eq!(c.commit(true), "教");
+        assert_eq!(commit_learning(&mut c), "教");
         assert_eq!(log.selects.borrow().last().unwrap().1, 2);
     }
 
@@ -1462,7 +1439,7 @@ mod tests {
         assert_eq!(c.display(), "京");
         assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(1)));
         assert_eq!(c.candidates()[1].text, "今日");
-        assert_eq!(c.commit(true), "京");
+        assert_eq!(commit_learning(&mut c), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
     }
 
@@ -1496,14 +1473,14 @@ mod tests {
     use crate::keymap::{action_for, Action, Key};
     use crate::romaji_converter::RomajiConverter;
 
-    fn type_word(c: &mut Composer<MockEngine>, conv: &mut RomajiConverter, word: &str) {
+    fn type_word(c: &mut Composer<MockEngine, FakeLexicon>, conv: &mut RomajiConverter, word: &str) {
         for ch in word.chars() {
             let kana: String = conv.process_input(ch).unwrap_or_default();
             c.push_input(&ch.to_string(), &kana, conv.buffer());
         }
     }
 
-    fn typed_and_flushed(word: &str) -> Composer<MockEngine> {
+    fn typed_and_flushed(word: &str) -> Composer<MockEngine, FakeLexicon> {
         let (mut c, _) = composer();
         let mut conv = RomajiConverter::new();
         type_word(&mut c, &mut conv, word);
@@ -1515,7 +1492,7 @@ mod tests {
     fn 変換しきれない子音が残る語はenterでrawのまま確定する() {
         let mut c = typed_and_flushed("enter");
         assert_eq!(c.phase(), Phase::Dangling);
-        assert_eq!(c.commit(true), "enter");
+        assert_eq!(commit_learning(&mut c), "enter");
     }
 
     #[test]
@@ -1526,7 +1503,7 @@ mod tests {
         assert_eq!(c.display(), "github");
         assert_eq!(texts(&c)[0], "github");
         assert!(texts(&c).len() >= 2);
-        assert_eq!(c.commit(true), "github");
+        assert_eq!(commit_learning(&mut c), "github");
         assert_eq!(*c.engine_cancels(), 1);
     }
 
@@ -1534,7 +1511,7 @@ mod tests {
     fn 末尾のnはかなのまま確定する() {
         let mut c = typed_and_flushed("kan");
         assert_eq!(c.phase(), Phase::Composing);
-        assert_eq!(c.commit(true), "かん");
+        assert_eq!(commit_learning(&mut c), "かん");
     }
 
     #[test]
@@ -1561,7 +1538,7 @@ mod tests {
             action_for(c.phase(), Key::Punct),
             Action::CommitThenInsert
         );
-        assert_eq!(format!("{}{}", c.commit(true), "."), "enter.");
+        assert_eq!(format!("{}{}", commit_learning(&mut c), "."), "enter.");
     }
 
     #[test]
@@ -1573,10 +1550,10 @@ mod tests {
         c.backspace_romaji();
         c.push_flush(conv.flush());
         assert_eq!(c.phase(), Phase::Dangling);
-        assert_eq!(c.commit(true), "enter");
+        assert_eq!(commit_learning(&mut c), "enter");
     }
 
-    fn type_symbol(c: &mut Composer<MockEngine>, ascii: &str) {
+    fn type_symbol(c: &mut Composer<MockEngine, FakeLexicon>, ascii: &str) {
         let form = crate::symbols::default_form(ascii).unwrap_or(ascii);
         c.push_input(ascii, form, "");
     }
@@ -1588,7 +1565,7 @@ mod tests {
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(c.display(), "「");
         assert!(log.converts.borrow().is_empty());
-        assert_eq!(c.commit(true), "「");
+        assert_eq!(commit_learning(&mut c), "「");
         assert!(log.selects.borrow().is_empty());
     }
 
@@ -1604,7 +1581,7 @@ mod tests {
         );
         assert!(c.advance());
         assert_eq!(c.display(), "『");
-        assert_eq!(c.commit(true), "『");
+        assert_eq!(commit_learning(&mut c), "『");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(*c.engine_cancels(), 1);
     }
@@ -1617,7 +1594,7 @@ mod tests {
         assert!(c.retreat());
         assert_eq!(c.display(), ".");
         assert!(c.select_candidate(1));
-        assert_eq!(c.commit(true), "．");
+        assert_eq!(commit_learning(&mut c), "．");
     }
 
     #[test]
@@ -1644,7 +1621,7 @@ mod tests {
         type_word(&mut c, &mut conv, "a");
         c.push_flush(conv.flush());
         assert_eq!(c.display_hiragana(), "（あ");
-        assert_eq!(c.commit(true), "（あ");
+        assert_eq!(commit_learning(&mut c), "（あ");
     }
 
     #[test]
@@ -1675,7 +1652,7 @@ mod tests {
         let mut c = typed_and_flushed("world");
         assert_eq!(c.phase(), Phase::Dangling);
         assert!(!c.is_symbol());
-        assert_eq!(c.commit(true), "world");
+        assert_eq!(commit_learning(&mut c), "world");
     }
 
     #[test]
@@ -1687,7 +1664,7 @@ mod tests {
         assert_eq!(c.display(), "キョウ");
         assert!(c.transliterate(Form::FullAlnum(translit::Case::Lower)));
         assert_eq!(c.display(), "ｋｙｏｕ");
-        assert_eq!(c.commit(true), "ｋｙｏｕ");
+        assert_eq!(commit_learning(&mut c), "ｋｙｏｕ");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(c.phase(), Phase::Empty);
     }
@@ -1794,13 +1771,13 @@ mod tests {
         c.transliterate(Form::Katakana);
         c.revert();
         assert_eq!(c.phase(), Phase::Literal);
-        assert_eq!(c.commit(true), "Tokyo");
+        assert_eq!(commit_learning(&mut c), "Tokyo");
     }
 
     #[test]
     fn 取り消しからの再変換は直前の候補列から続く_dangling() {
         let engine = MockEngine { log: Log::default(), table: vec![("きょうh".to_string(), vec![])] };
-        let mut c = Composer::new(engine);
+        let mut c = Composer::new(engine, FakeLexicon::default());
         c.push_flush(Flush::Dangling("きょうh".to_string()));
         c.push_input("kyouh", "", "");
         assert!(c.begin_conversion());
@@ -1844,7 +1821,7 @@ mod tests {
         c.push_literal("Phone");
         assert!(c.begin_conversion());
         assert_eq!(texts(&c), vec!["いPhone", "iPhone"]);
-        assert_eq!(c.commit(true), "いPhone");
+        assert_eq!(commit_learning(&mut c), "いPhone");
         assert!(log.selects.borrow().is_empty());
     }
 
@@ -1879,7 +1856,7 @@ mod tests {
         }
     }
 
-    fn loan_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine> {
+    fn loan_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine, FakeLexicon> {
         let engine = MockEngine {
             log: Log::default(),
             table: vec![(
@@ -1887,7 +1864,7 @@ mod tests {
                 candidates.iter().map(|s| s.to_string()).collect(),
             )],
         };
-        Composer::new(engine).with_english(loanwords)
+        Composer::new(engine, FakeLexicon::default().with_english(loanwords))
     }
 
     #[test]
@@ -1909,7 +1886,7 @@ mod tests {
         c.begin_conversion();
         assert!(c.advance());
         assert_eq!(c.display(), "desktop");
-        assert_eq!(c.commit(true), "desktop");
+        assert_eq!(commit_learning(&mut c), "desktop");
         assert!(c.engine.log.selects.borrow().is_empty());
     }
 
@@ -1919,9 +1896,9 @@ mod tests {
             log: Log::default(),
             table: vec![("うぃんど".to_string(), vec!["ウィンド".to_string()])],
         };
-        let mut c = Composer::new(engine).with_english(|k| {
+        let mut c = Composer::new(engine, FakeLexicon::default().with_english(|k| {
             if k == "ウィンド" { vec!["wind".to_string()] } else { Vec::new() }
-        });
+        }));
         let mut conv = RomajiConverter::new();
         type_word(&mut c, &mut conv, "uxinndo");
         c.push_flush(conv.flush());
@@ -1992,7 +1969,7 @@ mod tests {
         }
     }
 
-    fn emoji_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine> {
+    fn emoji_composer(reading: &str, candidates: &[&str]) -> Composer<MockEngine, FakeLexicon> {
         let engine = MockEngine {
             log: Log::default(),
             table: vec![(
@@ -2000,7 +1977,7 @@ mod tests {
                 candidates.iter().map(|s| s.to_string()).collect(),
             )],
         };
-        Composer::new(engine).with_emoji(emojis)
+        Composer::new(engine, FakeLexicon::default().with_emoji(emojis))
     }
 
     #[test]
@@ -2034,7 +2011,7 @@ mod tests {
         c.begin_conversion();
         let index = texts(&c).iter().position(|t| *t == "🍻").unwrap();
         assert!(c.select_candidate(index));
-        assert_eq!(c.commit(true), "🍻");
+        assert_eq!(commit_learning(&mut c), "🍻");
         assert!(c.engine.log.selects.borrow().is_empty());
     }
 
@@ -2067,7 +2044,7 @@ mod tests {
     #[test]
     fn 記号の組成では絵文字を引かない() {
         let engine = MockEngine { log: Log::default(), table: vec![] };
-        let mut c = Composer::new(engine).with_emoji(|_| vec!["😺".to_string()]);
+        let mut c = Composer::new(engine, FakeLexicon::default().with_emoji(|_| vec!["😺".to_string()]));
         c.push_input("!", "！", "");
         c.begin_conversion();
         assert!(!texts(&c).contains(&"😺"));
@@ -2092,7 +2069,7 @@ mod tests {
         assert_eq!(texts(&c), vec!["戌", "inu", "犬", "乾", "🐶", "伊奴"]);
     }
 
-    fn typed_romaji(keys: &str) -> Composer<MockEngine> {
+    fn typed_romaji(keys: &str) -> Composer<MockEngine, FakeLexicon> {
         let (mut c, _) = composer();
         for ch in keys.chars() {
             c.type_romaji(&ch.to_string());
@@ -2145,7 +2122,7 @@ mod tests {
             let mut c = typed_romaji(keys);
             c.flush_romaji();
             let preview = c.commit_preview();
-            assert_eq!(c.commit(false), preview, "{keys}");
+            assert_eq!(c.commit().text, preview, "{keys}");
         }
     }
 }
