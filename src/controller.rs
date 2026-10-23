@@ -13,11 +13,9 @@ use crate::deps::{EnglishMemory, Lexicon, ProdLexicon, ProdMemory};
 use crate::input::Route;
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
-use crate::outbound::{self, Decision, Screened};
+use crate::outbound::{self, Screened};
+use crate::rerank_gate::{GateOutcome, RerankGate};
 use crate::session::{ConversionMode, Effect, Gates, Outcome, RerankJob, Session};
-
-/// 直前文脈として読む最大長 (UTF-16 単位)。
-const CONTEXT_MAX_UTF16: usize = 200;
 
 /// ホストアプリのテキスト入力。
 pub trait TextClient {
@@ -87,8 +85,7 @@ pub struct Controller<C, P, E, L: Lexicon = ProdLexicon, M: EnglishMemory = Prod
     /// クライアントの bundle id。コントローラは 1 つのクライアントに付くので、最初に取れたものを使い回す。
     /// 取れなかったときは入れず、次の機会に取り直す。
     bundle_id: OnceCell<String>,
-    /// 直前に外へ出した「送らなかった / 文脈なしで送った」理由。同じ理由を打鍵ごとにログしないために持つ。
-    last_gate: Cell<Option<(&'static str, &'static str)>>,
+    gate: RerankGate,
 }
 
 impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: EnglishMemory> Controller<C, P, E, L, M> {
@@ -102,7 +99,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             syncing: Cell::new(false),
             panel_line: Cell::new(0),
             bundle_id: OnceCell::new(),
-            last_gate: Cell::new(None),
+            gate: RerankGate::default(),
         }
     }
 
@@ -301,36 +298,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
     fn send_rerank(&self, urgent: bool, job: &RerankJob) {
         let client = self.client();
-        let preceding = client
-            .as_ref()
-            .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
-            .unwrap_or_default();
-        let decision = match outbound::gate_app(self.env.secure_input(), self.bundle_id(client.as_ref())) {
-            Ok(pass) => outbound::screen(pass, &job.hiragana, &job.candidates, &preceding),
-            Err(reason) => Decision::Skip(reason),
-        };
-        match decision {
-            Decision::Skip(reason) => {
-                self.log_gate(Some(("skipped", reason.name())));
-                // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
-                self.env.cancel_rerank(self.id);
-            }
-            Decision::Send(screened) => {
-                match screened.context_dropped() {
-                    Some(reason) => self.log_gate(Some(("without context", reason.name()))),
-                    None => self.log_gate(None),
-                }
-                self.env.send_rerank(self.id, job.generation, &screened, urgent);
-            }
-        }
-    }
-
-    /// 理由が前回と変わったときだけログする (打鍵ごとに同じ行が出ないように)。名前だけで入力は含まない。
-    fn log_gate(&self, gate: Option<(&'static str, &'static str)>) {
-        if self.last_gate.replace(gate) != gate {
-            if let Some((kind, reason)) = gate {
-                self.env.log(&format!("LLM rerank {kind}: {reason}"));
-            }
+        let bundle_id = self.bundle_id(client.as_ref());
+        match self.gate.check(&self.env, bundle_id, client.as_ref(), &job.hiragana, &job.candidates) {
+            GateOutcome::Send(screened) => self.env.send_rerank(self.id, job.generation, &screened, urgent),
+            // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
+            GateOutcome::Cancel => self.env.cancel_rerank(self.id),
         }
     }
 }
@@ -449,6 +421,7 @@ mod tests {
     struct RecClient {
         bundle: Rc<RefCell<Option<String>>>,
         bundle_calls: Rc<Cell<usize>>,
+        preceding_calls: Rc<Cell<usize>>,
         marked: Rc<RefCell<String>>,
         preceding: Rc<RefCell<String>>,
     }
@@ -467,6 +440,7 @@ mod tests {
             *self.marked.borrow_mut() = text.to_string();
         }
         fn preceding_text(&self, _max_utf16: usize) -> String {
+            self.preceding_calls.set(self.preceding_calls.get() + 1);
             self.preceding.borrow().clone()
         }
         fn bundle_id(&self) -> Option<String> {
@@ -781,6 +755,28 @@ mod tests {
         let payloads = env.payloads.borrow();
         assert!(!payloads.is_empty());
         assert!(payloads.iter().all(|p| *p == ("今日は".to_string(), None)), "{payloads:?}");
+    }
+
+    #[test]
+    fn preceding_text_is_not_read_when_the_app_gate_refuses() {
+        for (secure, bundle) in [(true, Some("com.apple.TextEdit")), (false, Some("com.apple.Terminal")), (false, Some("com.1password.1password")), (false, None)] {
+            let (c, client, _panel, env) = rec_fixture();
+            env.allowed.set(true);
+            env.secure.set(secure);
+            client.set_bundle(bundle);
+            rec_type(&c, &client, "kyou");
+            assert!(env.sent.borrow().is_empty(), "{secure} {bundle:?}");
+            assert_eq!(client.preceding_calls.get(), 0, "{secure} {bundle:?}");
+        }
+    }
+
+    #[test]
+    fn preceding_text_is_read_when_the_app_gate_passes() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(Some("com.apple.TextEdit"));
+        rec_type(&c, &client, "kyou");
+        assert!(client.preceding_calls.get() > 0);
     }
 
     #[test]
