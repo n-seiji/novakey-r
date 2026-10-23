@@ -218,9 +218,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         text
     }
 
-    /// 組成が空になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
+    /// 組成が空になった、または英語を打っている状態になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
     fn finish(&mut self, fx: &mut Vec<Effect>) {
-        if self.rerank_outstanding && self.composer.is_empty() && !self.composer.has_romaji() {
+        let idle = (self.composer.is_empty() && !self.composer.has_romaji()) || self.composer.phase() == Phase::Dangling;
+        if self.rerank_outstanding && idle {
             self.rerank_outstanding = false;
             fx.push(Effect::CancelRerank);
         }
@@ -870,11 +871,24 @@ mod tests {
     }
 
     #[test]
-    fn 現挙動_英語らしい表示は状態に反映されずxでかなに戻る_段3_6で直す予定() {
+    fn 英語らしい表示になったあと大文字を続けても表示どおりに確定する() {
         let mut s = english_session();
         assert_eq!(drive(&mut s, "enter").0, "enter");
-        assert_eq!(drive(&mut s, "X").0, "えんてrX");
-        assert_eq!(drive(&mut s, "<enter>").1, "えんてrX");
+        assert_eq!(drive(&mut s, "X").0, "enterX");
+        assert_eq!(drive(&mut s, "<enter>").1, "enterX");
+        assert_eq!(drive(&mut english_session(), "mergeX<enter>").1, "mergeX");
+    }
+
+    #[test]
+    fn 英語を打っている間はai並べ替えを要求しない() {
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
+        assert!(effects_with(&RERANK, &mut session, "ente").iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
+        let english = effects_with(&RERANK, &mut session, "rsaX");
+        assert!(!english.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{english:?}");
+        assert_eq!(english.iter().filter(|e| **e == Effect::CancelRerank).count(), 1, "英語になった時点で出していた要求を取り消す");
+        assert_eq!(session.marked_text(), "entersaX");
     }
 
     #[derive(Clone, Default)]

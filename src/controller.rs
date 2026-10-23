@@ -725,6 +725,19 @@ mod tests {
     }
 
     #[test]
+    fn no_rerank_request_is_sent_while_typing_english() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(Some("com.apple.TextEdit"));
+        rec_type(&c, &client, "ente");
+        assert!(!env.sent.borrow().is_empty(), "kana input is still reranked");
+        env.sent.borrow_mut().clear();
+        rec_type(&c, &client, "rsa");
+        assert!(env.sent.borrow().is_empty(), "{:?}", env.sent.borrow());
+        assert_eq!(*client.marked.borrow(), "entersa");
+    }
+
+    #[test]
     fn skipped_rerank_cancels_the_pending_request_and_sends_nothing() {
         let (c, client, _panel, env) = rec_fixture();
         env.allowed.set(true);

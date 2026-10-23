@@ -56,3 +56,7 @@ kyou<space><space><down><commit-all>	今日
 <ai-on>kyou<live><rerank:3><enter>	きょう
 <ai-on>kyo<rerank:3>u<rerank-old:3><space><enter>	強
 <ai-on>kyo<rerank-old:3>u<rerank:3><space><enter>	きょう
+# 英語と見なして英字で表示している間に大文字を打つと、表示どおりの英字を確定する (かなに戻さない)。
+enterX<enter>	enterX
+mergeX<enter>	mergeX
+enterXa<enter>	enterXa
