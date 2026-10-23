@@ -606,7 +606,16 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.engine.cancel();
         }
         self.split_origin = None;
-        if self.typing == Typing::English && self.english_shown && matches!(self.stage, Stage::Editing) {
+        let split = if self.typing == Typing::English { self.english_split(false) } else { None };
+        if let Some(split) = split {
+            // 英語分割を表示している間の大文字は、見えているとおり (英単語+かな) の後ろに付ける。
+            self.segments = std::iter::once(Segment::Literal(split.head))
+                .chain(split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana }))
+                .chain((!split.pending.is_empty()).then(|| Segment::Kana { keys: split.pending.clone(), kana: split.pending }))
+                .chain(std::iter::once(Segment::Literal(text.to_string())))
+                .collect();
+            self.romaji.clear();
+        } else if self.typing == Typing::English && self.english_shown && matches!(self.stage, Stage::Editing) {
             // 英語を打っている途中の大文字は、表示している英字の続きにする (かなには戻さない)。
             let word = self.raw() + text;
             self.romaji.clear();

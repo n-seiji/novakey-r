@@ -60,3 +60,6 @@ kyou<space><space><down><commit-all>	今日
 enterX<enter>	enterX
 mergeX<enter>	mergeX
 enterXa<enter>	enterXa
+# 英語分割を表示している間に大文字を打つと、見えていたかなを残して大文字を続ける。
+artifactnikA<enter>	artifactにkA
+artifactnikAa<enter>	artifactにkAa

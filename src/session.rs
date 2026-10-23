@@ -154,6 +154,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
+        let before = phase;
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
         let key = match text.chars().collect::<Vec<_>>()[..] {
             [ch] if !ch.is_ascii_alphabetic() && self.composer.accepts_romaji(ch) => {
@@ -162,6 +163,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             _ => key,
         };
         if let Some(handled) = self.prepare(gates, key, &mut fx) {
+            self.resume_rerank(gates, before, &mut fx);
             self.finish(&mut fx);
             return Outcome { handled, action: None, phase, effects: fx };
         }
@@ -175,6 +177,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
         }
         let handled = self.perform(gates, action, text, &mut fx);
+        self.resume_rerank(gates, before, &mut fx);
         self.finish(&mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
@@ -246,6 +249,14 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         if let Some(job) = self.rerank_job() {
             self.rerank_outstanding = true;
             fx.push(Effect::RequestRerank { urgent, job });
+        }
+    }
+
+    /// 英語の判定が外れてかなの組成に戻った打鍵は、かなが増えなくても (未確定ローマ字の BS など) AI 要求を出し直す。
+    fn resume_rerank(&mut self, gates: &Gates, before: Phase, fx: &mut Vec<Effect>) {
+        let requested = fx.iter().any(|e| matches!(e, Effect::RequestRerank { .. }));
+        if before == Phase::Dangling && self.phase() == Phase::Composing && !requested {
+            self.request_rerank(gates, false, fx);
         }
     }
 
@@ -877,6 +888,17 @@ mod tests {
         assert_eq!(drive(&mut s, "X").0, "enterX");
         assert_eq!(drive(&mut s, "<enter>").1, "enterX");
         assert_eq!(drive(&mut english_session(), "mergeX<enter>").1, "mergeX");
+    }
+
+    #[test]
+    fn 英語の判定が外れたら打鍵がかなを増やさなくてもai要求を再開する() {
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
+        effects_with(&RERANK, &mut session, "enter");
+        assert_eq!(session.marked_text(), "enter");
+        let back = effects_with(&RERANK, &mut session, "\u{7f}");
+        assert!(back.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{back:?}");
     }
 
     #[test]
