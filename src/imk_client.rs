@@ -5,6 +5,7 @@ use objc2::runtime::AnyObject;
 use objc2::{msg_send, msg_send_id};
 use objc2_foundation::{NSNotFound, NSRange, NSString};
 
+use crate::controller::TextClient;
 use crate::platform::{lossy_string, utf16_units};
 
 /// retain 済みのクライアント参照。Id が生存を保証するので、メソッドは安全に呼べる。
@@ -13,15 +14,8 @@ pub struct Client(Id<AnyObject>);
 
 const NOT_FOUND: usize = NSNotFound as usize;
 
-impl Client {
-    pub fn new(client: &AnyObject) -> Self {
-        let ptr = client as *const AnyObject as *mut AnyObject;
-        // SAFETY: ptr は有効な参照から作ったので非 null で生存している。retain して所有権を得る。
-        let retained = unsafe { Id::retain(ptr) }.expect("参照から作ったポインタは非 null");
-        Self(retained)
-    }
-
-    pub fn insert(&self, text: &str) {
+impl TextClient for Client {
+    fn insert(&self, text: &str) {
         let ns = NSString::from_str(text);
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
         // SAFETY: IMKTextInput の insertText:replacementRange: は (NSString, NSRange) を取り、戻り値なし。
@@ -30,7 +24,7 @@ impl Client {
         }
     }
 
-    pub fn set_marked(&self, text: &str) {
+    fn set_marked(&self, text: &str) {
         let ns = NSString::from_str(text);
         let selection = NSRange { location: ns.len_utf16(), length: 0 };
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
@@ -45,18 +39,27 @@ impl Client {
         }
     }
 
-    /// マーク範囲 (なければ選択範囲) の直前のテキストを最大 max_utf16 UTF-16 単位返す。取れなければ空。
-    pub fn preceding_text(&self, max_utf16: usize) -> String {
+    // マーク範囲 (なければ選択範囲) の直前のテキストを最大 max_utf16 UTF-16 単位返す。取れなければ空。
+    fn preceding_text(&self, max_utf16: usize) -> String {
         self.anchor()
             .and_then(|anchor| preceding_range(anchor, max_utf16))
             .and_then(|range| self.substring(range))
             .unwrap_or_default()
     }
 
-    pub fn bundle_id(&self) -> Option<String> {
+    fn bundle_id(&self) -> Option<String> {
         // SAFETY: IMKTextInput の bundleIdentifier は NSString (nil 可) を返す。
         let id: Option<Id<NSString>> = unsafe { msg_send_id![&*self.0, bundleIdentifier] };
         id.map(|s| lossy_string(&s))
+    }
+}
+
+impl Client {
+    pub fn new(client: &AnyObject) -> Self {
+        let ptr = client as *const AnyObject as *mut AnyObject;
+        // SAFETY: ptr は有効な参照から作ったので非 null で生存している。retain して所有権を得る。
+        let retained = unsafe { Id::retain(ptr) }.expect("参照から作ったポインタは非 null");
+        Self(retained)
     }
 
     fn anchor(&self) -> Option<usize> {

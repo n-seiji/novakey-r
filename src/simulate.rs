@@ -6,13 +6,14 @@
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
 // <C-k> (Ctrl+文字) <F6>..<F10> <lt> (`<`) <gt> (`>`)。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use crate::composer::{Composer, Phase};
-use crate::input::{self, KeyInput, Modifiers, Route};
-use crate::keymap::Key;
-use crate::kkc::RustEngine;
-use crate::session::{ConversionMode, Effect, Session};
+use crate::composer::Phase;
+use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
+use crate::input::{self, KeyInput, Modifiers};
+use crate::session::{ConversionMode, RerankJob};
 use crate::translit::Form;
 
 /// 物理キー 1 打鍵。imk.rs の handleEvent が受け取るものと同じ粒度。
@@ -90,54 +91,148 @@ fn parse_keys(keys: &str) -> Result<Vec<(String, Event)>, String> {
     Ok(events)
 }
 
+/// ホストアプリの代わり。確定済みの文字列と、下線付きの未確定文字列 (最後の SetMarked) を持つ。
+#[derive(Clone, Default)]
+pub(crate) struct FakeClient(Rc<RefCell<ClientState>>);
+
+#[derive(Default)]
+pub(crate) struct ClientState {
+    pub committed: String,
+    pub marked: String,
+}
+
+impl TextClient for FakeClient {
+    fn insert(&self, text: &str) {
+        let mut state = self.0.borrow_mut();
+        state.marked.clear();
+        state.committed.push_str(text);
+    }
+
+    fn set_marked(&self, text: &str) {
+        self.0.borrow_mut().marked = text.to_string();
+    }
+
+    fn preceding_text(&self, _max_utf16: usize) -> String {
+        String::new()
+    }
+
+    fn bundle_id(&self) -> Option<String> {
+        None
+    }
+}
+
+impl FakeClient {
+    pub(crate) fn committed(&self) -> String {
+        self.0.borrow().committed.clone()
+    }
+
+    pub(crate) fn marked(&self) -> String {
+        self.0.borrow().marked.clone()
+    }
+
+    fn push_committed(&self, ch: char) {
+        self.0.borrow_mut().committed.push(ch);
+    }
+
+    fn pop_committed(&self) {
+        self.0.borrow_mut().committed.pop();
+    }
+}
+
+/// 候補パネルの代わり。表示中か、ハイライトの行と、呼ばれた順の記録を持つ。
+#[derive(Clone, Default)]
+pub(crate) struct FakePanel(Rc<RefCell<PanelState>>);
+
+#[derive(Default)]
+pub(crate) struct PanelState {
+    pub visible: bool,
+    pub line: usize,
+    pub calls: Vec<String>,
+}
+
+impl CandidatePanel for FakePanel {
+    fn show(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        state.calls.push("show".to_string());
+        let reread = !state.visible;
+        if reread {
+            state.line = 0;
+        }
+        state.visible = true;
+        reread
+    }
+
+    fn hide(&self) {
+        let mut state = self.0.borrow_mut();
+        state.calls.push("hide".to_string());
+        state.visible = false;
+    }
+
+    fn move_highlight(&self, delta: isize) {
+        let mut state = self.0.borrow_mut();
+        state.calls.push(format!("move:{delta}"));
+        state.line = (state.line as isize + delta) as usize;
+    }
+}
+
+impl FakePanel {
+    pub(crate) fn visible(&self) -> bool {
+        self.0.borrow().visible
+    }
+
+    pub(crate) fn line(&self) -> usize {
+        self.0.borrow().line
+    }
+
+    #[cfg(test)]
+    pub(crate) fn calls(&self) -> Vec<String> {
+        self.0.borrow().calls.clone()
+    }
+}
+
+/// 環境の代わり。セキュア入力も AI もなく、ログ・トレースは捨てる。
+pub(crate) struct FakeEnv;
+
+impl Environment for FakeEnv {
+    fn secure_input(&self) -> bool {
+        false
+    }
+
+    fn rerank_allowed(&self) -> bool {
+        false
+    }
+
+    fn log(&self, _line: &str) {}
+
+    fn trace(&self, _entry: &str, _fields: &str) {}
+
+    fn send_rerank(&self, _controller_id: u64, _job: &RerankJob, _context: &str, _urgent: bool) {}
+
+    fn cancel_rerank(&self, _controller_id: u64) {}
+}
+
+pub(crate) type SimController = Controller<FakeClient, FakePanel, FakeEnv>;
+
 /// 本物のアプリが持つ状態のうち、キー処理の結果として見えるもの。
 struct Sim {
-    session: Session<RustEngine>,
-    /// アプリに確定済みの文字列。
-    committed: String,
-    /// アプリが表示している下線付きの未確定文字列 (最後の SetMarked)。
-    marked: String,
-    panel_visible: bool,
-    panel_line: usize,
+    controller: SimController,
+    client: FakeClient,
+    panel: FakePanel,
     /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
     stale: Vec<String>,
 }
 
 impl Sim {
     fn new() -> Self {
-        let engine = RustEngine::new();
-        let mut session = Session::new(Composer::new(engine)
-                .with_english(crate::loanword::english_for)
-                .with_english_word(crate::loanword::is_english_word)
-                .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
-                .with_emoji(crate::emoji::emoji_for), ConversionMode::Space);
+        let mut session = new_session(ConversionMode::Space);
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
+        let panel = FakePanel::default();
         Self {
-            session,
-            committed: String::new(),
-            marked: String::new(),
-            panel_visible: false,
-            panel_line: 0,
+            controller: Controller::new(0, session, panel.clone(), FakeEnv),
+            client: FakeClient::default(),
+            panel,
             stale: Vec::new(),
-        }
-    }
-
-    fn apply(&mut self, effects: Vec<Effect>) {
-        for effect in effects {
-            match effect {
-                Effect::SetMarked(text) => self.marked = text,
-                Effect::Insert(text) => {
-                    self.marked.clear();
-                    self.committed.push_str(&text);
-                }
-                Effect::ShowCandidates { selected } => {
-                    self.panel_visible = true;
-                    self.panel_line = selected;
-                }
-                Effect::HideCandidates => self.panel_visible = false,
-                Effect::RequestRerank { .. } | Effect::CancelRerank => {}
-            }
         }
     }
 
@@ -148,44 +243,26 @@ impl Sim {
         }
         for ch in ev.characters.chars() {
             match ch {
-                '\r' => self.committed.push('\n'),
-                '\u{7f}' | '\u{8}' => {
-                    self.committed.pop();
-                }
+                '\r' => self.client.push_committed('\n'),
+                '\u{7f}' | '\u{8}' => self.client.pop_committed(),
                 c if c == '\u{1b}' || ('\u{F700}'..='\u{F8FF}').contains(&c) => {}
-                c => self.committed.push(c),
+                c => self.client.push_committed(c),
             }
         }
     }
 
-    /// imk.rs の handleEvent と同じ input::route でキーを処理する。
+    /// imk.rs の handleEvent と同じ input::route と Controller でキーを処理する。
     fn press(&mut self, ev: &Event) {
-        let handled = match input::route(&ev.to_input()) {
-            Route::PassThrough => false,
-            Route::Translit(form) => self.dispatch(Key::Translit(form), ""),
-            Route::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
-                self.dispatch(*key, text) || handled
-            }),
-            Route::Navigation => {
-                self.session.has_pending()
-            }
-        };
-        if !handled {
+        if !self.controller.on_key(input::route(&ev.to_input()), self.client.clone()) {
             self.pass_through(ev);
         }
     }
 
-    fn dispatch(&mut self, key: Key, text: &str) -> bool {
-        let outcome = self.session.handle(key, text);
-        self.apply(outcome.effects);
-        outcome.handled
-    }
-
     fn candidates_line(&self) -> String {
-        let Phase::Converting { selected, .. } = self.session.phase() else {
+        let Phase::Converting { selected, .. } = self.controller.phase() else {
             return String::new();
         };
-        self.session
+        self.controller
             .candidate_texts()
             .iter()
             .enumerate()
@@ -202,7 +279,7 @@ impl Sim {
     }
 
     fn phase_name(&self) -> String {
-        match self.session.phase() {
+        match self.controller.phase() {
             Phase::Transliterated(form) => format!("Transliterated({})", Self::describe_form(form)),
             other => format!("{other:?}"),
         }
@@ -244,16 +321,16 @@ fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
     let mut sim = Sim::new();
     for (label, ev) in parse_keys(keys)? {
         sim.press(&ev);
-        if sim.marked != sim.session.marked_text() {
+        if sim.client.marked() != sim.controller.marked_text() {
             sim.stale.push(label.clone());
         }
         if verbose {
-            let panel = if sim.panel_visible { format!(" panel@{}", sim.panel_line + 1) } else { String::new() };
+            let panel = if sim.panel.visible() { format!(" panel@{}", sim.panel.line() + 1) } else { String::new() };
             println!(
                 "{label:>9}  {:<34} marked={:?}{panel}  committed={:?}",
                 sim.phase_name(),
-                sim.marked,
-                sim.committed
+                sim.client.marked(),
+                sim.client.committed()
             );
             let cands = sim.candidates_line();
             if !cands.is_empty() {
@@ -261,7 +338,7 @@ fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
             }
         }
     }
-    Ok(Run { committed: sim.committed, marked: sim.marked, stale: sim.stale })
+    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale: sim.stale })
 }
 
 /// `--simulate '<keys>'`
