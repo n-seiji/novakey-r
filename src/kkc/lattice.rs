@@ -29,7 +29,7 @@ pub struct LookupCache {
     map: HashMap<String, Rc<Vec<Found>>>,
 }
 
-const CACHE_LIMIT: usize = 20_000;
+const CACHE_LIMIT: usize = 2_000;
 
 impl LookupCache {
     pub fn new() -> Self {
