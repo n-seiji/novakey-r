@@ -24,47 +24,63 @@ pub struct Found {
     pub ruby_chars: usize,
 }
 
-/// 読みの部分文字列ごとの辞書引きのメモ。変換のたびに全再計算するが、辞書引きは使い回す。
+/// トライのノードごとの辞書引きのメモ。変換のたびに全再計算するが、辞書引きは使い回す。
+/// 1 ノードの Elem は 1 度だけ作るので、大きさは辞書のうち実際に引いた部分で頭打ちになる。
 pub struct LookupCache {
-    map: HashMap<String, Rc<Vec<Found>>>,
+    map: HashMap<(char, usize), Rc<[Found]>>,
 }
 
-const CACHE_LIMIT: usize = 2_000;
+const CACHE_LIMIT: usize = 20_000;
 
 impl LookupCache {
     pub fn new() -> Self {
         Self { map: HashMap::new() }
     }
 
-    /// `substring` (カタカナ化済み・最大 20 文字) の先頭から始まる辞書語すべて (短い順)。
-    fn lookup(&mut self, dict: &Dictionary, substring: &str) -> Rc<Vec<Found>> {
-        if let Some(v) = self.map.get(substring) {
-            return v.clone();
-        }
-        let entries = match dict.prefix_entries(substring) {
-            Ok(e) => e,
+    /// `substring` (カタカナ化済み・最大 20 文字) の先頭から始まる辞書語すべて (短い順) を、ノードごとの塊で。
+    fn lookup(&mut self, dict: &Dictionary, substring: &str) -> Vec<Rc<[Found]>> {
+        let nodes = match dict.prefix_nodes(substring) {
+            Ok(n) => n,
             Err(err) => {
-                // 読み (ユーザーの入力) はログに出さない。毎回出ないよう 1 度だけ。
-                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    crate::platform::log(&format!("dictionary lookup failed: {}", err.kind()));
-                }
-                Vec::new()
+                log_lookup_failure(&err);
+                return Vec::new();
             }
         };
-        let found: Vec<Found> = entries
-            .into_iter()
-            .map(|e| {
-                let ruby_chars = e.ruby.chars().count();
-                Found { elem: Rc::new(Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)), ruby_chars }
-            })
-            .collect();
-        if self.map.len() >= CACHE_LIMIT {
-            self.map.clear();
+        let mut out = Vec::with_capacity(nodes.len());
+        for (first, _depth, node) in nodes {
+            if let Some(v) = self.map.get(&(first, node)) {
+                out.push(v.clone());
+                continue;
+            }
+            let entries = match dict.node_entries(first, node) {
+                Ok(e) => e,
+                Err(err) => {
+                    log_lookup_failure(&err);
+                    continue;
+                }
+            };
+            let found: Rc<[Found]> = entries
+                .into_iter()
+                .map(|e| {
+                    let ruby_chars = e.ruby.chars().count();
+                    Found { elem: Rc::new(Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)), ruby_chars }
+                })
+                .collect();
+            if self.map.len() >= CACHE_LIMIT {
+                self.map.clear();
+            }
+            self.map.insert((first, node), found.clone());
+            out.push(found);
         }
-        let rc = Rc::new(found);
-        self.map.insert(substring.to_string(), rc.clone());
-        rc
+        out
+    }
+}
+
+/// 読み (ユーザーの入力) はログに出さない。毎回出ないよう 1 度だけ。
+fn log_lookup_failure(err: &super::dict::DictError) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::platform::log(&format!("dictionary lookup failed: {}", err.kind()));
     }
 }
 
@@ -153,7 +169,7 @@ impl Lattice {
             let upper = (start + MAX_LENGTH).min(n);
             let substring: String = chars[start..upper].iter().collect();
             let found = cache.lookup(dict, &substring);
-            for f in found.iter() {
+            for f in found.iter().flat_map(|g| g.iter()) {
                 // 読みが切り出した範囲に収まらない語は来ないはずだが、念のため
                 if f.ruby_chars == 0 || start + f.ruby_chars > n {
                     continue;
@@ -369,6 +385,39 @@ mod tests {
             l.nodes[idx].prevs.push(0);
         }
         l
+    }
+
+    fn key(e: &Elem) -> (String, String, usize, usize, usize, u32) {
+        (e.word.clone(), e.ruby.clone(), e.lcid, e.rcid, e.mid, e.base.to_bits())
+    }
+
+    #[test]
+    fn node_cache_lookup_matches_prefix_entries() {
+        let dict = Dictionary::open_default().unwrap();
+        let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/kkc_corpus.txt")).unwrap();
+        let readings: Vec<&str> = corpus.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("typed-seq")).collect();
+        assert!(readings.len() >= 100, "corpus too small");
+        // キャッシュを共有したまま、読みの全開始位置 (最大 20 文字の窓) を 2 周する
+        let mut cache = LookupCache::new();
+        let mut checked = 0;
+        for _ in 0..2 {
+            for r in readings.iter().step_by(readings.len() / 80 + 1) {
+                let chars: Vec<char> = to_katakana(r).chars().collect();
+                for start in 0..chars.len() {
+                    let sub: String = chars[start..(start + MAX_LENGTH).min(chars.len())].iter().collect();
+                    let old: Vec<_> = dict
+                        .prefix_entries(&sub)
+                        .unwrap()
+                        .into_iter()
+                        .map(|e| key(&Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)))
+                        .collect();
+                    let new: Vec<_> = cache.lookup(&dict, &sub).iter().flat_map(|g| g.iter()).map(|f| key(&f.elem)).collect();
+                    assert_eq!(old, new, "窓 {start} の辞書引きが旧経路と違う");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 500);
     }
 
     fn totals(l: &Lattice, idx: usize) -> Vec<f32> {

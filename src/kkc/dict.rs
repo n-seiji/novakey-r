@@ -351,6 +351,15 @@ impl Dictionary {
     /// `movingTowardPrefixSearch` + `getDicdataFromLoudstxt3` の first-character トライ分に当たる。
     /// user / memory 辞書は対象外。読みはカタカナ化済みであること (`to_katakana`)。
     pub fn prefix_entries(&self, katakana_reading: &str) -> Result<Vec<Entry>, DictError> {
+        let mut out = Vec::new();
+        for (first, _depth, node) in self.prefix_nodes(katakana_reading)? {
+            out.extend(self.node_entries(first, node)?);
+        }
+        Ok(out)
+    }
+
+    /// `prefix_entries` が読む (先頭文字, 深さ 0 始まり, トライのノード) を短い prefix から順に返す。
+    pub fn prefix_nodes(&self, katakana_reading: &str) -> Result<Vec<(char, usize, usize)>, DictError> {
         let chars: Vec<char> = katakana_reading.chars().collect();
         let Some(&first) = chars.first() else {
             return Ok(Vec::new());
@@ -359,11 +368,7 @@ impl Dictionary {
             return Ok(Vec::new());
         };
         let ids: Vec<u8> = chars.iter().map(|&c| self.char_id(c)).collect();
-        let mut out = Vec::new();
-        for (_depth, node) in trie.walk(&ids) {
-            out.extend(self.node_entries(first, node)?);
-        }
-        Ok(out)
+        Ok(trie.walk(&ids).into_iter().map(|(depth, node)| (first, depth, node)).collect())
     }
 
     /// 品詞連接コスト。`former` は左の語の rcid、`latter` は右の語の lcid。
