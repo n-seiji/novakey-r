@@ -153,6 +153,8 @@ pub struct Composer<E: CandidateEngine> {
     pending_raw: String,
     hiragana: String,
     typing: Typing,
+    /// 英語分割で英単語にまとめる前の区切りと未確定の打鍵。取り消しで分割前の打鍵中に戻すために持つ。
+    split_origin: Option<(Vec<Segment>, String)>,
     reading: ReadingCands,
     stage: Stage,
     live: bool,
@@ -176,6 +178,7 @@ impl<E: CandidateEngine> Composer<E> {
             pending_raw: String::new(),
             hiragana: String::new(),
             typing: Typing::Empty,
+            split_origin: None,
             reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
             stage: Stage::Editing,
             live: false,
@@ -305,6 +308,8 @@ impl<E: CandidateEngine> Composer<E> {
             Stage::Editing => None,
             Stage::Reverted { kept } => kept,
             Stage::Selecting(s) => {
+                // 設計書は「Transliterated → Space は typing のまま」だが、候補選択中からの字種変換だけは Dangling を Kana に落とす。
+                // 候補選択中は読みの変換結果を見ていて、取り消し (revert) と同じく読みに戻るため。Editing からの字種変換は Dangling のまま。
                 self.leave_english();
                 Some(s.list)
             }
@@ -409,6 +414,7 @@ impl<E: CandidateEngine> Composer<E> {
     /// 変換候補は、かなの部分をエンジンで変換したものに英単語を前に付けたもの (artifactを使う)。
     fn fix_english_split(&mut self, split: english_split::Split) {
         let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
+        let origin = (self.segments.clone(), self.pending_raw.clone());
         let head = Segment::Literal(split.head.clone());
         let tail = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
         self.segments = std::iter::once(head).chain(tail).collect();
@@ -417,6 +423,7 @@ impl<E: CandidateEngine> Composer<E> {
         self.reset_candidates();
         self.stage = Stage::Editing;
         self.typing = Typing::Mixed;
+        self.split_origin = Some(origin);
         let texts = self.engine.convert(self.reading.generation, &tail_kana);
         for (engine_index, text) in texts.into_iter().enumerate() {
             let text = format!("{}{text}", split.head);
@@ -455,6 +462,7 @@ impl<E: CandidateEngine> Composer<E> {
     /// 打鍵 raw と、それで確定したかな kana を追加する。kana が空なら raw は次のかなに持ち越す。
     /// carry はローマ字バッファに残っている未確定の打鍵で、確定した単位には含めず持ち越す。
     pub fn push_input(&mut self, raw: &str, kana: &str, carry: &str) {
+        self.split_origin = None;
         self.pending_raw.push_str(raw);
         if kana.is_empty() {
             return;
@@ -477,6 +485,7 @@ impl<E: CandidateEngine> Composer<E> {
             self.engine.cancel();
         }
         debug_assert!(self.pending_raw.is_empty());
+        self.split_origin = None;
         self.pending_raw.clear();
         self.segments.push(Segment::Literal(text.to_string()));
         self.sync_hiragana();
@@ -501,6 +510,7 @@ impl<E: CandidateEngine> Composer<E> {
         let Some(last) = self.segments.last_mut() else {
             return false;
         };
+        self.split_origin = None;
         let emptied = match last {
             Segment::Kana { keys, kana } => {
                 kana.pop();
@@ -520,6 +530,11 @@ impl<E: CandidateEngine> Composer<E> {
         if was_literal && self.segments.iter().any(Segment::is_literal) {
             self.sync_hiragana();
             self.reset_candidates();
+            self.typing = if self.segments.iter().all(Segment::is_literal) {
+                Typing::Literal
+            } else {
+                Typing::Mixed
+            };
         } else {
             self.refresh();
         }
@@ -612,6 +627,7 @@ impl<E: CandidateEngine> Composer<E> {
     pub fn discard(&mut self) {
         self.engine.cancel();
         self.segments.clear();
+        self.split_origin = None;
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();
@@ -628,6 +644,13 @@ impl<E: CandidateEngine> Composer<E> {
             Stage::Reverted { kept } | Stage::Transliterated { kept, .. } => kept,
             Stage::Editing => None,
         };
+        // 英語分割でできた Mixed は、打った英字ではないので、分割前のかなの打鍵中に戻す (続きを打てば分割し直す)。
+        if let Some((segments, pending_raw)) = self.split_origin.take() {
+            self.segments = segments;
+            self.pending_raw = pending_raw;
+            self.refresh();
+            return;
+        }
         // 英字入力 (Literal / Mixed) は局面を保って入力中に戻る。読みだけを表示する Reverted に入れるのはかなだけ。
         if matches!(self.typing, Typing::Literal | Typing::Mixed) {
             return;
@@ -662,6 +685,7 @@ impl<E: CandidateEngine> Composer<E> {
             None => self.engine.cancel(),
         }
         self.segments.clear();
+        self.split_origin = None;
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();

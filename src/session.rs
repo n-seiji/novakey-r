@@ -836,6 +836,35 @@ mod tests {
         assert_eq!(s.phase(), Phase::Empty);
     }
 
+    // 英語分割 (artifactni) は変換に入るときに英単語とかなへ分ける。取り消しは分ける前の打鍵中に戻る。
+
+    #[test]
+    fn 英語分割の変換を取り消して続きを打つと取り消さずに打った結果と同じ() {
+        let mut s = english_session();
+        let reverted = drive(&mut s, "artifactni<space><esc>tsuite<enter>");
+        let mut d = english_session();
+        let direct = drive(&mut d, "artifactnitsuite<enter>");
+        assert_eq!(reverted, direct);
+        assert_eq!(reverted.1, "artifactについて");
+    }
+
+    #[test]
+    fn 英語分割の変換を取り消してbsしても取り消さずに打った結果と同じ() {
+        let mut s = english_session();
+        let reverted = drive(&mut s, "artifactni<space><esc><bs><space>");
+        let mut d = english_session();
+        let direct = drive(&mut d, "artifactni<bs><space>");
+        assert_eq!(reverted, direct);
+        assert_eq!(s.phase(), d.phase());
+    }
+
+    #[test]
+    fn かなを消しきった後のbsと打鍵は英字のまま続く() {
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        assert_eq!(drive(&mut s, "Tokyo<bs>a").0, "Tokya");
+        assert_eq!(s.phase(), Phase::Literal);
+    }
+
     #[test]
     fn 現挙動_英語らしい表示は状態に反映されずxでかなに戻る_段3_6で直す予定() {
         let mut s = english_session();
