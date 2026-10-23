@@ -25,6 +25,11 @@ env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt"
 
+[tasks.characterization]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+description = "現挙動の固定 (tools/characterization.txt)。リアーキ中に出力が変わったら失敗"
+run = "cargo run --release -- --simulate-file tools/characterization.txt"
+
 [tasks.scenarios-learning]
 env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"

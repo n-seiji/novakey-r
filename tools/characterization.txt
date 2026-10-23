@@ -1,0 +1,38 @@
+# 現挙動の固定 (特性テスト): `mise run characterization` で流す。形式は scenarios.txt と同じ。
+# scenarios.txt のうち期待が無い行について、リアーキ前の出力を期待として記録したもの。「正しい」挙動とは限らない。
+# 組成中のまま終わる行は、末尾に <enter> を足して確定まで流している。出力が変わったらその理由を確かめ、意図した変更のときだけ更新する。
+kyou<space>1	強1
+kyou<space>2	強2
+l<enter>	l
+kyou<esc><esc>	
+kyou<tab>x<enter>	きょう\tx
+kyou<space><space>0	kyou0
+kyou<space>a<enter>	強あ
+kyou<space>A<enter>	強A
+kyou<space><space>a<enter>	kyouあ
+hello<bs><bs><enter>	へ
+kyou<left><enter>	きょう
+kyou<C-a><enter>	きょう
+kyou@<enter>	きょう@
+kyou<space>"	強"
+Tokyo<esc>	
+Tokyo<S-space>x<enter>	Tokyo x
+Tokyo<up><enter>	Tokyo
+enter<esc><esc>	
+enter<space>1	enter 1
+git<space>1	git 1
+kyou.<space><enter>	強。
+kyou<F7><up><enter>	キョウ
+kyou<F7><down><enter>	キョウ
+kyou<F7><esc><esc>	
+kyoun<esc>	
+kyou<space><bs><enter>	きょう
+kyou<esc>	
+kyou<space><esc><esc>	
+kyou<F7><esc><esc>	
+kyou<space><space><esc><esc>	
+kyouTokyo<esc>	
+kyouTokyo<enter>	きょうTokyo
+kyouT<bs><enter>	きょう
+iPhone<space><bs><enter>	いPhone
+neko<space><enter>	猫

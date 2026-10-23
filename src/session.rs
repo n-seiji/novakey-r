@@ -657,4 +657,84 @@ mod tests {
         effects_of(&mut session, "kyou");
         assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));
     }
+
+    /// `<space>` `<bs>` `<esc>` `<enter>` `<F7>` を含む打鍵列を流し、(最後の表示, 確定した文字列) を返す。
+    fn drive(session: &mut Session<NullEngine>, keys: &str) -> (String, String) {
+        let mut committed = String::new();
+        let mut rest = keys;
+        while !rest.is_empty() {
+            let (key, text, len) = match rest.strip_prefix('<') {
+                Some(tail) => {
+                    let name = &tail[..tail.find('>').unwrap()];
+                    let key = match name {
+                        "space" => (Key::Space, " "),
+                        "bs" => (Key::Backspace, "\u{7f}"),
+                        "esc" => (Key::Escape, "\u{1b}"),
+                        "enter" => (Key::Enter, "\r"),
+                        "F7" => (Key::Translit(crate::translit::Form::Katakana), ""),
+                        other => panic!("unknown key {other}"),
+                    };
+                    (key.0, key.1.to_string(), name.len() + 2)
+                }
+                None => {
+                    let ch = rest.chars().next().unwrap();
+                    (classify(ch), ch.to_string(), ch.len_utf8())
+                }
+            };
+            rest = &rest[len..];
+            for effect in session.handle(key, &text).effects {
+                if let Effect::Insert(text) = effect {
+                    committed.push_str(&text);
+                }
+            }
+        }
+        (session.marked_text(), committed)
+    }
+
+    // 以下は現挙動の固定 (特性テスト)。期待値は --simulate で得た値で、正しい挙動ではない。
+    // 取り消し系は段 3-3 / 3-6 で直す予定。直したらこの期待値を新しい仕様に書き換える。
+
+    #[test]
+    fn 現挙動_変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
+        let mut s = Session::new(Composer::new(NullEngine));
+        assert_eq!(drive(&mut s, "kyouTo<space><bs><bs>"), ("きょうT".to_string(), String::new()));
+        // 見た目は きょうT だが、確定は kyouT (変換なしで打った kyouT は きょうT を確定する)
+        assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
+    }
+
+    #[test]
+    fn 現挙動_字種変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
+        let mut s = Session::new(Composer::new(NullEngine));
+        assert_eq!(drive(&mut s, "kyouTo<F7><esc><bs>"), ("きょうT".to_string(), String::new()));
+        assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
+    }
+
+    #[test]
+    fn 現挙動_取り消し後に打った文字で履歴依存の確定になる_段3_3で直す予定() {
+        let mut s = Session::new(Composer::new(NullEngine));
+        assert_eq!(drive(&mut s, "iPhone<space><esc>s").0, "いPhones");
+        assert_eq!(drive(&mut s, "<enter>").1, "iPhones");
+    }
+
+    #[test]
+    fn 現挙動_取り消し後のbsと打鍵が英字を読み直す_段3_3で直す予定() {
+        let mut s = Session::new(Composer::new(NullEngine));
+        assert_eq!(drive(&mut s, "Tokyo<F7><esc><bs>a").0, "Tokyあ");
+    }
+
+    #[test]
+    fn 現挙動_取り消し後のspaceで英字が変換に入る_段3_3で直す予定() {
+        let mut s = Session::new(Composer::new(NullEngine));
+        let (shown, committed) = drive(&mut s, "Tokyo<F7><esc><space>");
+        assert_eq!((shown.as_str(), committed.as_str()), ("Tokyo", ""));
+        assert!(matches!(s.phase(), Phase::Converting { .. }));
+    }
+
+    #[test]
+    fn 現挙動_英語らしい表示は状態に反映されずxでかなに戻る_段3_6で直す予定() {
+        let mut s = english_session();
+        assert_eq!(drive(&mut s, "enter").0, "enter");
+        assert_eq!(drive(&mut s, "X").0, "えんてrX");
+        assert_eq!(drive(&mut s, "<enter>").1, "えんてrX");
+    }
 }
