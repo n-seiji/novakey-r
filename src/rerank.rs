@@ -25,10 +25,13 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEBOUNCE: Duration = Duration::from_millis(250);
 /// 同時に飛ばす送信の上限。古い送信が 3 秒詰まっても、新しい (Space の) 送信を待たせないための余地。
 pub const MAX_IN_FLIGHT: usize = 2;
+/// 429 / 5xx のあと、送信を止める時間。
+pub const PAUSE: Duration = Duration::from_secs(60);
+/// 「その他の失敗」がこの回数続いたら無効化する。
+pub const MAX_PERMANENT_FAILURES: u32 = 3;
 
-/// AI 並べ替えを今使えるか。`CredentialsRejected` / `Paused` は、エラーの分類を入れる段で使い始める。
+/// AI 並べ替えを今使えるか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Availability {
     Ready,
     CredentialsMissing,
@@ -79,16 +82,58 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// POST を 1 回送る。エラー文字列は URL (アカウント ID を含む) を含みうるので、ログに出さない。
+/// 通信に失敗した理由の種類だけ。ライブラリのエラー文字列は URL (アカウント ID を含む) を含みうるので持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    Timeout,
+    Connect,
+    Tls,
+    Read,
+}
+
+/// POST を 1 回送る。
 pub trait Transport {
-    fn post(&self, req: &HttpRequest) -> Result<HttpResponse, String>;
+    fn post(&self, req: &HttpRequest) -> Result<HttpResponse, TransportFailure>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
-    Transport,
+    Transport(TransportFailure),
     Status(u16),
     InvalidResponse,
+}
+
+/// 失敗への対応の区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// タイムアウト・接続失敗。その要求だけ失敗にし、再送しない。
+    Transient,
+    /// 429 / 5xx。しばらく送らない。
+    Backoff,
+    /// 401 / 403。認証情報が拒否された。
+    AuthRejected,
+    /// その他の 4xx・不正な応答。続くようなら無効化する。
+    Permanent,
+}
+
+impl FetchError {
+    pub fn classify(&self) -> FailureClass {
+        match self {
+            FetchError::Transport(_) => FailureClass::Transient,
+            FetchError::Status(401 | 403) => FailureClass::AuthRejected,
+            FetchError::Status(429 | 500..=599) => FailureClass::Backoff,
+            FetchError::Status(_) | FetchError::InvalidResponse => FailureClass::Permanent,
+        }
+    }
+
+    /// ログ用の理由名。本文・URL は含まない。
+    fn reason(&self) -> String {
+        match self {
+            FetchError::Transport(t) => format!("transport {t:?}"),
+            FetchError::Status(code) => format!("status {code}"),
+            FetchError::InvalidResponse => "invalid response".to_string(),
+        }
+    }
 }
 
 pub fn build_request(creds: &Credentials, key: &Screened) -> HttpRequest {
@@ -143,7 +188,7 @@ pub fn parse_choice(body: &str, candidate_count: usize) -> Result<usize, FetchEr
 }
 
 pub fn fetch_choice(transport: &dyn Transport, creds: &Credentials, key: &Screened) -> Result<usize, FetchError> {
-    let response = transport.post(&build_request(creds, key)).map_err(|_| FetchError::Transport)?;
+    let response = transport.post(&build_request(creds, key)).map_err(FetchError::Transport)?;
     if response.status != 200 {
         return Err(FetchError::Status(response.status));
     }
@@ -191,6 +236,14 @@ pub struct Submitted {
     pub log_missing: bool,
 }
 
+/// `complete` の結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Completed {
+    pub delivery: Option<Delivery>,
+    /// 状態が変わったときだけ入る 1 行 (理由名と数だけ。依頼内容・認証情報は含まない)。
+    pub log: Option<String>,
+}
+
 /// `credentials_loaded` の結果。読み出し待ちだった要求の分をまとめて返す。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Loaded {
@@ -212,6 +265,17 @@ enum CredState {
     Unreadable,
 }
 
+/// 送信を続けてよいか。認証情報の状態 (`CredState`) とは別に、通信の結果から決まる。
+enum Health {
+    Ready,
+    /// 429 / 5xx のあと。この時刻まで送らない。
+    PausedUntil(Instant),
+    /// 401 / 403。認証情報の読み直し (トグルの入れ直し) まで送らない。
+    Rejected,
+    /// 落ちた・失敗が続いた。以後は何も受け付けない。
+    Disabled,
+}
+
 /// 認証情報の読み出し待ちの要求 (コントローラごとに最新の 1 件)。
 struct Awaiting {
     since: Instant,
@@ -231,8 +295,9 @@ pub struct State {
     pending: HashMap<u64, Pending>,
     /// 送信中の件数 (`take_due` で増やし、`release_slot` で減らす)。上限は `MAX_IN_FLIGHT`。
     in_flight: usize,
-    /// 落ちたら立つ。以後は何も受け付けない。
-    disabled: bool,
+    health: Health,
+    /// 「その他の失敗」の連続回数。成功で戻る。
+    permanent_failures: u32,
 }
 
 impl State {
@@ -247,15 +312,20 @@ impl State {
             request_count: 0,
             pending: HashMap::new(),
             in_flight: 0,
-            disabled: false,
+            health: Health::Ready,
+            permanent_failures: 0,
         }
     }
 
     /// 今分かっている状態。未読込・読み出し中は使えるとみなす (送信時に分かる)。読まない。
-    pub fn availability(&self) -> Availability {
-        if self.disabled {
-            Availability::Disabled
-        } else if matches!(self.creds, CredState::Missing | CredState::Unreadable) {
+    pub fn availability(&self, now: Instant) -> Availability {
+        match self.health {
+            Health::Disabled => return Availability::Disabled,
+            Health::Rejected => return Availability::CredentialsRejected,
+            Health::PausedUntil(until) if now < until => return Availability::Paused,
+            Health::PausedUntil(_) | Health::Ready => {}
+        }
+        if matches!(self.creds, CredState::Missing | CredState::Unreadable) {
             Availability::CredentialsMissing
         } else {
             Availability::Ready
@@ -264,14 +334,14 @@ impl State {
 
     /// 使えない扱いにして、待機中の要求を捨てる。最初の 1 回だけ `true`。
     pub fn disable(&mut self) -> bool {
-        let first = !self.disabled;
-        self.disabled = true;
+        let first = !self.is_disabled();
+        self.health = Health::Disabled;
         self.cancel_all();
         first
     }
 
     pub fn is_disabled(&self) -> bool {
-        self.disabled
+        matches!(self.health, Health::Disabled)
     }
 
     #[cfg(test)]
@@ -291,8 +361,12 @@ impl State {
     /// 認証情報の読み出しを頼む (トグル ON 時)。読み込み済みなら何もしない。
     /// 未登録・読めなかったときは読み直す。実際に読むのはワーカー。
     pub fn request_credentials(&mut self) {
-        if self.disabled {
+        if self.is_disabled() {
             return;
+        }
+        if matches!(self.health, Health::Rejected) {
+            self.health = Health::Ready;
+            self.creds = CredState::Wanted;
         }
         if matches!(self.creds, CredState::Unknown | CredState::Missing | CredState::Unreadable) {
             self.creds = CredState::Wanted;
@@ -361,8 +435,14 @@ impl State {
     }
 
     pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
-        if self.disabled || job.payload.candidates().len() < 2 {
+        if job.payload.candidates().len() < 2 {
             return Submitted::default();
+        }
+        match self.health {
+            Health::Disabled | Health::Rejected => return Submitted::default(),
+            Health::PausedUntil(until) if now < until => return Submitted::default(),
+            Health::PausedUntil(_) => self.health = Health::Ready,
+            Health::Ready => {}
         }
         match &self.creds {
             CredState::Loaded(c) => {
@@ -476,19 +556,68 @@ impl State {
         self.sent.clear();
     }
 
-    /// 通信の結果を受ける。その間に新しい世代が来ていれば捨てる (最新だけ採用)。
-    pub fn complete(&mut self, sent: InFlight, result: Result<usize, FetchError>) -> Option<Delivery> {
-        if !self.is_latest(sent.controller_id, sent.generation) {
-            return None;
-        }
+    /// 通信の結果を受ける。失敗は分類に従って、送信の停止・一時停止・無効化のどれかへ進める。
+    /// 古い世代の結果も、状態の判断には使う (配信だけ捨てる)。
+    pub fn complete(&mut self, now: Instant, sent: InFlight, result: Result<usize, FetchError>) -> Completed {
+        let latest = self.is_latest(sent.controller_id, sent.generation);
+        let mut log = None;
         let (status, text) = match result {
             Ok(index) => {
-                self.last_result = Some((sent.key, index));
+                self.permanent_failures = 0;
+                if latest {
+                    self.last_result = Some((sent.key, index));
+                }
                 (STATUS_OK, index.to_string())
             }
-            Err(_) => (STATUS_FAILED, "Clef rerank failed".to_string()),
+            Err(err) => {
+                let class = err.classify();
+                log = self.note_failure(now, &err, class);
+                if matches!(class, FailureClass::AuthRejected | FailureClass::Backoff) {
+                    // 止めた要求の結果は配信しない。メインスレッドは availability から状態を知る。
+                    return Completed { delivery: None, log };
+                }
+                (STATUS_FAILED, "Clef rerank failed".to_string())
+            }
         };
-        Some(Delivery { controller_id: sent.controller_id, generation: sent.generation, status, text })
+        let delivery = latest
+            .then(|| Delivery { controller_id: sent.controller_id, generation: sent.generation, status, text });
+        Completed { delivery, log }
+    }
+
+    /// 失敗を状態に反映する。状態が変わったときだけログの 1 行を返す (理由名と数だけ)。
+    fn note_failure(&mut self, now: Instant, err: &FetchError, class: FailureClass) -> Option<String> {
+        match class {
+            FailureClass::Transient => None,
+            FailureClass::AuthRejected => {
+                if matches!(self.health, Health::Rejected | Health::Disabled) {
+                    return None;
+                }
+                self.health = Health::Rejected;
+                self.creds = CredState::Unknown;
+                self.pending.clear();
+                self.awaiting.clear();
+                Some(format!("LLM rerank stopped: credentials rejected ({})", err.reason()))
+            }
+            FailureClass::Backoff => {
+                if matches!(self.health, Health::Rejected | Health::Disabled) {
+                    return None;
+                }
+                if matches!(self.health, Health::PausedUntil(until) if now < until) {
+                    return None;
+                }
+                self.health = Health::PausedUntil(now + PAUSE);
+                self.pending.clear();
+                Some(format!("LLM rerank paused for {}s ({})", PAUSE.as_secs(), err.reason()))
+            }
+            FailureClass::Permanent => {
+                self.permanent_failures += 1;
+                if self.permanent_failures < MAX_PERMANENT_FAILURES || self.is_disabled() {
+                    return None;
+                }
+                self.disable()
+                    .then(|| format!("LLM rerank disabled: {} consecutive failures ({})", self.permanent_failures, err.reason()))
+            }
+        }
     }
 }
 
@@ -648,12 +777,12 @@ mod tests {
         assert!(parse_choice("not json", 2).is_err());
     }
 
-    struct Fake(RefCell<Vec<HttpRequest>>, Result<(u16, &'static str), &'static str>);
+    struct Fake(RefCell<Vec<HttpRequest>>, Result<(u16, &'static str), TransportFailure>);
 
     impl Transport for Fake {
-        fn post(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        fn post(&self, req: &HttpRequest) -> Result<HttpResponse, TransportFailure> {
             self.0.borrow_mut().push(HttpRequest { url: req.url.clone(), bearer: req.bearer.clone(), body: req.body.clone(), timeout: req.timeout });
-            self.1.map(|(status, body)| HttpResponse { status, body: body.into() }).map_err(String::from)
+            self.1.map(|(status, body)| HttpResponse { status, body: body.into() })
         }
     }
 
@@ -666,14 +795,14 @@ mod tests {
         assert_eq!(t.0.borrow().len(), 1);
         let t = Fake(RefCell::default(), Ok((401, body)));
         assert_eq!(fetch_choice(&t, &creds(), &key), Err(FetchError::Status(401)));
-        let t = Fake(RefCell::default(), Err("https://secret-url timed out"));
-        assert_eq!(fetch_choice(&t, &creds(), &key), Err(FetchError::Transport));
+        let t = Fake(RefCell::default(), Err(TransportFailure::Timeout));
+        assert_eq!(fetch_choice(&t, &creds(), &key), Err(FetchError::Transport(TransportFailure::Timeout)));
     }
 
     #[test]
     fn keychain_is_untouched_until_the_first_send() {
         let (mut s, loads) = state(true);
-        assert_eq!(s.availability(), Availability::Ready);
+        assert_eq!(s.availability(Instant::now()), Availability::Ready);
         assert_eq!(loads.get(), 0);
         assert!(!s.take_load_request(), "頼まれていないものは読まない");
         s.submit(Instant::now(), job(1, 1, "あ", false));
@@ -733,12 +862,12 @@ mod tests {
         let (mut s, loads) = state(false);
         s.submit(Instant::now(), job(1, 1, "あ", false));
         assert_eq!(loads.get(), 1);
-        assert_eq!(s.availability(), Availability::CredentialsMissing);
+        assert_eq!(s.availability(Instant::now()), Availability::CredentialsMissing);
         assert_eq!(loads.get(), 1, "availability は読まない");
         s.request_credentials();
         s.pump();
         assert_eq!(loads.get(), 2);
-        assert_eq!(s.availability(), Availability::CredentialsMissing);
+        assert_eq!(s.availability(Instant::now()), Availability::CredentialsMissing);
 
         let (mut s, loads) = state(true);
         s.submit(Instant::now(), job(1, 1, "あ", false));
@@ -751,10 +880,10 @@ mod tests {
     fn credentials_registered_later_are_found_after_a_reload() {
         let (mut s, _) = state(false);
         s.submit(Instant::now(), job(1, 1, "あ", false));
-        assert_eq!(s.availability(), Availability::CredentialsMissing);
+        assert_eq!(s.availability(Instant::now()), Availability::CredentialsMissing);
         *s.store.result.lock().unwrap() = Ok(Some(creds()));
         s.request_credentials();
-        assert_eq!(s.availability(), Availability::Ready, "読み出し中は使えるとみなす");
+        assert_eq!(s.availability(Instant::now()), Availability::Ready, "読み出し中は使えるとみなす");
         s.pump();
         let t0 = Instant::now();
         assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
@@ -769,11 +898,11 @@ mod tests {
         assert!(first.log_missing);
         assert!(!s.submit(Instant::now(), job(1, 2, "あい", false)).log_missing);
         assert_eq!(loads.get(), 1);
-        assert_eq!(s.availability(), Availability::CredentialsMissing);
+        assert_eq!(s.availability(Instant::now()), Availability::CredentialsMissing);
         *s.store.result.lock().unwrap() = Ok(Some(creds()));
         s.request_credentials();
         s.pump();
-        assert_eq!(s.availability(), Availability::Ready);
+        assert_eq!(s.availability(Instant::now()), Availability::Ready);
         assert_eq!(loads.get(), 2);
     }
 
@@ -845,7 +974,7 @@ mod tests {
         s.submit(t0, job(1, 1, "あ", false));
         assert!(s.disable(), "最初の 1 回だけ true");
         assert!(!s.disable());
-        assert_eq!(s.availability(), Availability::Disabled);
+        assert_eq!(s.availability(Instant::now()), Availability::Disabled);
         assert!(s.next_deadline().is_none(), "待機中の要求は捨てる");
         assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
         s.request_credentials();
@@ -864,7 +993,7 @@ mod tests {
         let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![2]);
         s.cancel(2);
-        assert_eq!(s.complete(due.into_iter().next().unwrap(), Ok(1)), None);
+        assert_eq!(s.complete(t0, due.into_iter().next().unwrap(), Ok(1)).delivery, None);
         assert!(!s.is_latest(1, 1) && !s.is_latest(2, 1));
     }
 
@@ -885,7 +1014,7 @@ mod tests {
         s.submit(t0, job(1, 1, "あ", false));
         let sent = s.take_all_due(ms(t0, 250)).remove(0);
         s.submit(ms(t0, 300), job(1, 2, "あい", false));
-        assert_eq!(s.complete(sent, Ok(1)), None);
+        assert_eq!(s.complete(t0, sent, Ok(1)).delivery, None);
     }
 
     #[test]
@@ -894,11 +1023,11 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         let sent = s.take_all_due(ms(t0, 250)).remove(0);
-        let d = s.complete(sent, Ok(1)).unwrap();
+        let d = s.complete(t0, sent, Ok(1)).delivery.unwrap();
         assert_eq!((d.status, d.text.as_str(), d.generation), (STATUS_OK, "1", 1));
         s.submit(ms(t0, 300), job(1, 2, "あい", false));
         let sent = s.take_all_due(ms(t0, 600)).remove(0);
-        let d = s.complete(sent, Err(FetchError::Transport)).unwrap();
+        let d = s.complete(t0, sent, Err(FetchError::Transport(TransportFailure::Timeout))).delivery.unwrap();
         assert_eq!(d.status, STATUS_FAILED);
     }
 
@@ -908,7 +1037,7 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         let sent = s.take_all_due(ms(t0, 250)).remove(0);
-        s.complete(sent, Ok(1)).unwrap();
+        s.complete(t0, sent, Ok(1)).delivery.unwrap();
         let again = s.submit(ms(t0, 400), job(1, 2, "あ", false));
         let d = again.delivery.expect("キャッシュで即座に返る");
         assert_eq!((d.status, d.text.as_str(), d.generation), (STATUS_OK, "1", 2));
@@ -921,7 +1050,7 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         let sent = s.take_all_due(ms(t0, 250)).remove(0);
-        s.complete(sent, Err(FetchError::Status(500)));
+        s.complete(t0, sent, Err(FetchError::Status(400)));
         let again = s.submit(ms(t0, 400), job(1, 2, "あ", false));
         assert!(again.delivery.is_none());
         assert!(s.next_deadline().is_some());
@@ -934,7 +1063,7 @@ mod tests {
         for (generation, reading) in [(1, "あ"), (2, "い")] {
             s.submit(t0, job(1, generation, reading, true));
             let sent = s.take_all_due(t0).remove(0);
-            s.complete(sent, Ok(0)).unwrap();
+            s.complete(t0, sent, Ok(0)).delivery.unwrap();
         }
         assert!(s.submit(t0, job(1, 3, "あ", true)).delivery.is_none());
     }
@@ -959,5 +1088,149 @@ mod tests {
             let sent = s.take_all_due(t0).remove(0);
             assert_eq!(sent.request_number, generation);
         }
+    }
+
+    fn fail(s: &mut Rig, t0: Instant, id: u64, generation: u64, reading: &str, err: FetchError) -> Completed {
+        s.submit(t0, job(id, generation, reading, true));
+        let sent = s.take_all_due(t0).remove(0);
+        s.complete(t0, sent, Err(err))
+    }
+
+    #[test]
+    fn failures_are_classified_by_how_to_respond() {
+        use FailureClass::*;
+        let cases = [
+            (FetchError::Transport(TransportFailure::Timeout), Transient),
+            (FetchError::Transport(TransportFailure::Connect), Transient),
+            (FetchError::Transport(TransportFailure::Tls), Transient),
+            (FetchError::Transport(TransportFailure::Read), Transient),
+            (FetchError::Status(401), AuthRejected),
+            (FetchError::Status(403), AuthRejected),
+            (FetchError::Status(429), Backoff),
+            (FetchError::Status(500), Backoff),
+            (FetchError::Status(503), Backoff),
+            (FetchError::Status(400), Permanent),
+            (FetchError::Status(404), Permanent),
+            (FetchError::InvalidResponse, Permanent),
+        ];
+        for (err, class) in cases {
+            assert_eq!(err.classify(), class, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_credential_stops_sending_until_credentials_are_requested_again() {
+        for code in [401, 403] {
+            let (mut s, loads) = state(true);
+            let t0 = Instant::now();
+            s.submit(t0, job(1, 1, "あ", false));
+            s.submit(t0, job(2, 1, "い", false));
+            let sent = s.take_all_due(ms(t0, 250)).remove(0);
+            let done = s.complete(t0, sent, Err(FetchError::Status(code)));
+            assert_eq!(done.delivery, None, "{code}");
+            let log = done.log.expect("状態が変わったので 1 度ログを出す");
+            assert!(log.contains(&code.to_string()), "{log}");
+            assert_eq!(s.availability(t0), Availability::CredentialsRejected, "{code}");
+            assert!(s.next_deadline().is_none(), "待機中のものは捨てる: {code}");
+            assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
+            assert!(s.next_deadline().is_none(), "拒否されている間は送信待機に入れない: {code}");
+            assert!(!s.take_load_request(), "勝手に読み直さない");
+            assert_eq!(loads.get(), 1);
+            s.request_credentials();
+            s.pump();
+            assert_eq!(loads.get(), 2, "トグルを入れ直したら認証情報を読み直す");
+            assert_eq!(s.availability(t0), Availability::Ready);
+            s.submit(t0, job(1, 3, "あいう", true));
+            assert_eq!(s.take_all_due(t0).len(), 1, "再開する");
+        }
+    }
+
+    #[test]
+    fn a_second_rejection_does_not_log_again() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", true));
+        s.submit(t0, job(2, 1, "い", true));
+        let mut due = s.take_all_due(t0);
+        let (b, a) = (due.remove(1), due.remove(0));
+        assert!(s.complete(t0, a, Err(FetchError::Status(401))).log.is_some());
+        assert_eq!(s.complete(t0, b, Err(FetchError::Status(401))), Completed::default());
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_pause_for_a_minute_then_resume() {
+        for code in [429, 500, 503] {
+            let (mut s, _) = state(true);
+            let t0 = Instant::now();
+            s.submit(t0, job(2, 1, "い", false));
+            let done = fail(&mut s, t0, 1, 1, "あ", FetchError::Status(code));
+            assert_eq!(done.delivery, None, "{code}");
+            assert!(done.log.expect("状態が変わったので 1 度ログを出す").contains(&code.to_string()));
+            assert_eq!(s.availability(t0), Availability::Paused, "{code}");
+            assert!(s.next_deadline().is_none(), "待機中のものは捨てる: {code}");
+            assert_eq!(s.submit(ms(t0, 1000), job(1, 2, "あい", true)), Submitted::default());
+            assert!(s.next_deadline().is_none(), "止めている間は受け付けない: {code}");
+            assert_eq!(s.availability(t0 + Duration::from_secs(59)), Availability::Paused);
+            assert_eq!(s.availability(t0 + Duration::from_secs(60)), Availability::Ready, "{code}");
+            let t1 = t0 + Duration::from_secs(60);
+            s.submit(t1, job(1, 3, "あいう", true));
+            assert_eq!(s.take_all_due(t1).len(), 1, "60 秒たてば送る");
+        }
+    }
+
+    #[test]
+    fn pausing_again_while_paused_does_not_log_again() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", true));
+        s.submit(t0, job(2, 1, "い", true));
+        let mut due = s.take_all_due(t0);
+        let (b, a) = (due.remove(1), due.remove(0));
+        assert!(s.complete(t0, a, Err(FetchError::Status(429))).log.is_some());
+        let again = s.complete(ms(t0, 500), b, Err(FetchError::Status(503)));
+        assert_eq!(again.log, None);
+        assert_eq!(s.availability(t0 + Duration::from_secs(60)), Availability::Ready, "停止期間を延ばさない");
+    }
+
+    #[test]
+    fn a_transient_failure_fails_only_that_request() {
+        for failure in [TransportFailure::Timeout, TransportFailure::Connect, TransportFailure::Tls, TransportFailure::Read] {
+            let (mut s, _) = state(true);
+            let t0 = Instant::now();
+            let done = fail(&mut s, t0, 1, 1, "あ", FetchError::Transport(failure));
+            assert_eq!(done.delivery.map(|d| d.status), Some(STATUS_FAILED));
+            assert_eq!(done.log, None);
+            assert_eq!(s.availability(t0), Availability::Ready);
+            assert!(s.next_deadline().is_none(), "再送しない");
+            s.submit(t0, job(1, 2, "あい", true));
+            assert_eq!(s.take_all_due(t0).len(), 1, "次の打鍵は普通に送る");
+        }
+    }
+
+    #[test]
+    fn three_permanent_failures_in_a_row_disable_and_a_success_resets_the_count() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        let errors = [FetchError::Status(400), FetchError::InvalidResponse, FetchError::Status(404)];
+        for (n, err) in errors.iter().enumerate().take(2) {
+            let done = fail(&mut s, t0, 1, n as u64 + 1, &format!("あ{n}"), err.clone());
+            assert_eq!(done.delivery.map(|d| d.status), Some(STATUS_FAILED));
+            assert_eq!(done.log, None);
+            assert_eq!(s.availability(t0), Availability::Ready);
+        }
+        s.submit(t0, job(1, 3, "ok", true));
+        let sent = s.take_all_due(t0).remove(0);
+        s.complete(t0, sent, Ok(0)).delivery.unwrap();
+        for (n, err) in errors.iter().enumerate().take(2) {
+            fail(&mut s, t0, 1, n as u64 + 10, &format!("い{n}"), err.clone());
+            assert_eq!(s.availability(t0), Availability::Ready, "成功で数え直した");
+        }
+        let done = fail(&mut s, t0, 1, 20, "う", errors[2].clone());
+        assert!(done.log.expect("無効化したとき 1 度だけログ").contains("disabled"));
+        assert_eq!(s.availability(t0), Availability::Disabled);
+        assert!(s.next_deadline().is_none());
+        s.request_credentials();
+        assert!(!s.take_load_request(), "トグルでは戻らない");
+        assert_eq!(s.submit(t0, job(1, 30, "え", true)), Submitted::default());
     }
 }

@@ -47,9 +47,9 @@ impl AiStatus {
         match self {
             AiStatus::Off | AiStatus::On(Availability::Ready) => None,
             AiStatus::On(Availability::CredentialsMissing) => Some("LLMリランキング無効(Cloudflare認証情報を確認)"),
-            AiStatus::On(Availability::CredentialsRejected) => Some("LLMリランキング無効(Cloudflare認証情報が拒否されました)"),
-            AiStatus::On(Availability::Paused) => Some("LLMリランキング一時停止中"),
-            AiStatus::On(Availability::Disabled) => Some("LLMリランキング停止(内部エラー。再起動で復帰)"),
+            AiStatus::On(Availability::CredentialsRejected) => Some("LLMリランキング停止(認証情報が拒否された。確認してトグルを入れ直す)"),
+            AiStatus::On(Availability::Paused) => Some("LLMリランキング一時停止中(混雑)"),
+            AiStatus::On(Availability::Disabled) => Some("LLMリランキング停止(エラーが続いた。再起動で復帰)"),
         }
     }
 }
