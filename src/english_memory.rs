@@ -73,7 +73,7 @@ pub fn knows(word: &str) -> bool {
     with_store(|s| s.words.iter().any(|w| w == word))
 }
 
-/// 英語として確定した語を覚える。学習してよいかは呼び出し側 (Composer::commit) が決める。
+/// 英語として確定した語を覚える。学習の可否は呼び出し側 (Composer::commit) で判定済みの前提。直接呼ぶとゲートを素通りする。
 pub fn learn(word: &str) {
     if !is_memorable(word) {
         return;

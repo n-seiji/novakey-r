@@ -181,6 +181,7 @@ impl CandidateEngine for RustEngine {
     }
 
     /// revision と添字を確かめて、選ばれた候補を学習する (保存まで行う)。
+    /// 学習の可否は呼び出し側 (Composer::commit) で判定済みの前提。直接呼ぶとゲートを素通りする。
     fn select(&mut self, revision: u64, engine_index: usize) -> bool {
         let last = self.last.take();
         let (Some(core), Some((r, candidates))) = (&self.core, last) else {

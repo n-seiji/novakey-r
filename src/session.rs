@@ -50,8 +50,9 @@ pub enum ConversionMode {
     Space,
 }
 
-/// 1 回の入力処理で許される外向きの動き。入口で必ず渡し、既定は何も許さない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 1 回の入力処理で許される外向きの動き。入口で必ず渡す (既定値は持たない。本番では Controller が毎回作る)。
+/// bundle id が取れないときは学習を許可する (outbound::learning_allowed の現仕様)。AI 送信は outbound::decide が UnknownApp で止める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
     pub learning: bool,

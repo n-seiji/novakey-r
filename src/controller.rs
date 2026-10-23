@@ -360,6 +360,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
 mod tests {
     use super::*;
     use std::rc::Rc;
+    use crate::kkc::{learning::Learning, KkcCore};
 
     use crate::simulate::{FakeClient, FakeEnv, FakePanel};
 
@@ -594,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_composition_and_candidate_click_respect_the_learning_gate() {
+    fn commit_composition_respects_the_learning_gate() {
         LEARNED.with(|l| l.borrow_mut().clear());
         let env = RecEnv::default();
         env.secure.set(true);
@@ -608,6 +609,90 @@ mod tests {
         rec_press(&c, &client, Key::Letter { upper: true }, "G");
         c.on_commit_composition(Some(client.clone()));
         assert_eq!(LEARNED.with(|l| l.borrow().len()), 1, "commit-all learns when allowed");
+    }
+
+    /// 英語の記憶と engine の学習の両方を観測できる controller (どちらも本物のファイルには触れない)。
+    fn observing_controller(env: RecEnv) -> (RecController, Rc<KkcCore>) {
+        LEARNED.with(|l| l.borrow_mut().clear());
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let composer = Composer::new(RustEngine::with_core(core.clone())).with_english_memory(|_| false, |w| {
+            LEARNED.with(|l| l.borrow_mut().push(w.to_string()));
+        });
+        (Controller::new(9, Session::new(composer, ConversionMode::Space), HookPanel::default(), env), core)
+    }
+
+    fn engine_learned(core: &KkcCore) -> bool {
+        !core.learning().borrow().is_empty()
+    }
+
+    /// "kanji" を打ち、候補ウィンドウを開く。
+    fn open_candidate_window(c: &RecController, client: &RecClient) {
+        rec_type(c, client, "kanji");
+        rec_press(c, client, Key::Space, " ");
+        rec_press(c, client, Key::Space, " ");
+        assert!(matches!(c.phase(), Phase::Converting { window: true, .. }));
+    }
+
+    fn candidate_click_learns(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        c.on_candidate_selected("幹事");
+        engine_learned(&core)
+    }
+
+    #[test]
+    fn a_candidate_click_is_learned_when_allowed() {
+        assert!(candidate_click_learns(false));
+    }
+
+    #[test]
+    fn a_candidate_click_is_not_learned_under_secure_input() {
+        assert!(!candidate_click_learns(true));
+    }
+
+    fn picking_by_digit_learns(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert_eq!(c.phase(), Phase::Empty);
+        engine_learned(&core)
+    }
+
+    #[test]
+    fn picking_a_candidate_by_digit_is_learned_when_allowed() {
+        assert!(picking_by_digit_learns(false));
+    }
+
+    #[test]
+    fn picking_a_candidate_by_digit_is_not_learned_under_secure_input() {
+        assert!(!picking_by_digit_learns(true));
+    }
+
+    fn english_commit_is_remembered(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        rec_type(&c, &client, "git");
+        rec_press(&c, &client, Key::Enter, "\r");
+        assert!(!engine_learned(&core));
+        LEARNED.with(|l| l.borrow().iter().any(|w| w == "git"))
+    }
+
+    #[test]
+    fn an_english_commit_is_remembered_when_allowed() {
+        assert!(english_commit_is_remembered(false));
+    }
+
+    #[test]
+    fn an_english_commit_is_not_remembered_under_secure_input() {
+        assert!(!english_commit_is_remembered(true));
     }
 
     #[test]
