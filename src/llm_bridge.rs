@@ -344,7 +344,9 @@ pub fn smoke_test() {
         std::process::exit(2);
     });
     let candidates = vec!["今日は医者に行く".to_string(), "今日歯医者に行く".to_string()];
-    let Decision::Send(payload) = outbound::screen("きょうはいしゃにいく", &candidates, "") else {
+    // 合成した通常アプリの bundle id で通す (実在のユーザー入力ではないので、アプリ検査は形だけ)。
+    let pass = outbound::gate_app(false, Some("com.apple.TextEdit")).expect("通常アプリは通る");
+    let Decision::Send(payload) = outbound::screen(pass, "きょうはいしゃにいく", &candidates, "") else {
         eprintln!("smoke test input was rejected by the outbound screen");
         std::process::exit(2);
     };
@@ -419,7 +421,8 @@ mod tests {
 
     fn job(id: u64, generation: u64, reading: &str) -> Job {
         let candidates = vec!["a".to_string(), "b".to_string()];
-        let Decision::Send(payload) = outbound::screen(reading, &candidates, "") else { panic!("テスト入力が検査で止まった") };
+        let pass = outbound::gate_app(false, Some("com.apple.TextEdit")).unwrap();
+        let Decision::Send(payload) = outbound::screen(pass, reading, &candidates, "") else { panic!("テスト入力が検査で止まった") };
         Job { controller_id: id, generation, payload, urgent: true }
     }
 

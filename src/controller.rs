@@ -306,7 +306,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             .map(|c| c.preceding_text(CONTEXT_MAX_UTF16))
             .unwrap_or_default();
         let decision = match outbound::gate_app(self.env.secure_input(), self.bundle_id(client.as_ref())) {
-            Ok(()) => outbound::screen(&job.hiragana, &job.candidates, &preceding),
+            Ok(pass) => outbound::screen(pass, &job.hiragana, &job.candidates, &preceding),
             Err(reason) => Decision::Skip(reason),
         };
         match decision {
@@ -450,6 +450,7 @@ mod tests {
         bundle: Rc<RefCell<Option<String>>>,
         bundle_calls: Rc<Cell<usize>>,
         marked: Rc<RefCell<String>>,
+        preceding: Rc<RefCell<String>>,
     }
 
     impl RecClient {
@@ -466,7 +467,7 @@ mod tests {
             *self.marked.borrow_mut() = text.to_string();
         }
         fn preceding_text(&self, _max_utf16: usize) -> String {
-            String::new()
+            self.preceding.borrow().clone()
         }
         fn bundle_id(&self) -> Option<String> {
             self.bundle_calls.set(self.bundle_calls.get() + 1);
@@ -479,6 +480,8 @@ mod tests {
         allowed: Rc<Cell<bool>>,
         secure: Rc<Cell<bool>>,
         sent: Rc<RefCell<Vec<u64>>>,
+        /// 送られた payload の (文脈, 文脈を空にした理由の名前)。
+        payloads: Rc<RefCell<Vec<(String, Option<&'static str>)>>>,
         cancels: Rc<Cell<usize>>,
         logs: Rc<RefCell<Vec<String>>>,
     }
@@ -494,8 +497,9 @@ mod tests {
             self.logs.borrow_mut().push(line.to_string());
         }
         fn trace(&self, _entry: &str, _fields: &str) {}
-        fn send_rerank(&self, _id: u64, generation: u64, _payload: &Screened, _urgent: bool) {
+        fn send_rerank(&self, _id: u64, generation: u64, payload: &Screened, _urgent: bool) {
             self.sent.borrow_mut().push(generation);
+            self.payloads.borrow_mut().push((payload.context().to_string(), payload.context_dropped().map(|r| r.name())));
         }
         fn cancel_rerank(&self, _id: u64) {
             self.cancels.set(self.cancels.get() + 1);
@@ -753,6 +757,30 @@ mod tests {
         rec_type(&c, &client, "kyou");
         assert!(env.sent.borrow().is_empty());
         assert!(env.cancels.get() > 0);
+    }
+
+    #[test]
+    fn a_secret_in_the_preceding_text_is_sent_with_an_empty_context() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(Some("com.apple.TextEdit"));
+        *client.preceding.borrow_mut() = "パスワードは hunter2".to_string();
+        rec_type(&c, &client, "kyou");
+        let payloads = env.payloads.borrow();
+        assert!(!payloads.is_empty(), "the request is still sent");
+        assert!(payloads.iter().all(|p| *p == (String::new(), Some("secret_word"))), "{payloads:?}");
+    }
+
+    #[test]
+    fn an_ordinary_preceding_text_is_sent_as_the_context() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(Some("com.apple.TextEdit"));
+        *client.preceding.borrow_mut() = "昨日は雨。今日は".to_string();
+        rec_type(&c, &client, "kyou");
+        let payloads = env.payloads.borrow();
+        assert!(!payloads.is_empty());
+        assert!(payloads.iter().all(|p| *p == ("今日は".to_string(), None)), "{payloads:?}");
     }
 
     #[test]

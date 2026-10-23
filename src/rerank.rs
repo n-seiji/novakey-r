@@ -244,6 +244,7 @@ impl<S: CredentialStore> State<S> {
             };
         };
         if let Some((cached_key, index)) = &self.last_result {
+            // key には context_dropped も含まれる。送る本文が同じでも理由が違えば外れるだけで、漏れは増えない (キャッシュ命中が減る側にしか倒れない)。
             if *cached_key == key {
                 let text = index.to_string();
                 self.register_latest(id, generation);
@@ -360,7 +361,8 @@ mod tests {
 
     fn screened(context: &str, reading: &str, candidates: &[&str]) -> Screened {
         let candidates: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
-        match outbound::screen(reading, &candidates, context) {
+        let pass = outbound::gate_app(false, Some("com.apple.TextEdit")).unwrap();
+        match outbound::screen(pass, reading, &candidates, context) {
             Decision::Send(s) => s,
             Decision::Skip(reason) => panic!("テスト入力が検査で止まった: {}", reason.name()),
         }
