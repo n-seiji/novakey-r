@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 
@@ -599,7 +600,15 @@ const CONTEXT_MAX_UTF16: usize = 200;
 mod tests {
     use std::cell::Cell;
 
-    use super::{accepts_llm_result, rerank_allowed, FlagGuard};
+    use objc2::ClassType;
+
+    use super::{accepts_llm_result, rerank_allowed, FlagGuard, NovakeyRInputController};
+
+    #[test]
+    fn the_controller_class_registers_with_imk_overrides() {
+        // debug ビルドの objc2 は、上書きしたメソッドの型を IMKInputController 側と照合する。
+        let _ = NovakeyRInputController::class();
+    }
 
     #[test]
     fn flag_guard_clears_the_flag_on_drop_and_on_panic() {

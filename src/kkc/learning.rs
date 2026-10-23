@@ -725,7 +725,7 @@ mod tests {
         true
     }
 
-    fn clock(day: &Rc<Cell<u16>>) -> impl Fn() -> u16 + 'static {
+    fn clock(day: &Rc<Cell<u16>>) -> impl Fn() -> u16 + 'static + use<> {
         let d = day.clone();
         move || d.get()
     }

@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 // simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (keymap::stroke → Session) を headless で動かす。
 // 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
@@ -216,22 +216,27 @@ fn setup_env() {
     // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
     let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
     if learning {
-        std::env::remove_var("NOVAKEY_DISABLE_LEARNING");
+        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
+        unsafe { std::env::remove_var("NOVAKEY_DISABLE_LEARNING") };
     } else {
-        std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1");
+        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
+        unsafe { std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1") };
     }
     if !learning || std::env::var_os("NOVAKEY_MEMORY_DIR").is_none_or(|v| v.is_empty()) {
         let memory_dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&memory_dir);
-        std::env::set_var("NOVAKEY_MEMORY_DIR", memory_dir);
+        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
+        unsafe { std::env::set_var("NOVAKEY_MEMORY_DIR", memory_dir) };
     }
     if std::env::var_os("NOVAKEY_LOANWORDS").is_none() {
         let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/loanwords.tsv");
-        std::env::set_var("NOVAKEY_LOANWORDS", repo_table);
+        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
+        unsafe { std::env::set_var("NOVAKEY_LOANWORDS", repo_table) };
     }
     if std::env::var_os("NOVAKEY_EMOJI").is_none() {
         let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/emoji.tsv");
-        std::env::set_var("NOVAKEY_EMOJI", repo_table);
+        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
+        unsafe { std::env::set_var("NOVAKEY_EMOJI", repo_table) };
     }
 }
 
