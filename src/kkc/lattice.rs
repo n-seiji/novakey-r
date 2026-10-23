@@ -28,13 +28,18 @@ pub struct Found {
 /// 1 ノードの Elem は 1 度だけ作るので、大きさは辞書のうち実際に引いた部分で頭打ちになる。
 pub struct LookupCache {
     map: HashMap<(char, usize), Rc<[Found]>>,
+    limit: usize,
 }
 
 const CACHE_LIMIT: usize = 20_000;
 
 impl LookupCache {
     pub fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self::with_limit(CACHE_LIMIT)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self { map: HashMap::new(), limit }
     }
 
     /// `substring` (カタカナ化済み・最大 20 文字) の先頭から始まる辞書語すべて (短い順) を、ノードごとの塊で。
@@ -47,16 +52,17 @@ impl LookupCache {
             }
         };
         let mut out = Vec::with_capacity(nodes.len());
-        for (first, _depth, node) in nodes {
+        for (first, node) in nodes {
             if let Some(v) = self.map.get(&(first, node)) {
                 out.push(v.clone());
                 continue;
             }
+            // 読めなかったノードも空で覚え、clear まで読み直さない
             let entries = match dict.node_entries(first, node) {
                 Ok(e) => e,
                 Err(err) => {
                     log_lookup_failure(&err);
-                    continue;
+                    Vec::new()
                 }
             };
             let found: Rc<[Found]> = entries
@@ -66,7 +72,7 @@ impl LookupCache {
                     Found { elem: Rc::new(Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)), ruby_chars }
                 })
                 .collect();
-            if self.map.len() >= CACHE_LIMIT {
+            if self.map.len() >= self.limit {
                 self.map.clear();
             }
             self.map.insert((first, node), found.clone());
@@ -391,33 +397,65 @@ mod tests {
         (e.word.clone(), e.ruby.clone(), e.lcid, e.rcid, e.mid, e.base.to_bits())
     }
 
-    #[test]
-    fn node_cache_lookup_matches_prefix_entries() {
+    /// origin/main の LookupCache (読みの substring をキーにする) をそのまま残した参照実装。
+    struct OldLookupCache {
+        map: HashMap<String, Rc<Vec<Found>>>,
+        limit: usize,
+    }
+
+    impl OldLookupCache {
+        fn lookup(&mut self, dict: &Dictionary, substring: &str) -> Rc<Vec<Found>> {
+            if let Some(v) = self.map.get(substring) {
+                return v.clone();
+            }
+            let entries = dict.prefix_entries(substring).unwrap_or_default();
+            let found: Vec<Found> = entries
+                .into_iter()
+                .map(|e| {
+                    let ruby_chars = e.ruby.chars().count();
+                    Found { elem: Rc::new(Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)), ruby_chars }
+                })
+                .collect();
+            if self.map.len() >= self.limit {
+                self.map.clear();
+            }
+            let rc = Rc::new(found);
+            self.map.insert(substring.to_string(), rc.clone());
+            rc
+        }
+    }
+
+    fn check_against_old(limit: usize, rounds: usize) -> usize {
         let dict = Dictionary::open_default().unwrap();
         let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/kkc_corpus.txt")).unwrap();
         let readings: Vec<&str> = corpus.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("typed-seq")).collect();
         assert!(readings.len() >= 100, "corpus too small");
-        // キャッシュを共有したまま、読みの全開始位置 (最大 20 文字の窓) を 2 周する
-        let mut cache = LookupCache::new();
+        let mut old = OldLookupCache { map: HashMap::new(), limit };
+        let mut new = LookupCache::with_limit(limit);
         let mut checked = 0;
-        for _ in 0..2 {
+        for _ in 0..rounds {
             for r in readings.iter().step_by(readings.len() / 80 + 1) {
                 let chars: Vec<char> = to_katakana(r).chars().collect();
                 for start in 0..chars.len() {
                     let sub: String = chars[start..(start + MAX_LENGTH).min(chars.len())].iter().collect();
-                    let old: Vec<_> = dict
-                        .prefix_entries(&sub)
-                        .unwrap()
-                        .into_iter()
-                        .map(|e| key(&Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)))
-                        .collect();
-                    let new: Vec<_> = cache.lookup(&dict, &sub).iter().flat_map(|g| g.iter()).map(|f| key(&f.elem)).collect();
-                    assert_eq!(old, new, "窓 {start} の辞書引きが旧経路と違う");
+                    let o: Vec<_> = old.lookup(&dict, &sub).iter().map(|f| key(&f.elem)).collect();
+                    let n: Vec<_> = new.lookup(&dict, &sub).iter().flat_map(|g| g.iter()).map(|f| key(&f.elem)).collect();
+                    assert_eq!(o, n, "窓 {start} の辞書引きが旧経路と違う (limit {limit})");
                     checked += 1;
                 }
             }
         }
-        assert!(checked > 500);
+        checked
+    }
+
+    #[test]
+    fn node_cache_lookup_matches_old_substring_cache() {
+        assert!(check_against_old(CACHE_LIMIT, 2) > 500);
+    }
+
+    #[test]
+    fn node_cache_lookup_matches_old_cache_when_cleared_often() {
+        assert!(check_against_old(7, 2) > 500);
     }
 
     fn totals(l: &Lattice, idx: usize) -> Vec<f32> {
