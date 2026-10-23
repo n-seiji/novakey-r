@@ -4,9 +4,7 @@
 // Cocoa に対して行うべきこと (Effect) の列を返す。imk.rs は Effect を実行するだけで、ここは headless で動く。
 
 use std::collections::HashMap;
-
-use once_cell::sync::Lazy;
-use rand::Rng;
+use std::sync::LazyLock;
 
 use crate::composer::{CandidateEngine, Composer, Phase};
 use crate::keymap::{self, Action, Key};
@@ -344,7 +342,7 @@ impl<E: CandidateEngine> Session<E> {
     }
 }
 
-static PLAYFUL_MAP: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
+static PLAYFUL_MAP: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
     let mut outs = HashMap::new();
     outs.insert("l", vec!["l", "I", "|"]);
     outs.insert("1", vec!["l", "1", "I"]);
@@ -356,13 +354,28 @@ static PLAYFUL_MAP: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|
 
 pub fn playful_convert(text: &str) -> Option<String> {
     let list = PLAYFUL_MAP.get(text)?;
-    let i = rand::thread_rng().gen_range(0..list.len());
-    Some(list[i].to_string())
+    Some(list[random_index(list.len())].to_string())
+}
+
+// RandomState は生成のたびに別のキーを持つので、呼び出しごとに新しく作ると毎回違う値になる
+fn random_index(len: usize) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    let hash = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    (hash % len as u64) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_index_stays_within_len() {
+        for len in [1usize, 2, 3, 1000] {
+            for _ in 0..2000 {
+                assert!(random_index(len) < len);
+            }
+        }
+    }
     use crate::keymap::classify;
 
     struct NullEngine;
