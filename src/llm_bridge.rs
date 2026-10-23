@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::outbound::{self, Decision, Screened};
 use crate::platform;
 use crate::rerank::{
-    self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, Transport,
+    self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport,
 };
 
 pub use crate::rerank::{STATUS_CREDENTIALS_MISSING, STATUS_OK};
@@ -24,23 +24,31 @@ pub enum Availability {
     CredentialsMissing,
 }
 
-/// 汎用パスワードとして Keychain に置かれた値を読む。空白だけ・空は未登録扱い。
+/// errSecItemNotFound。項目がない (未登録) ことを表す。
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// 汎用パスワードとして Keychain に置かれた値を読む。空白だけ・空・UTF-8 でないものは未登録扱い。
+/// 項目がないことと、読めなかったこと (ロック中・拒否など) は区別する。
 struct KeychainStore;
 
 impl KeychainStore {
-    fn read(account: &str) -> Option<String> {
-        let bytes = security_framework::passwords::get_generic_password(rerank::KEYCHAIN_SERVICE, account).ok()?;
-        let value = String::from_utf8(bytes).ok()?.trim().to_string();
-        (!value.is_empty()).then_some(value)
+    fn read(account: &str) -> Result<Option<String>, StoreError> {
+        let bytes = match security_framework::passwords::get_generic_password(rerank::KEYCHAIN_SERVICE, account) {
+            Ok(bytes) => bytes,
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(None),
+            Err(_) => return Err(StoreError),
+        };
+        let Ok(value) = String::from_utf8(bytes) else { return Ok(None) };
+        let value = value.trim().to_string();
+        Ok((!value.is_empty()).then_some(value))
     }
 }
 
 impl CredentialStore for KeychainStore {
-    fn load(&self) -> Option<Credentials> {
-        Some(Credentials {
-            api_token: Self::read(rerank::KEYCHAIN_ACCOUNT_TOKEN)?,
-            account_id: Self::read(rerank::KEYCHAIN_ACCOUNT_ID)?,
-        })
+    fn load(&self) -> Result<Option<Credentials>, StoreError> {
+        let Some(api_token) = Self::read(rerank::KEYCHAIN_ACCOUNT_TOKEN)? else { return Ok(None) };
+        let Some(account_id) = Self::read(rerank::KEYCHAIN_ACCOUNT_ID)? else { return Ok(None) };
+        Ok(Some(Credentials { api_token, account_id }))
     }
 }
 
@@ -87,7 +95,9 @@ const MAX_IN_FLIGHT: usize = 2;
 
 /// 送信の管理。状態機械 (`State`)・Keychain・通信を差し替えられるようにして、スレッドの扱いをテストする。
 struct Engine<S: CredentialStore, T: Transport> {
-    state: Mutex<State<S>>,
+    state: Mutex<State>,
+    /// 読み出しは止まりうるので、`state` のロックを持たずにワーカースレッドだけが呼ぶ。
+    store: S,
     wake: Condvar,
     transport: T,
     /// 送信中のスレッド数。減らすときは必ず `state` のロックを持ち、ワーカーの待機を取りこぼさない。
@@ -142,7 +152,8 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
 impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> Engine<S, T> {
     fn new(store: S, transport: T, notify_main: Box<dyn Fn() + Send + Sync>, log: Box<dyn Fn(&str) + Send + Sync>) -> Self {
         Self {
-            state: Mutex::new(State::new(store)),
+            state: Mutex::new(State::new()),
+            store,
             wake: Condvar::new(),
             transport,
             in_flight: AtomicUsize::new(0),
@@ -185,7 +196,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
         self.wake.notify_all();
     }
 
-    /// 時刻が来た送信を、空きがある分だけ取り出し、送信ごとに短命のスレッドを起こす。
+    /// 認証情報の読み出しと、時刻が来た送信の取り出し (空きがある分だけ。送信ごとに短命のスレッドを起こす)。
     fn worker_loop(self: &Arc<Self>) {
         loop {
             let due = {
@@ -193,6 +204,12 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
                 loop {
                     if self.is_disabled() {
                         return;
+                    }
+                    if state.take_load_request() {
+                        drop(state);
+                        self.load_credentials();
+                        state = lock(&self.state);
+                        continue;
                     }
                     let free = MAX_IN_FLIGHT.saturating_sub(self.in_flight.load(Ordering::SeqCst));
                     let now = Instant::now();
@@ -231,6 +248,27 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
                 }
             }
         }
+    }
+
+    /// ロックを外して読み、もう一度ロックを取って結果を渡す。止まっても main の submit は待たない。
+    fn load_credentials(&self) {
+        let loaded = self.store.load();
+        let loaded = lock(&self.state).credentials_loaded(loaded);
+        if loaded.log_missing {
+            (self.log)("Cloudflare認証情報なし");
+        }
+        for delivery in loaded.deliveries {
+            self.push_result(delivery);
+        }
+    }
+
+    /// 認証情報の読み出しを先に始めさせる (トグル ON 時)。
+    fn prepare(&self) {
+        if self.is_disabled() {
+            return;
+        }
+        lock(&self.state).request_credentials();
+        self.wake.notify_one();
     }
 
     fn send(&self, sent: InFlight) {
@@ -306,9 +344,15 @@ pub fn cancel_all() {
     }
 }
 
-/// トグル ON 時の確認。Keychain は、未登録と分かっているときの読み直し以外では触れない。
+/// トグル ON 時に、認証情報の読み出しをバックグラウンドで始めさせる。待たない。
+pub fn prepare() {
+    shared().prepare();
+}
+
+/// 今分かっている状態を返すだけで、Keychain には触れない (読み出し中・未読込は使えるとみなす)。
 pub fn availability() -> Availability {
-    if lock(&shared().state).availability() {
+    let Some(engine) = SHARED.get() else { return Availability::Available };
+    if lock(&engine.state).availability() {
         Availability::Available
     } else {
         Availability::CredentialsMissing
@@ -361,11 +405,21 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    struct Store;
+    /// 呼ばれたスレッドを記録する。`release` があるときは、それが来るまで読み出しが返らない。
+    struct Store {
+        threads: Mutex<Vec<std::thread::ThreadId>>,
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Option<Mutex<mpsc::Receiver<()>>>,
+    }
 
     impl CredentialStore for Store {
-        fn load(&self) -> Option<Credentials> {
-            Some(Credentials { api_token: "tok".into(), account_id: "acct".into() })
+        fn load(&self) -> Result<Option<Credentials>, StoreError> {
+            lock(&self.threads).push(std::thread::current().id());
+            let _ = lock(&self.entered).send(());
+            if let Some(release) = &self.release {
+                let _ = lock(release).recv_timeout(Duration::from_secs(10));
+            }
+            Ok(Some(Credentials { api_token: "tok".into(), account_id: "acct".into() }))
         }
     }
 
@@ -398,17 +452,30 @@ mod tests {
         release: mpsc::Sender<()>,
         delivered: mpsc::Receiver<()>,
         logs: Arc<Mutex<Vec<String>>>,
+        store_entered: mpsc::Receiver<()>,
+        store_release: mpsc::Sender<()>,
     }
 
     fn harness(panic_on: Option<&'static str>) -> Harness {
+        harness_with(panic_on, false)
+    }
+
+    fn harness_with(panic_on: Option<&'static str>, hang_store: bool) -> Harness {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (store_rel_tx, store_rel_rx) = mpsc::channel();
         let (slow_tx, slow_rx) = mpsc::channel();
         let (rel_tx, rel_rx) = mpsc::channel();
         let (del_tx, del_rx) = mpsc::channel();
         let del_tx = Mutex::new(del_tx);
         let logs = Arc::new(Mutex::new(Vec::new()));
         let log_sink = logs.clone();
+        let store = Store {
+            threads: Mutex::new(Vec::new()),
+            entered: Mutex::new(entered_tx),
+            release: hang_store.then(|| Mutex::new(store_rel_rx)),
+        };
         let engine = Arc::new(Engine::new(
-            Store,
+            store,
             Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on },
             Box::new(move || {
                 let _ = lock(&del_tx).send(());
@@ -416,7 +483,7 @@ mod tests {
             Box::new(move |m| lock(&log_sink).push(m.to_string())),
         ));
         engine.start();
-        Harness { engine, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs }
+        Harness { engine, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs, store_entered: entered_rx, store_release: store_rel_tx }
     }
 
     fn job(id: u64, generation: u64, reading: &str) -> Job {
@@ -427,6 +494,50 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn credentials_are_read_off_the_calling_thread_and_only_once() {
+        let h = harness(None);
+        h.engine.submit(job(1, 1, "fast"));
+        h.delivered.recv_timeout(WAIT).expect("結果が届く");
+        h.engine.submit(job(1, 2, "fast2"));
+        h.delivered.recv_timeout(WAIT).expect("結果が届く");
+        let threads = lock(&h.engine.store.threads);
+        assert_eq!(threads.len(), 1, "読み出しは 1 度きり");
+        assert_ne!(threads[0], std::thread::current().id(), "呼び出し側 (main) のスレッドでは読まない");
+    }
+
+    #[test]
+    fn preparing_reads_credentials_in_the_background_before_the_first_send() {
+        let h = harness(None);
+        h.engine.prepare();
+        h.store_entered.recv_timeout(WAIT).expect("トグル ON で読み出しが始まる");
+        assert_ne!(lock(&h.engine.store.threads)[0], std::thread::current().id());
+        h.engine.submit(job(1, 1, "fast"));
+        h.delivered.recv_timeout(WAIT).expect("結果が届く");
+        assert_eq!(lock(&h.engine.store.threads).len(), 1, "送信時に読み直さない");
+    }
+
+    #[test]
+    fn submit_and_cancel_do_not_wait_for_a_stalled_credential_read() {
+        let h = harness_with(None, true);
+        h.engine.submit(job(1, 1, "fast"));
+        h.store_entered.recv_timeout(WAIT).expect("読み出しが始まり、止まる");
+        let engine = h.engine.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            engine.submit(job(1, 2, "fast2"));
+            engine.cancel(1);
+            let _ = lock(&engine.state).availability();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(WAIT).expect("読み出しが止まっていても、ロックで待たされない");
+        let _ = h.store_release.send(());
+        assert!(h.delivered.recv_timeout(Duration::from_millis(300)).is_err(), "取り消した要求の結果は届かない");
+        h.engine.submit(job(1, 3, "fast3"));
+        h.delivered.recv_timeout(WAIT).expect("読み出しが済めば送れる");
+        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(3));
+    }
 
     #[test]
     fn an_urgent_request_is_not_blocked_by_a_stale_one_in_flight() {
