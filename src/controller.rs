@@ -47,9 +47,11 @@ pub trait Environment {
     fn cancel_rerank(&self, controller_id: u64);
 }
 
-pub fn new_session(mode: ConversionMode) -> Session<RustEngine> {
+/// `generation` は AI 結果の世代番号の開始値。作り直した session が、古い結果と同じ番号を再利用しないように渡す。
+pub fn new_session(mode: ConversionMode, generation: u64) -> Session<RustEngine> {
     Session::new(
         Composer::new(RustEngine::new())
+            .with_generation(generation)
             .with_english(crate::loanword::english_for)
             .with_english_word(crate::loanword::is_english_word)
             .with_english_memory(crate::english_memory::knows, crate::english_memory::learn)
@@ -114,6 +116,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         self.session.borrow().mode()
     }
 
+    /// パネル更新中か。呼び戻された選択変更は無視するので、呼び出し側は Cocoa の値を読む前に見てよい。
+    pub fn is_syncing(&self) -> bool {
+        self.syncing.get()
+    }
+
     pub fn candidate_texts(&self) -> Vec<String> {
         self.session.borrow().candidate_texts()
     }
@@ -128,10 +135,9 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
 
     /// キー 1 打。処理したら true (false ならホストアプリへ素通しする)。
     pub fn on_key(&self, route: Route, client: C) -> bool {
-        if route == Route::PassThrough {
-            return false;
+        if route != Route::PassThrough {
+            *self.last_client.borrow_mut() = Some(client.clone());
         }
-        *self.last_client.borrow_mut() = Some(client.clone());
         match route {
             Route::PassThrough => false,
             Route::Translit(form) => self.dispatch(Key::Translit(form), "", &client),
@@ -209,7 +215,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         match self.session.try_borrow_mut() {
             Ok(mut session) => {
                 // 作り直した session にも、メニューの表示と同じ現在のモードを引き継ぐ。
-                *session = new_session(session.mode());
+                *session = new_session(session.mode(), session.generation());
             }
             Err(_) => self.env.log("reset_after_panic: session is borrowed, not recreated"),
         }
@@ -356,13 +362,15 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
     use crate::simulate::{FakeClient, FakeEnv, FakePanel};
 
     type Fixture = (Controller<FakeClient, FakePanel, FakeEnv>, FakeClient, FakePanel);
 
     fn fixture() -> Fixture {
         let panel = FakePanel::default();
-        let controller = Controller::new(1, new_session(ConversionMode::Space), panel.clone(), FakeEnv);
+        let controller = Controller::new(1, new_session(ConversionMode::Space, 0), panel.clone(), FakeEnv);
         (controller, FakeClient::default(), panel)
     }
 
@@ -435,6 +443,233 @@ mod tests {
         assert_eq!(f.0.mode(), ConversionMode::Space);
         f.0.on_toggle_conversion_mode();
         assert_eq!(f.0.mode(), ConversionMode::Live);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecClient {
+        bundle: Rc<RefCell<Option<String>>>,
+        bundle_calls: Rc<Cell<usize>>,
+        marked: Rc<RefCell<String>>,
+    }
+
+    impl RecClient {
+        fn set_bundle(&self, id: Option<&str>) {
+            *self.bundle.borrow_mut() = id.map(str::to_string);
+        }
+    }
+
+    impl TextClient for RecClient {
+        fn insert(&self, _text: &str) {
+            self.marked.borrow_mut().clear();
+        }
+        fn set_marked(&self, text: &str) {
+            *self.marked.borrow_mut() = text.to_string();
+        }
+        fn preceding_text(&self, _max_utf16: usize) -> String {
+            String::new()
+        }
+        fn bundle_id(&self) -> Option<String> {
+            self.bundle_calls.set(self.bundle_calls.get() + 1);
+            self.bundle.borrow().clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecEnv {
+        allowed: Rc<Cell<bool>>,
+        sent: Rc<RefCell<Vec<u64>>>,
+        cancels: Rc<Cell<usize>>,
+        logs: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Environment for RecEnv {
+        fn secure_input(&self) -> bool {
+            false
+        }
+        fn rerank_allowed(&self) -> bool {
+            self.allowed.get()
+        }
+        fn log(&self, line: &str) {
+            self.logs.borrow_mut().push(line.to_string());
+        }
+        fn trace(&self, _entry: &str, _fields: &str) {}
+        fn send_rerank(&self, _id: u64, job: &RerankJob, _context: &str, _urgent: bool) {
+            self.sent.borrow_mut().push(job.generation);
+        }
+        fn cancel_rerank(&self, _id: u64) {
+            self.cancels.set(self.cancels.get() + 1);
+        }
+    }
+
+    /// show / move_highlight の中で呼ぶフックを持つパネル (本物のパネルが同期で呼び戻すのを真似る)。
+    #[derive(Clone, Default)]
+    struct HookPanel {
+        hook: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+        hooks_run: Rc<Cell<usize>>,
+        hidden: Rc<Cell<usize>>,
+    }
+
+    impl HookPanel {
+        fn fire(&self) {
+            let hook = self.hook.borrow().clone();
+            if let Some(hook) = hook {
+                self.hooks_run.set(self.hooks_run.get() + 1);
+                hook();
+            }
+        }
+    }
+
+    impl CandidatePanel for HookPanel {
+        fn show(&self) -> bool {
+            self.fire();
+            true
+        }
+        fn hide(&self) {
+            self.hidden.set(self.hidden.get() + 1);
+        }
+        fn move_highlight(&self, _delta: isize) {
+            self.fire();
+        }
+    }
+
+    type RecController = Controller<RecClient, HookPanel, RecEnv>;
+
+    fn rec_fixture() -> (Rc<RecController>, RecClient, HookPanel, RecEnv) {
+        let (client, panel, env) = (RecClient::default(), HookPanel::default(), RecEnv::default());
+        let controller = Rc::new(Controller::new(7, new_session(ConversionMode::Space, 0), panel.clone(), env.clone()));
+        (controller, client, panel, env)
+    }
+
+    fn rec_type(c: &RecController, client: &RecClient, letters: &str) {
+        for ch in letters.chars() {
+            assert!(c.on_key(Route::Keys(vec![(Key::Letter { upper: false }, ch.to_string())]), client.clone()));
+        }
+    }
+
+    fn rec_press(c: &RecController, client: &RecClient, key: Key, text: &str) -> bool {
+        c.on_key(Route::Keys(vec![(key, text.to_string())]), client.clone())
+    }
+
+    #[test]
+    fn reset_after_panic_clears_the_screen_and_keeps_the_conversion_mode() {
+        let (c, client, panel, env) = rec_fixture();
+        rec_type(&c, &client, "kyou");
+        rec_press(&c, &client, Key::Space, " ");
+        rec_press(&c, &client, Key::Space, " ");
+        c.on_toggle_conversion_mode();
+        c.syncing.set(true);
+        c.panel_line.set(3);
+        let (hidden, cancels) = (panel.hidden.get(), env.cancels.get());
+
+        c.reset_after_panic();
+
+        assert_eq!(*client.marked.borrow(), "");
+        assert_eq!(panel.hidden.get(), hidden + 1);
+        assert_eq!(c.mode(), ConversionMode::Live);
+        assert_eq!(c.phase(), Phase::Empty);
+        assert_eq!(env.cancels.get(), cancels + 1);
+        assert!(!c.syncing.get());
+        assert_eq!(c.panel_line.get(), 0);
+    }
+
+    #[test]
+    fn reset_after_panic_logs_and_keeps_the_session_when_it_is_borrowed() {
+        let (c, client, _panel, env) = rec_fixture();
+        rec_type(&c, &client, "a");
+        let _held = c.session.borrow_mut();
+        c.reset_after_panic();
+        assert_eq!(env.logs.borrow().len(), 1);
+        assert_eq!(env.cancels.get(), 1);
+    }
+
+    #[test]
+    fn a_stale_rerank_result_is_not_applied_after_the_session_is_recreated() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(Some("com.apple.TextEdit"));
+        rec_type(&c, &client, "kyou");
+        let old = *env.sent.borrow().last().expect("a rerank request was sent");
+
+        c.reset_after_panic();
+        env.sent.borrow_mut().clear();
+        rec_type(&c, &client, "kyou");
+        let fresh = *env.sent.borrow().last().expect("a rerank request was sent");
+        let before = client.marked.borrow().clone();
+
+        assert_ne!(old, fresh, "generation numbers must not be reused");
+        c.on_rerank_result(old, 1);
+        assert_eq!(*client.marked.borrow(), before);
+    }
+
+    #[test]
+    fn skipped_rerank_cancels_the_pending_request_and_sends_nothing() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(None);
+        rec_type(&c, &client, "kyou");
+        assert!(env.sent.borrow().is_empty());
+        assert!(env.cancels.get() > 0);
+    }
+
+    #[test]
+    fn the_same_gate_reason_is_logged_once() {
+        let (c, client, _panel, env) = rec_fixture();
+        env.allowed.set(true);
+        client.set_bundle(None);
+        rec_type(&c, &client, "kyouha");
+        assert_eq!(env.logs.borrow().len(), 1, "{:?}", env.logs.borrow());
+    }
+
+    #[test]
+    fn bundle_id_is_retried_until_found_and_then_cached() {
+        let (c, client, _panel, _env) = rec_fixture();
+        rec_type(&c, &client, "a");
+        let missed = client.bundle_calls.get();
+        assert!(missed > 0);
+        rec_type(&c, &client, "a");
+        assert!(client.bundle_calls.get() > missed, "None is not cached");
+
+        client.set_bundle(Some("com.apple.TextEdit"));
+        rec_type(&c, &client, "a");
+        let found = client.bundle_calls.get();
+        client.set_bundle(Some("com.apple.Terminal"));
+        rec_type(&c, &client, "a");
+        assert_eq!(client.bundle_calls.get(), found, "a found id is not fetched again");
+    }
+
+    #[test]
+    fn panel_callbacks_during_show_do_not_double_borrow_and_selection_changes_are_ignored() {
+        let (c, client, panel, _env) = rec_fixture();
+        rec_type(&c, &client, "kyou");
+        rec_press(&c, &client, Key::Space, " ");
+        let texts = c.candidate_texts();
+        assert!(texts.len() >= 2);
+        let weak = Rc::downgrade(&c);
+        let other = texts[1].clone();
+        *panel.hook.borrow_mut() = Some(Rc::new(move || {
+            let c = weak.upgrade().expect("controller alive");
+            assert!(c.is_syncing());
+            assert!(!c.candidate_texts().is_empty());
+            c.on_selection_changed(&other);
+        }));
+
+        rec_press(&c, &client, Key::Space, " ");
+
+        assert!(panel.hooks_run.get() >= 2, "show and move_highlight both called back");
+        assert!(!c.is_syncing());
+        assert_eq!(c.phase(), Phase::Converting { selected: 1, window: true });
+    }
+
+    #[test]
+    fn a_selection_change_outside_the_panel_update_moves_the_selection() {
+        let (c, client, _panel, _env) = rec_fixture();
+        rec_type(&c, &client, "kyou");
+        rec_press(&c, &client, Key::Space, " ");
+        rec_press(&c, &client, Key::Space, " ");
+        let texts = c.candidate_texts();
+        c.on_selection_changed(&texts[2]);
+        assert!(matches!(c.phase(), Phase::Converting { selected: 2, .. }), "{:?}", c.phase());
+        assert_eq!(c.panel_line.get(), 2);
     }
 
     #[test]

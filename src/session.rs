@@ -85,6 +85,10 @@ impl<E: CandidateEngine> Session<E> {
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.composer.current_generation()
+    }
+
     pub fn set_rerank(&mut self, enabled: bool) {
         self.rerank = enabled;
     }

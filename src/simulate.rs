@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-// simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (input::route → Session) を headless で動かす。
+// simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (input::route → Controller) を headless で動かす。
 // 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
 //
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
@@ -224,7 +224,7 @@ struct Sim {
 
 impl Sim {
     fn new() -> Self {
-        let mut session = new_session(ConversionMode::Space);
+        let mut session = new_session(ConversionMode::Space, 0);
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
         let panel = FakePanel::default();
