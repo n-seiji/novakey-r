@@ -21,7 +21,7 @@ pub struct KeyInput {
     pub mods: Modifiers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Route {
     /// Command / Option、字種変換キーでない Ctrl。IME は触らずアプリへ渡す。
     PassThrough,
@@ -30,6 +30,18 @@ pub enum Route {
     Keys(Vec<(Key, String)>),
     /// ←→ や機能キー。未確定文があれば握りつぶし、無ければアプリへ素通しする (判定は呼び出し側)。
     Navigation,
+}
+
+// Keys が入力文字列を持つので、derive(Debug) だとログ/trace に打鍵が漏れる。文字列は出さず Key の名前だけにする。
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Route::PassThrough => f.write_str("PassThrough"),
+            Route::Translit(form) => f.debug_tuple("Translit").field(form).finish(),
+            Route::Keys(keys) => f.debug_tuple("Keys").field(&keys.iter().map(|(k, _)| k.name()).collect::<Vec<_>>()).finish(),
+            Route::Navigation => f.write_str("Navigation"),
+        }
+    }
 }
 
 pub fn route(input: &KeyInput) -> Route {
@@ -57,6 +69,7 @@ pub fn route(input: &KeyInput) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translit::Case;
 
     fn input(key_code: u16, chars: &str, mods: Modifiers) -> KeyInput {
         KeyInput {
@@ -81,9 +94,29 @@ mod tests {
     #[test]
     fn control_translit_keys_become_translit() {
         let m = Modifiers { control: true, ..NONE };
-        let lower = route(&input(0, "k", m));
-        assert!(matches!(lower, Route::Translit(_)), "{lower:?}");
-        assert_eq!(route(&input(0, "K", m)), lower);
+        assert_eq!(route(&input(0, "k", m)), Route::Translit(Form::Katakana));
+        assert_eq!(route(&input(0, "K", m)), Route::Translit(Form::Katakana));
+    }
+
+    #[test]
+    fn control_reads_characters_ignoring_modifiers() {
+        let m = Modifiers { control: true, ..NONE };
+        // 実機では Ctrl+K の characters は制御文字 "\u{b}" になる。
+        let ctrl_k = KeyInput {
+            key_code: 40,
+            characters: "\u{b}".to_string(),
+            characters_ignoring_modifiers: "k".to_string(),
+            mods: m,
+        };
+        assert_eq!(route(&ctrl_k), Route::Translit(Form::Katakana));
+        // characters 側が k でも、判定は ignoring 側 (a) で行われる。
+        let swapped = KeyInput {
+            key_code: 0,
+            characters: "k".to_string(),
+            characters_ignoring_modifiers: "a".to_string(),
+            mods: m,
+        };
+        assert_eq!(route(&swapped), Route::PassThrough);
     }
 
     #[test]
@@ -95,9 +128,15 @@ mod tests {
 
     #[test]
     fn function_keys_f6_to_f10_become_translit() {
-        for (code, ch) in [(97, "\u{F709}"), (98, "\u{F70A}"), (100, "\u{F70B}"), (101, "\u{F70C}"), (109, "\u{F70D}")] {
-            let r = route(&input(code, ch, NONE));
-            assert!(matches!(r, Route::Translit(_)), "key_code {code}: {r:?}");
+        let lower = Case::Lower;
+        for (code, ch, want) in [
+            (97, "\u{F709}", Form::Hiragana),
+            (98, "\u{F70A}", Form::Katakana),
+            (100, "\u{F70B}", Form::HalfKatakana),
+            (101, "\u{F70C}", Form::FullAlnum(lower)),
+            (109, "\u{F70D}", Form::HalfAlnum(lower)),
+        ] {
+            assert_eq!(route(&input(code, ch, NONE)), Route::Translit(want), "key_code {code}");
         }
     }
 
@@ -105,6 +144,12 @@ mod tests {
     fn left_and_right_arrows_are_navigation() {
         assert_eq!(route(&input(123, "\u{F702}", NONE)), Route::Navigation);
         assert_eq!(route(&input(124, "\u{F703}", NONE)), Route::Navigation);
+    }
+
+    #[test]
+    fn other_function_keys_and_empty_characters_are_navigation() {
+        assert_eq!(route(&input(115, "\u{F729}", NONE)), Route::Navigation);
+        assert_eq!(route(&input(0, "", NONE)), Route::Navigation);
     }
 
     #[test]
@@ -119,12 +164,26 @@ mod tests {
 
     #[test]
     fn ordinary_letter_is_keys_with_its_text() {
-        match route(&input(0, "a", NONE)) {
-            Route::Keys(keys) => {
-                assert_eq!(keys.len(), 1);
-                assert_eq!(keys[0].1, "a");
-            }
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(
+            route(&input(0, "a", NONE)),
+            Route::Keys(vec![(Key::Letter { upper: false }, "a".to_string())])
+        );
+    }
+
+    #[test]
+    fn multiple_characters_become_one_key_each() {
+        assert_eq!(
+            route(&input(0, "ab", NONE)),
+            Route::Keys(vec![
+                (Key::Letter { upper: false }, "a".to_string()),
+                (Key::Letter { upper: false }, "b".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn debug_output_does_not_contain_typed_text() {
+        let dbg = format!("{:?}", route(&input(0, "xyz", NONE)));
+        assert!(!dbg.contains('x') && !dbg.contains('z'), "{dbg}");
     }
 }

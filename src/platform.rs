@@ -151,6 +151,8 @@ pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
 }
 
 const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
+#[cfg(test)]
+const NS_EVENT_TYPE_KEY_UP: usize = 11;
 pub const NS_EVENT_MASK_KEY_DOWN: usize = 1 << NS_EVENT_TYPE_KEY_DOWN;
 const SHIFT_MODIFIER: usize = 1 << 17;
 const CONTROL_MODIFIER: usize = 1 << 18;
@@ -441,7 +443,7 @@ mod tests {
 
     #[test]
     fn key_up_is_not_converted() {
-        let ev = synth_event(11, 0, "a", "a", 0);
+        let ev = synth_event(NS_EVENT_TYPE_KEY_UP, 0, "a", "a", 0);
         assert!(key_event(&ev).is_none());
     }
 }

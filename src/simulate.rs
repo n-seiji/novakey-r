@@ -33,7 +33,7 @@ impl Event {
         KeyInput {
             key_code: self.key_code,
             characters: self.characters.clone(),
-            // Ctrl 付きでも文字は変わらないので、そのまま「修飾キーを無視した文字」として使う。
+            // sim では characters と ignoring を区別しない (実機の characters は Ctrl で "\u{b}" になる)。
             characters_ignoring_modifiers: self.characters.clone(),
             mods: Modifiers { shift: self.shift, control: self.control, command_or_option: false },
         }
