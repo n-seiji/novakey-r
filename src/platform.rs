@@ -1,7 +1,8 @@
 #![allow(unsafe_code)]
 //! Cocoa / InputMethodKit への薄い境界。unsafe はこのモジュールと imk_client.rs に閉じ込める。
 use std::cell::RefCell;
-use std::sync::Mutex;
+use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::{autoreleasepool, Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
@@ -96,19 +97,70 @@ pub fn guard<T>(fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
     })
 }
 
+unsafe extern "C" {
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+}
+
+/// dlsym で引いたシンボルの番地。見つからなければ None。
+pub fn symbol(name: &std::ffi::CStr) -> Option<NonNull<std::ffi::c_void>> {
+    const RTLD_DEFAULT: isize = -2;
+    // SAFETY: RTLD_DEFAULT と NUL 終端の名前を渡す dlsym は常に呼べる。
+    NonNull::new(unsafe { dlsym(RTLD_DEFAULT as *mut std::ffi::c_void, name.as_ptr()) })
+}
+
+/// `catch_objc` の中で ObjC メッセージを送るための票。例外が巻き戻れる `objc_msgSend` の番地を持つ。
+/// `msg_send!` は objc_msgSend を `extern "C"` (巻き戻りなし = nounwind) の型で呼ぶので、例外が通ると release で未定義動作になる。
+/// ここでは dlsym で引いた番地を `extern "C-unwind"` の関数ポインタとして呼ぶ (リンク済みの宣言を経由すると LLVM が
+/// nounwind の宣言に寄せてしまう)。
+#[derive(Clone, Copy)]
+pub struct Sender(NonNull<std::ffi::c_void>);
+
+impl Sender {
+    pub fn address(self) -> *mut std::ffi::c_void {
+        self.0.as_ptr()
+    }
+}
+
+fn sender() -> Option<Sender> {
+    static ADDRESS: OnceLock<Option<usize>> = OnceLock::new();
+    ADDRESS
+        .get_or_init(|| symbol(c"objc_msgSend").map(|p| p.as_ptr() as usize))
+        .and_then(|a| NonNull::new(a as *mut std::ffi::c_void))
+        .map(Sender)
+}
+
+/// `Sender` で型付きのメッセージ送信をする。`send!(s, 受け手, セレクタ; (引数 => 型, ...) -> 戻り値の型)`。
+/// 戻り値が ObjC オブジェクトなら生ポインタなので、呼び出し側で retain する。unsafe な文脈で使うこと。
+macro_rules! send {
+    ($s:expr, $recv:expr, $sel:expr; ($($arg:expr => $ty:ty),*) -> $ret:ty) => {{
+        let function: unsafe extern "C-unwind" fn(*mut objc2::runtime::AnyObject, objc2::runtime::Sel $(, $ty)*) -> $ret =
+            std::mem::transmute($s.address());
+        function(($recv) as *const _ as *const objc2::runtime::AnyObject as *mut objc2::runtime::AnyObject, $sel $(, $arg)*)
+    }};
+}
+pub(crate) use send;
+
 /// ホストアプリや候補パネルへの Objective-C 呼び出し `f` を実行し、NSException が投げられたら `None` にする。
 /// 例外が Rust のフレームに届くと "Rust cannot catch foreign exceptions" で IME ごと abort するので、呼び出しごとに止める。
 /// ログには例外の名前だけを、名前ごとに 1 度出す (reason にはホストのテキストが入りうるので読まない)。
-pub fn catch_objc<T>(f: impl FnOnce() -> T) -> Option<T> {
+///
+/// `f` には生の送信 (`send!`) だけを置くこと。**`f` は panic してはならない**: panic は @catch(id) に捕まらず、
+/// "C" 宣言の try_catch を越えて abort する。Vec の確保や文字列変換など panic しうる処理は `f` の外で行う。
+/// 例外を捕まえる送信の仕組みが使えない (dlsym が失敗した) ときは、`f` を呼ばずに `None` を返す。
+pub fn catch_objc<T>(f: impl FnOnce(Sender) -> T) -> Option<T> {
+    let send = sender()?;
     let mut result = None;
-    let mut call = Some(|| result = Some(f()));
+    let mut call = Some(|| result = Some(f(send)));
     let mut exception: *mut objc2::ffi::objc_object = std::ptr::null_mut();
     // 例外が通る関数は C-unwind でなければならない (extern "C" だと巻き戻しで abort する)。objc2 の catch は
     // C-unwind を nightly 専用の feature でしか使わないので、同じ objc-sys の try_catch を直接呼ぶ。
     let function = function_for(&call);
-    // SAFETY: C-unwind と C は呼び出し規約が同じで、違いは巻き戻しを許すかだけ。trampoline は巻き戻しを許すので、
-    // try_catch の @try が例外を受け止める。context は call への有効な可変参照で呼び出し中生存する。
-    // 返った例外は +1 retain 済みなので Id::from_raw が所有する。
+    // SAFETY: 例外が通る経路は次の 4 つで、どれも巻き戻しが定義された動作になる。
+    // (1) f の中の送信は `Sender` 経由の `extern "C-unwind"` 関数ポインタ呼び出しで、objc_msgSend のフレームも巻き戻せる。
+    // (2) trampoline は `extern "C-unwind"`。(3) try_catch は @try/@catch(id) で例外をここで止めるので、例外は
+    // try_catch の "C" の境界を越えない。C-unwind と C は呼び出し規約が同じで、transmute で変わるのは巻き戻しの可否の型だけ。
+    // (4) f は panic しない (上の doc)。panic だと @catch(id) を素通りして "C" の境界を越えてしまう。
+    // context は call への有効な可変参照で呼び出し中生存する。返った例外は +1 retain 済みなので Id::from_raw が所有する。
     let caught = unsafe {
         let function = std::mem::transmute::<extern "C-unwind" fn(*mut std::ffi::c_void), extern "C" fn(*mut std::ffi::c_void)>(function);
         objc2::ffi::try_catch(function, (&raw mut call).cast(), &raw mut exception)
@@ -184,16 +236,24 @@ pub fn is_secure_input_enabled() -> bool {
 }
 
 /// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。
+/// 送信が例外を投げたら空にする。
 pub fn utf16_units(string: &NSString) -> Vec<u16> {
-    // SAFETY: length は NSUInteger、getCharacters:range: は range が文字列内なら buffer に unichar を書き込む。
+    // SAFETY: length は NSUInteger を返す。
+    let Some(length) = catch_objc(|s| unsafe { send!(s, string, sel!(length); () -> usize) }) else {
+        return Vec::new();
+    };
+    let mut buffer: Vec<u16> = vec![0; length];
+    let range = NSRange { location: 0, length };
+    let out = buffer.as_mut_ptr();
+    // SAFETY: getCharacters:range: は range が文字列内なら out に unichar を書き込む。
     // buffer は length 個の領域を確保してあり、範囲は 0..length。
-    unsafe {
-        let length: usize = msg_send![string, length];
-        let mut buffer: Vec<u16> = vec![0; length];
-        let range = NSRange { location: 0, length };
-        let _: () = msg_send![string, getCharacters: buffer.as_mut_ptr(), range: range];
-        buffer
+    let filled = catch_objc(|s| unsafe {
+        send!(s, string, sel!(getCharacters:range:); (out => *mut u16, range => NSRange) -> ())
+    });
+    if filled.is_none() {
+        return Vec::new();
     }
+    buffer
 }
 
 /// ホスト由来の NSString を String にする。不正なサロゲートは U+FFFD になる。
@@ -323,13 +383,13 @@ pub fn show_candidates() -> bool {
         };
         // SAFETY: panel は生成済みの IMKCandidates。isVisible は BOOL を返し、updateCandidates と show: は
         // 引数の型が一致する。updateCandidates は candidates: を同期で呼び戻すので、借用を外してから呼ぶ。
-        catch_objc(|| unsafe {
-            let visible: Bool = msg_send![&*panel, isVisible];
+        catch_objc(|s| unsafe {
+            let visible: Bool = send!(s, &*panel, sel!(isVisible); () -> Bool);
             if visible.as_bool() {
                 return false;
             }
-            let _: () = msg_send![&*panel, updateCandidates];
-            let _: () = msg_send![&*panel, show: K_IMK_LOCATE_CANDIDATES_BELOW_HINT];
+            send!(s, &*panel, sel!(updateCandidates); () -> ());
+            send!(s, &*panel, sel!(show:); (K_IMK_LOCATE_CANDIDATES_BELOW_HINT => usize) -> ());
             true
         })
         .unwrap_or(false)
@@ -340,9 +400,7 @@ pub fn hide_candidates() {
     CANDIDATES_PANEL.with(|cell| {
         if let Some(panel) = cell.borrow().as_deref() {
             // SAFETY: panel は生成済みの IMKCandidates で、hide は引数なし。
-            catch_objc(|| unsafe {
-                let _: () = msg_send![panel, hide];
-            });
+            catch_objc(|s| unsafe { send!(s, panel, sel!(hide); () -> ()) });
         }
     });
 }
@@ -357,9 +415,13 @@ pub fn move_candidate_highlight(delta: isize) {
     let action = if delta > 0 { sel!(moveDown:) } else { sel!(moveUp:) };
     for _ in 0..delta.unsigned_abs() {
         // SAFETY: panel は生成済みの IMKCandidates (NSResponder) で、moveDown: / moveUp: は sender (nil 可) を取る。
-        let moved = catch_objc(|| unsafe {
-            let _: *mut AnyObject =
-                msg_send![&*panel, performSelector: action, withObject: std::ptr::null::<AnyObject>()];
+        let moved = catch_objc(|s| unsafe {
+            send!(
+                s,
+                &*panel,
+                sel!(performSelector:withObject:);
+                (action => Sel, std::ptr::null::<AnyObject>() => *const AnyObject) -> *mut AnyObject
+            );
         });
         if moved.is_none() {
             return;
@@ -438,18 +500,18 @@ mod tests {
     }
     #[test]
     fn catch_objc_returns_the_value_when_nothing_is_thrown() {
-        assert_eq!(catch_objc(|| 7), Some(7));
+        assert_eq!(catch_objc(|_| 7), Some(7));
     }
 
     #[test]
     fn catch_objc_turns_an_nsexception_into_none() {
         // SAFETY: NSArray の array は空配列を返し、objectAtIndex: は NSUInteger を取る。範囲外なので NSRangeException が投げられる。
-        let caught = catch_objc(|| unsafe {
-            let array: Id<AnyObject> = msg_send_id![class!(NSArray), array];
-            let _: *mut AnyObject = msg_send![&*array, objectAtIndex: 3usize];
+        let array: Id<AnyObject> = unsafe { msg_send_id![class!(NSArray), array] };
+        let caught = catch_objc(|s| unsafe {
+            send!(s, &*array, sel!(objectAtIndex:); (3usize => usize) -> *mut AnyObject);
         });
         assert_eq!(caught, None);
-        assert_eq!(catch_objc(|| "still works"), Some("still works"));
+        assert_eq!(catch_objc(|_| "still works"), Some("still works"));
     }
 
     #[test]

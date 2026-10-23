@@ -8,6 +8,8 @@ rust-version = "1.85"
 
 [dependencies]
 objc2 = { version = "0.5", features = ["exception"] }
+# objc2::ffi::try_catch は unstable-exception 機能で semver 対象外なので、版を固定する
+objc-sys = { version = "=0.3.5", features = ["unstable-exception"] }
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSAutoreleasePool", "NSBundle", "NSRange", "NSObjCRuntime"] }
 regex = "1"
 unicode-segmentation = "1"
