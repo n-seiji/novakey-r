@@ -49,7 +49,8 @@ impl AiStatus {
             AiStatus::On(Availability::CredentialsMissing) => Some("LLMリランキング無効(Cloudflare認証情報を確認)"),
             AiStatus::On(Availability::CredentialsRejected) => Some("LLMリランキング停止(認証情報が拒否された。確認してトグルを入れ直す)"),
             AiStatus::On(Availability::Paused) => Some("LLMリランキング一時停止中(混雑)"),
-            AiStatus::On(Availability::Disabled) => Some("LLMリランキング停止(エラーが続いた。再起動で復帰)"),
+            AiStatus::On(Availability::ErrorsPersisted) => Some("LLMリランキング停止(エラーが続いた。設定を確認してトグルを入れ直す)"),
+            AiStatus::On(Availability::Disabled) => Some("LLMリランキング停止(内部エラー。再起動で復帰)"),
         }
     }
 }
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn 要求を送れるのはオンで使えるときだけ() {
-        for a in [Availability::CredentialsMissing, Availability::CredentialsRejected, Availability::Paused, Availability::Disabled] {
+        for a in [Availability::CredentialsMissing, Availability::CredentialsRejected, Availability::Paused, Availability::ErrorsPersisted, Availability::Disabled] {
             let status = AiStatus::On(Availability::Ready).observe(a);
             assert!(!status.allows_requests(), "{a:?}");
             assert!(status.accepts_results(), "止まっていても、すでに届いた結果は受ける: {a:?}");

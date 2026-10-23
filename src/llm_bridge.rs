@@ -265,7 +265,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
     /// ロックを外して読み、もう一度ロックを取って結果を渡す。止まっても main の submit は待たない。
     fn load_credentials(&self) {
         let loaded = self.store.load();
-        let loaded = lock(&self.state).credentials_loaded(loaded);
+        let loaded = lock(&self.state).credentials_loaded(self.clock.now(), loaded);
         if loaded.log_missing {
             (self.log)("Cloudflare認証情報なし");
         }
@@ -534,6 +534,11 @@ mod tests {
     }
 
     fn harness_with(panic_on: Option<&'static str>, hang_store: bool) -> Harness {
+        harness_logging(panic_on, hang_store, |_| {})
+    }
+
+    /// `on_log` は、ログを記録したあとに呼ばれる (呼んだスレッドで)。
+    fn harness_logging(panic_on: Option<&'static str>, hang_store: bool, on_log: impl Fn(&str) + Send + Sync + 'static) -> Harness {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (store_rel_tx, store_rel_rx) = mpsc::channel();
         let (slow_tx, slow_rx) = mpsc::channel();
@@ -553,7 +558,10 @@ mod tests {
             store,
             Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on, script: Mutex::new(None), posts: Default::default() },
             Box::new(clock.clone()),
-            Box::new(move |m| lock(&log_sink).push(m.to_string())),
+            Box::new(move |m| {
+                lock(&log_sink).push(m.to_string());
+                on_log(m);
+            }),
             |_| Arc::new(main),
         );
         engine.start();
@@ -861,6 +869,27 @@ mod tests {
     }
 
     #[test]
+    fn a_sender_whose_generation_went_stale_before_sending_returns_its_slot() {
+        let (sent_tx, sent_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (sent_tx, go_rx) = (Mutex::new(sent_tx), Mutex::new(go_rx));
+        let h = harness_logging(None, false, move |m| {
+            if m.starts_with("Clef requests sent") {
+                let _ = lock(&sent_tx).send(());
+                let _ = lock(&go_rx).recv_timeout(WAIT);
+            }
+        });
+        h.engine.submit(job(1, 1, "fast"));
+        sent_rx.recv_timeout(WAIT).expect("送信が取り出された (ワーカーはここで止まっている)");
+        assert_eq!(lock(&h.engine.state).in_flight(), 1);
+        h.engine.cancel(1);
+        let _ = go_tx.send(());
+        h.wait_idle();
+        assert_eq!(h.posts(), 0, "世代が古くなっていたので通信しない");
+        assert!(h.pop_result().is_none());
+    }
+
+    #[test]
     fn a_timeout_fails_only_that_request() {
         let h = harness(None);
         h.script(Some(Err(TransportFailure::Timeout)));
@@ -884,7 +913,7 @@ mod tests {
             h.wait_idle();
             let _ = h.pop_result();
         }
-        assert_eq!(lock(&h.engine.state).availability(Instant::now()), Availability::Disabled);
+        assert_eq!(lock(&h.engine.state).availability(Instant::now()), Availability::ErrorsPersisted);
         h.engine.submit(job(1, 4, "fast4"));
         assert_eq!(h.posts(), 3);
         let logs = lock(&h.logs);
