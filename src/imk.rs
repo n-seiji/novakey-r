@@ -9,7 +9,7 @@ use objc2_foundation::{NSArray, NSObject, NSString};
 use crate::controller::{new_session, CandidatePanel, Controller, Environment};
 use crate::imk_client::Client;
 use crate::input::{self, Route};
-use crate::llm_bridge;
+use crate::llm_bridge::{Choice, Delivery, RerankService, Unavailable};
 use crate::platform;
 use crate::registry::Registry;
 use crate::outbound::Screened;
@@ -19,6 +19,7 @@ use crate::session::ConversionMode;
 use crate::trace;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -28,17 +29,36 @@ thread_local! {
 
 const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
 
-fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
+/// AI 並べ替えの送信側。プロセスに 1 つだけ、最初の送信かトグル ON で起こす。
+/// グローバルなのは、IMK のコールバック (Environment を作るのは Cocoa 側) から届く経路がほかにないため。
+static RERANK: OnceLock<Arc<RerankService>> = OnceLock::new();
+
+fn rerank_service() -> &'static Arc<RerankService> {
+    RERANK.get_or_init(|| RerankService::start(dispatch_llm_result))
+}
+
+/// まだ起こしていなければ何もしない。
+fn cancel_rerank(controller_id: u64) {
+    if let Some(service) = RERANK.get() {
+        service.cancel(controller_id);
+    }
+}
+
+/// 起こしていなければ、使える (読み出し中・未読込と同じ) とみなす。
+fn rerank_availability() -> Availability {
+    RERANK.get().map_or(Availability::Ready, |service| service.availability())
+}
+
+fn dispatch_llm_result(delivery: Delivery) {
     CONTROLLERS.with(|c| {
-        c.deliver(controller_id, |weak| weak.load(), |controller| {
-            controller.handle_llm_result(generation, status, text);
+        c.deliver(delivery.controller_id, |weak| weak.load(), |controller| {
+            controller.handle_llm_result(delivery.generation, &delivery.outcome);
         });
     });
 }
 
 pub fn init_llm_dispatch() {
     set_ai_status(if platform::defaults_bool(AI_RERANK_KEY) { AiStatus::On(Availability::Ready) } else { AiStatus::Off });
-    llm_bridge::set_result_handler(dispatch_llm_result);
 }
 
 fn ai_status() -> AiStatus {
@@ -85,7 +105,7 @@ impl Environment for PlatformEnv {
 
     fn rerank_allowed(&self) -> bool {
         // 一時停止が明けた・認証情報の読み直しが済んだことを拾うため、毎回送信側の状態を取り込む (ロックだけで Keychain には触れない)。
-        set_ai_status(ai_status().observe(llm_bridge::availability()));
+        set_ai_status(ai_status().observe(rerank_availability()));
         ai_status().allows_requests()
     }
 
@@ -98,11 +118,11 @@ impl Environment for PlatformEnv {
     }
 
     fn send_rerank(&self, controller_id: u64, generation: u64, payload: &Screened, urgent: bool) {
-        llm_bridge::rerank_async(controller_id, generation, payload.clone(), urgent);
+        rerank_service().submit(controller_id, generation, payload.clone(), urgent);
     }
 
     fn cancel_rerank(&self, controller_id: u64) {
-        llm_bridge::cancel(controller_id);
+        cancel_rerank(controller_id);
     }
 }
 
@@ -116,7 +136,7 @@ impl Drop for Ivars {
     fn drop(&mut self) {
         platform::guard(|| (), || {
             let _ = CONTROLLERS.try_with(|c| c.remove(self.id));
-            llm_bridge::cancel(self.id);
+            cancel_rerank(self.id);
         });
     }
 }
@@ -240,7 +260,7 @@ declare_class!(
                 } else {
                     "AI並べ替え: オフ"
                 };
-                set_ai_status(ai_status().observe(llm_bridge::availability()));
+                set_ai_status(ai_status().observe(rerank_availability()));
                 let warning = ai_status().warning();
                 platform::build_menu(
                     &[
@@ -259,12 +279,14 @@ declare_class!(
                 set_ai_status(if enabled { AiStatus::On(Availability::Ready) } else { AiStatus::Off });
                 platform::set_defaults_bool(AI_RERANK_KEY, enabled);
                 if !enabled {
-                    llm_bridge::cancel_all();
+                    if let Some(service) = RERANK.get() {
+                        service.cancel_all();
+                    }
                 }
                 if enabled {
                     // Keychain の読み出しは止まりうるので待たない。結果は、メニューを開いたとき (menu) か
                     // 最初の送信の結果で警告に反映される。
-                    llm_bridge::prepare();
+                    rerank_service().prepare();
                 }
             })
         }
@@ -303,25 +325,23 @@ impl NovakeyRInputController {
         platform::guard(|| (), || self.ivars().controller.reset_after_panic());
     }
 
-    fn handle_llm_result(&self, generation: u64, status: i32, text: &str) {
-        self.guard_session(|| (), || self.apply_llm_result(generation, status, text));
+    fn handle_llm_result(&self, generation: u64, outcome: &Result<Choice, Unavailable>) {
+        self.guard_session(|| (), || self.apply_llm_result(generation, outcome));
     }
 
-    fn apply_llm_result(&self, generation: u64, status: i32, text: &str) {
+    fn apply_llm_result(&self, generation: u64, outcome: &Result<Choice, Unavailable>) {
         if !ai_status().accepts_results() {
             return;
         }
-        if status == llm_bridge::STATUS_CREDENTIALS_MISSING {
-            set_ai_status(ai_status().observe(Availability::CredentialsMissing));
+        match outcome {
+            Ok(choice) => self.ivars().controller.on_rerank_result(generation, choice),
+            Err(reason) => {
+                if *reason == Unavailable::CredentialsMissing {
+                    set_ai_status(ai_status().observe(Availability::CredentialsMissing));
+                }
+                platform::log(&format!("LLM rerank error: {reason:?}"));
+            }
         }
-        if status != llm_bridge::STATUS_OK {
-            platform::log(&format!("LLM rerank error status={}", status));
-            return;
-        }
-        let Ok(index) = text.trim().parse::<usize>() else {
-            return;
-        };
-        self.ivars().controller.on_rerank_result(generation, index);
     }
 }
 

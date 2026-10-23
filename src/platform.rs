@@ -2,7 +2,8 @@
 //! Cocoa / InputMethodKit への薄い境界。unsafe はこのモジュールと imk_client.rs に閉じ込める。
 use std::cell::RefCell;
 use std::ptr::NonNull;
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use objc2::rc::{autoreleasepool, Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
@@ -272,6 +273,33 @@ pub fn run_on_main(f: fn()) {
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, f as *mut std::ffi::c_void, trampoline) };
 }
 
+type MainTask = Box<dyn FnOnce() + Send>;
+
+/// `run_on_main` は `fn()` しか運べないので、データを持つ処理はここに積んで取り出し口 (`drain_main_tasks`) を投入する。
+/// プロセスに 1 つだけのグローバルで、データを運べる投入口ができたら (`run_on_main_boxed`) なくす。
+static MAIN_TASKS: Mutex<VecDeque<MainTask>> = Mutex::new(VecDeque::new());
+
+/// `task` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。投入した順に実行される。
+pub fn post_to_main(task: MainTask) {
+    MAIN_TASKS.lock().unwrap_or_else(PoisonError::into_inner).push_back(task);
+    run_on_main(drain_main_tasks);
+}
+
+fn drain_main_tasks() {
+    run_queued(&MAIN_TASKS);
+}
+
+/// 積まれた処理を順に実行する。1 件の panic で残りを止めない。
+fn run_queued(queue: &Mutex<VecDeque<MainTask>>) {
+    loop {
+        let task = queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front();
+        let Some(task) = task else { return };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+            log("panic in main-queue task (ignored)");
+        }
+    }
+}
+
 pub fn is_secure_input_enabled() -> bool {
     // SAFETY: Carbon の引数なし C 関数で、状態を読むだけ。
     unsafe { IsSecureEventInputEnabled() != 0 }
@@ -536,6 +564,25 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_main_tasks_run_in_order_and_a_panic_does_not_stop_the_rest() {
+        let queue = Mutex::new(VecDeque::new());
+        let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
+        for n in 1..=3 {
+            let ran = ran.clone();
+            let task: MainTask = Box::new(move || {
+                ran.lock().unwrap().push(n);
+                if n == 2 {
+                    panic!("task panic");
+                }
+            });
+            queue.lock().unwrap().push_back(task);
+        }
+        run_queued(&queue);
+        assert_eq!(*ran.lock().unwrap(), vec![1, 2, 3]);
+        assert!(queue.lock().unwrap().is_empty());
+    }
 
     fn ns_from_units(units: &[u16]) -> Id<NSString> {
         // SAFETY: stringWithCharacters:length: は unichar 配列とその長さを取り NSString を返す。

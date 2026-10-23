@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use crate::composer::{CandidateEngine, Committed, Composer, Phase};
 use crate::deps::{EnglishMemory, Lexicon};
 use crate::keymap::{self, Action, Key};
+use crate::rerank::Choice;
 
 /// リランキング要求の中身。送信は Effect の実行側が決める。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +128,8 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     }
 
     /// AI の並べ替え結果を反映する。世代が古いなどで反映されなければ空。
-    pub fn apply_rerank(&mut self, generation: u64, index: usize) -> Vec<Effect> {
-        match self.composer.apply_rerank(generation, index) {
+    pub fn apply_rerank(&mut self, generation: u64, choice: &Choice) -> Vec<Effect> {
+        match self.composer.apply_rerank(generation, choice) {
             Some(_) => vec![Effect::SetMarked(self.marked_text())],
             None => Vec::new(),
         }
@@ -759,7 +760,7 @@ mod tests {
     fn 世代が違うapply_rerankは何も出さない() {
         let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         effects_of(&mut session, "kyou");
-        assert!(session.apply_rerank(u64::MAX, 1).is_empty());
+        assert!(session.apply_rerank(u64::MAX, &Choice { index: 1, text: "京".into() }).is_empty());
     }
 
     #[test]

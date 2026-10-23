@@ -12,10 +12,6 @@ use std::time::{Duration, Instant};
 
 use crate::outbound::Screened;
 
-pub const STATUS_OK: i32 = 0;
-pub const STATUS_FAILED: i32 = 1;
-pub const STATUS_CREDENTIALS_MISSING: i32 = 4;
-
 pub const KEYCHAIN_SERVICE: &str = "me.sijis.inputmethod.NovakeyR.cloudflare";
 pub const KEYCHAIN_ACCOUNT_TOKEN: &str = "api-token";
 pub const KEYCHAIN_ACCOUNT_ID: &str = "account-id";
@@ -220,13 +216,33 @@ pub struct InFlight {
     pub creds: Credentials,
 }
 
+/// 選ばれた候補。`index` は要求した候補列での位置、`text` はその位置にあった文字列。
+/// 受け取り側は text も照合し、候補の並びが変わっていたら適用しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub index: usize,
+    pub text: String,
+}
+
+impl Choice {
+    fn from_key(key: &Screened, index: usize) -> Option<Self> {
+        key.candidates().get(index).map(|text| Self { index, text: text.clone() })
+    }
+}
+
+/// 結果を返せなかった理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    CredentialsMissing,
+    Failed,
+}
+
 /// メインスレッドへ返す結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub controller_id: u64,
     pub generation: u64,
-    pub status: i32,
-    pub text: String,
+    pub outcome: Result<Choice, Unavailable>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -468,8 +484,7 @@ impl State {
             delivery: Some(Delivery {
                 controller_id: job.controller_id,
                 generation: job.generation,
-                status: STATUS_CREDENTIALS_MISSING,
-                text: "Cloudflare認証情報なし".into(),
+                outcome: Err(Unavailable::CredentialsMissing),
             }),
             log_missing,
         }
@@ -480,11 +495,11 @@ impl State {
         if let Some((cached_key, index)) = &self.last_result {
             // key には context_dropped も含まれる。送る本文が同じでも理由が違えば外れるだけで、漏れは増えない (キャッシュ命中が減る側にしか倒れない)。
             if *cached_key == key {
-                let text = index.to_string();
+                let outcome = Choice::from_key(&key, *index).ok_or(Unavailable::Failed);
                 self.register_latest(id, generation);
                 self.sent.insert(id, generation);
                 return Submitted {
-                    delivery: Some(Delivery { controller_id: id, generation, status: STATUS_OK, text }),
+                    delivery: Some(Delivery { controller_id: id, generation, outcome }),
                     log_missing: false,
                 };
             }
@@ -561,13 +576,14 @@ impl State {
     pub fn complete(&mut self, now: Instant, sent: InFlight, result: Result<usize, FetchError>) -> Completed {
         let latest = self.is_latest(sent.controller_id, sent.generation);
         let mut log = None;
-        let (status, text) = match result {
+        let outcome = match result {
             Ok(index) => {
                 self.permanent_failures = 0;
+                let choice = Choice::from_key(&sent.key, index);
                 if latest {
                     self.last_result = Some((sent.key, index));
                 }
-                (STATUS_OK, index.to_string())
+                choice.ok_or(Unavailable::Failed)
             }
             Err(err) => {
                 let class = err.classify();
@@ -576,11 +592,10 @@ impl State {
                     // 止めた要求の結果は配信しない。メインスレッドは availability から状態を知る。
                     return Completed { delivery: None, log };
                 }
-                (STATUS_FAILED, "Clef rerank failed".to_string())
+                Err(Unavailable::Failed)
             }
         };
-        let delivery = latest
-            .then(|| Delivery { controller_id: sent.controller_id, generation: sent.generation, status, text });
+        let delivery = latest.then(|| Delivery { controller_id: sent.controller_id, generation: sent.generation, outcome });
         Completed { delivery, log }
     }
 
@@ -845,13 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_credentials_deliver_status_4_and_log_once() {
+    fn missing_credentials_deliver_unavailable_and_log_once() {
         let (mut s, loads) = state(false);
         let first = s.submit(Instant::now(), job(1, 1, "あ", false));
-        assert_eq!(first.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
+        assert_eq!(first.delivery.as_ref().map(|d| d.outcome.clone()), Some(Err(Unavailable::CredentialsMissing)));
         assert!(first.log_missing);
         let second = s.submit(Instant::now(), job(1, 2, "あい", false));
-        assert_eq!(second.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
+        assert_eq!(second.delivery.as_ref().map(|d| d.outcome.clone()), Some(Err(Unavailable::CredentialsMissing)));
         assert!(!second.log_missing);
         assert_eq!(loads.get(), 1, "打鍵ごとに Keychain を読み直さない");
         assert!(s.next_deadline().is_none());
@@ -894,7 +909,7 @@ mod tests {
     fn an_unreadable_store_is_unavailable_but_can_be_reread() {
         let (mut s, loads) = rig(Err(StoreError));
         let first = s.submit(Instant::now(), job(1, 1, "あ", false));
-        assert_eq!(first.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
+        assert_eq!(first.delivery.as_ref().map(|d| d.outcome.clone()), Some(Err(Unavailable::CredentialsMissing)));
         assert!(first.log_missing);
         assert!(!s.submit(Instant::now(), job(1, 2, "あい", false)).log_missing);
         assert_eq!(loads.get(), 1);
@@ -1018,17 +1033,17 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_result_is_delivered_and_failure_reports_status_1() {
+    fn a_successful_result_is_delivered_and_failure_reports_unavailable() {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         let sent = s.take_all_due(ms(t0, 250)).remove(0);
         let d = s.complete(t0, sent, Ok(1)).delivery.unwrap();
-        assert_eq!((d.status, d.text.as_str(), d.generation), (STATUS_OK, "1", 1));
+        assert_eq!((d.outcome, d.generation), (Ok(Choice { index: 1, text: "京は".into() }), 1));
         s.submit(ms(t0, 300), job(1, 2, "あい", false));
         let sent = s.take_all_due(ms(t0, 600)).remove(0);
         let d = s.complete(t0, sent, Err(FetchError::Transport(TransportFailure::Timeout))).delivery.unwrap();
-        assert_eq!(d.status, STATUS_FAILED);
+        assert_eq!(d.outcome, Err(Unavailable::Failed));
     }
 
     #[test]
@@ -1040,7 +1055,7 @@ mod tests {
         s.complete(t0, sent, Ok(1)).delivery.unwrap();
         let again = s.submit(ms(t0, 400), job(1, 2, "あ", false));
         let d = again.delivery.expect("キャッシュで即座に返る");
-        assert_eq!((d.status, d.text.as_str(), d.generation), (STATUS_OK, "1", 2));
+        assert_eq!((d.outcome, d.generation), (Ok(Choice { index: 1, text: "京は".into() }), 2));
         assert!(s.next_deadline().is_none(), "通信は待機に入らない");
     }
 
@@ -1198,7 +1213,7 @@ mod tests {
             let (mut s, _) = state(true);
             let t0 = Instant::now();
             let done = fail(&mut s, t0, 1, 1, "あ", FetchError::Transport(failure));
-            assert_eq!(done.delivery.map(|d| d.status), Some(STATUS_FAILED));
+            assert_eq!(done.delivery.map(|d| d.outcome), Some(Err(Unavailable::Failed)));
             assert_eq!(done.log, None);
             assert_eq!(s.availability(t0), Availability::Ready);
             assert!(s.next_deadline().is_none(), "再送しない");
@@ -1214,7 +1229,7 @@ mod tests {
         let errors = [FetchError::Status(400), FetchError::InvalidResponse, FetchError::Status(404)];
         for (n, err) in errors.iter().enumerate().take(2) {
             let done = fail(&mut s, t0, 1, n as u64 + 1, &format!("あ{n}"), err.clone());
-            assert_eq!(done.delivery.map(|d| d.status), Some(STATUS_FAILED));
+            assert_eq!(done.delivery.map(|d| d.outcome), Some(Err(Unavailable::Failed)));
             assert_eq!(done.log, None);
             assert_eq!(s.availability(t0), Availability::Ready);
         }

@@ -21,6 +21,7 @@ use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
 use crate::outbound::Screened;
+use crate::rerank::Choice;
 use crate::session::ConversionMode;
 use crate::translit::Form;
 
@@ -242,6 +243,8 @@ pub(crate) struct EnvState {
     pub rerank: bool,
     /// 送られて、まだ取り消されていない AI 要求の世代 (古い順)。
     pub sent: Vec<u64>,
+    /// `sent` と同じ順の、送られた候補列。
+    pub sent_candidates: Vec<Vec<String>>,
     /// `sent` と同じ順の、送られた payload の (文脈, 文脈を空にした理由の名前)。取り消しでは消さない。
     pub payloads: Vec<(String, Option<&'static str>)>,
 }
@@ -262,11 +265,14 @@ impl Environment for FakeEnv {
     fn send_rerank(&self, _controller_id: u64, generation: u64, payload: &Screened, _urgent: bool) {
         let mut state = self.0.borrow_mut();
         state.sent.push(generation);
+        state.sent_candidates.push(payload.candidates().to_vec());
         state.payloads.push((payload.context().to_string(), payload.context_dropped().map(|r| r.name())));
     }
 
     fn cancel_rerank(&self, _controller_id: u64) {
-        self.0.borrow_mut().sent.clear();
+        let mut state = self.0.borrow_mut();
+        state.sent.clear();
+        state.sent_candidates.clear();
     }
 }
 
@@ -357,10 +363,16 @@ impl Sim {
                 self.client.0.borrow_mut().bundle = Some("com.apple.TextEdit".to_string());
             }
             Step::Rerank { n, oldest } => {
-                let sent = self.env.0.borrow().sent.clone();
-                let generation = if *oldest { sent.first() } else { sent.last() };
-                if let Some(&generation) = generation {
-                    self.controller.on_rerank_result(generation, *n - 1);
+                let (generation, candidates) = {
+                    let state = self.env.0.borrow();
+                    let at = if *oldest { 0 } else { state.sent.len().wrapping_sub(1) };
+                    (state.sent.get(at).copied(), state.sent_candidates.get(at).cloned().unwrap_or_default())
+                };
+                if let Some(generation) = generation {
+                    let index = *n - 1;
+                    // 範囲外の番号は、本物の経路では届かないが、適用されないことを確かめるために通す。
+                    let text = candidates.get(index).cloned().unwrap_or_default();
+                    self.controller.on_rerank_result(generation, &Choice { index, text });
                 }
             }
         }

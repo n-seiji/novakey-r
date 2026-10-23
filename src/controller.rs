@@ -14,6 +14,7 @@ use crate::input::Route;
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
 use crate::outbound::{self, Screened};
+use crate::rerank::Choice;
 use crate::rerank_gate::{GateOutcome, RerankGate};
 use crate::session::{ConversionMode, Effect, Gates, Outcome, RerankJob, Session};
 
@@ -197,15 +198,15 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         }
     }
 
-    /// AI 並べ替えの結果 (選ばれた候補の番号)。
-    pub fn on_rerank_result(&self, generation: u64, index: usize) {
+    /// AI 並べ替えの結果 (選ばれた候補)。
+    pub fn on_rerank_result(&self, generation: u64, choice: &Choice) {
         let Some(client) = self.client() else { return };
         let effects = {
             // 変換処理の途中に run loop が再入した場合は、結果を捨てる (借用の二重取得で落とさない)。
             let Ok(mut session) = self.session.try_borrow_mut() else {
                 return;
             };
-            session.apply_rerank(generation, index)
+            session.apply_rerank(generation, choice)
         };
         self.run(effects, Some(&client));
     }
@@ -719,7 +720,7 @@ mod tests {
         let before = client.marked.borrow().clone();
 
         assert_ne!(old, fresh, "generation numbers must not be reused");
-        c.on_rerank_result(old, 1);
+        c.on_rerank_result(old, &Choice { index: 1, text: "x".into() });
         assert_eq!(*client.marked.borrow(), before);
     }
 
