@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 mod composer;
+mod config;
 mod imk;
 mod imk_client;
 mod input;
@@ -49,6 +50,7 @@ fn main() {
         return;
     }
 
+    config::init(config::Config::from_env());
     platform::install_panic_hook();
     imk::register_controller();
     imk::init_llm_dispatch();

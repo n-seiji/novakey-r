@@ -4,7 +4,6 @@
 // 表は初回参照時に一度だけ読み、ファイルが無ければ空の表として扱う。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 type Table = HashMap<String, Vec<String>>;
@@ -32,17 +31,10 @@ pub fn lookup<'a>(table: &'a Table, katakana: &str) -> &'a [String] {
     found.map_or(&[], Vec::as_slice)
 }
 
-fn table_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("NOVAKEY_LOANWORDS") {
-        return Some(path.into());
-    }
-    // Contents/MacOS/novakey_r から見た Contents/Resources/
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.parent()?.join("Resources/loanwords.tsv"))
-}
-
 static TABLE: LazyLock<Table> = LazyLock::new(|| {
-    table_path()
+    crate::config::get()
+        .loanwords_path
+        .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| parse(&s))
         .unwrap_or_default()

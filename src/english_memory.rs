@@ -45,10 +45,10 @@ struct Store {
 }
 
 impl Store {
-    fn from_env() -> Self {
-        let disabled = std::env::var("NOVAKEY_DISABLE_LEARNING").is_ok_and(|v| v == "1");
-        let path = (!disabled)
-            .then(crate::kkc::learning_dir)
+    fn from_config(config: &crate::config::Config) -> Self {
+        let path = config
+            .learning_enabled
+            .then(|| crate::kkc::learning_dir(config))
             .flatten()
             .map(|dir| dir.join(FILE_NAME));
         let words = path
@@ -65,7 +65,7 @@ thread_local! {
 }
 
 fn with_store<T>(f: impl FnOnce(&mut Store) -> T) -> T {
-    STORE.with(|cell| f(cell.borrow_mut().get_or_insert_with(Store::from_env)))
+    STORE.with(|cell| f(cell.borrow_mut().get_or_insert_with(|| Store::from_config(crate::config::get()))))
 }
 
 /// 英語として確定したことのある語か。

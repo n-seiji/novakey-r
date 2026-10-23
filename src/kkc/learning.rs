@@ -71,13 +71,9 @@ fn system_today() -> u16 {
     today_from_unix(secs)
 }
 
-/// 学習データの置き場所 (`<NOVAKEY_MEMORY_DIR または ~/Library/Application Support/NovakeyR>/rust-learning`)。
-pub fn default_dir() -> Option<PathBuf> {
-    let base = match std::env::var("NOVAKEY_MEMORY_DIR") {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/NovakeyR"),
-    };
-    Some(base.join(DIR_NAME))
+/// 学習データの置き場所 (`<設定の memory_dir>/rust-learning`)。
+pub fn default_dir(config: &crate::config::Config) -> Option<PathBuf> {
+    config.memory_dir.as_ref().map(|base| base.join(DIR_NAME))
 }
 
 /// 値のように扱う 1 回分の語 (clause の組み立て用)
@@ -246,12 +242,12 @@ impl Learning {
         }
     }
 
-    /// 環境変数 (`NOVAKEY_DISABLE_LEARNING=1` で無効、`NOVAKEY_MEMORY_DIR`) に従って開く。
-    pub fn from_env() -> Self {
-        if std::env::var("NOVAKEY_DISABLE_LEARNING").is_ok_and(|v| v == "1") {
+    /// 設定 (学習の有効・記憶先) に従って開く。
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        if !config.learning_enabled {
             return Self::disabled();
         }
-        match default_dir() {
+        match default_dir(config) {
             Some(dir) => Self::open(&dir),
             None => Self::disabled(),
         }

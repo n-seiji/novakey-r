@@ -1,4 +1,4 @@
-#![allow(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (input::route → Session) を headless で動かす。
 // 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
@@ -214,29 +214,23 @@ fn setup_env() {
     // 既定は学習 off。`NOVAKEY_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。NOVAKEY_MEMORY_DIR で変えられる)。
     // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
     let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
-    if learning {
-        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
-        unsafe { std::env::remove_var("NOVAKEY_DISABLE_LEARNING") };
-    } else {
-        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
-        unsafe { std::env::set_var("NOVAKEY_DISABLE_LEARNING", "1") };
-    }
-    if !learning || std::env::var_os("NOVAKEY_MEMORY_DIR").is_none_or(|v| v.is_empty()) {
-        let memory_dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&memory_dir);
-        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
-        unsafe { std::env::set_var("NOVAKEY_MEMORY_DIR", memory_dir) };
-    }
-    if std::env::var_os("NOVAKEY_LOANWORDS").is_none() {
-        let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/loanwords.tsv");
-        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
-        unsafe { std::env::set_var("NOVAKEY_LOANWORDS", repo_table) };
-    }
-    if std::env::var_os("NOVAKEY_EMOJI").is_none() {
-        let repo_table = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/emoji.tsv");
-        // SAFETY: スレッドを起こす前、simulate / simulate_file の先頭でだけ呼ぶ (setup_env)。
-        unsafe { std::env::set_var("NOVAKEY_EMOJI", repo_table) };
-    }
+    let memory_dir = match std::env::var_os("NOVAKEY_MEMORY_DIR") {
+        Some(dir) if learning && !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+    };
+    let repo_table = |env: &str, name: &str| {
+        std::env::var_os(env).map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(name), PathBuf::from)
+    };
+    crate::config::init(crate::config::Config {
+        memory_dir: Some(memory_dir),
+        learning_enabled: learning,
+        loanwords_path: Some(repo_table("NOVAKEY_LOANWORDS", "loanwords.tsv")),
+        emoji_path: Some(repo_table("NOVAKEY_EMOJI", "emoji.tsv")),
+    });
 }
 
 /// 1 シナリオを最後まで流す。最後に確定した文字列と、未確定のまま残った文字列を返す。
