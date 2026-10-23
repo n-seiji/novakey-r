@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 // composer.rs - 未確定文の状態機械: 入力単位(ローマ字+かな) + 同期変換候補 + フェーズ。
-// 候補は {text, engine_index} で持ち、リランキング後も学習には元 index を渡す。
-// ローマ字そのまま(raw)の候補は engine_index を持たず、確定しても学習しない。
+// 候補は {text, source} で持ち、リランキング後も学習には Source::Engine の元の順位を渡す。
+// ローマ字そのまま(raw)など engine 以外の候補は順位を持たず、確定しても学習しない。
 
 use crate::english_split;
 use crate::romaji_converter::Flush;
@@ -12,7 +12,35 @@ use crate::translit::{self, Form};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub text: String,
-    pub engine_index: Option<usize>,
+    pub source: Source,
+}
+
+/// `CandidateEngine::convert` が返した順位。学習に渡す唯一の添字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineRank(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Engine(EngineRank),
+    /// 記号 1 つの異体候補。
+    Symbol,
+    Raw,
+    Hiragana,
+    Katakana,
+    /// カタカナ語に対応する英単語。
+    Loanword,
+    Emoji,
+    /// かな混じり (Mixed) で表示中の読みそのもの。
+    MixedReading,
+}
+
+impl Candidate {
+    fn engine_rank(&self) -> Option<EngineRank> {
+        match self.source {
+            Source::Engine(rank) => Some(rank),
+            _ => None,
+        }
+    }
 }
 
 pub trait CandidateEngine {
@@ -78,8 +106,6 @@ pub struct Composer<E: CandidateEngine> {
     learn_english: fn(&str),
     /// ひらがなの読み全体に対応する絵文字を引く関数。テストでは差し替える。
     emoji_for: fn(&str) -> Vec<String>,
-    /// 変換候補に入れた絵文字。リランキングで並べ直すときに見分けるために持つ。
-    emoji_texts: Vec<String>,
 }
 
 impl<E: CandidateEngine> Composer<E> {
@@ -101,7 +127,6 @@ impl<E: CandidateEngine> Composer<E> {
             knows_english: |_| false,
             learn_english: |_| {},
             emoji_for: |_| Vec::new(),
-            emoji_texts: Vec::new(),
         }
     }
 
@@ -214,7 +239,6 @@ impl<E: CandidateEngine> Composer<E> {
     fn reset_candidates(&mut self) {
         self.generation += 1;
         self.candidates.clear();
-        self.emoji_texts.clear();
         self.pending_rerank = None;
     }
 
@@ -231,7 +255,7 @@ impl<E: CandidateEngine> Composer<E> {
                 .iter()
                 .map(|form| Candidate {
                     text: (*form).to_string(),
-                    engine_index: None,
+                    source: Source::Symbol,
                 })
                 .collect();
             return;
@@ -241,7 +265,7 @@ impl<E: CandidateEngine> Composer<E> {
             if !self.candidates.iter().any(|c| c.text == text) {
                 self.candidates.push(Candidate {
                     text,
-                    engine_index: Some(engine_index),
+                    source: Source::Engine(EngineRank(engine_index)),
                 });
             }
         }
@@ -299,7 +323,7 @@ impl<E: CandidateEngine> Composer<E> {
         for (engine_index, text) in texts.into_iter().enumerate() {
             let text = format!("{}{text}", split.head);
             if !self.candidates.iter().any(|c| c.text == text) {
-                self.candidates.push(Candidate { text, engine_index: Some(engine_index) });
+                self.candidates.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
             }
         }
     }
@@ -416,7 +440,7 @@ impl<E: CandidateEngine> Composer<E> {
             // 表示中のかな混じりを第 1 候補にし、raw はその直後に並べる。
             self.candidates.push(Candidate {
                 text: self.hiragana.clone(),
-                engine_index: None,
+                source: Source::MixedReading,
             });
         }
         self.insert_kana_fallback();
@@ -504,12 +528,12 @@ impl<E: CandidateEngine> Composer<E> {
             (self.learn_english)(&unit.raw);
         }
         let learned = match self.phase {
-            Phase::Converting { selected, .. } => self.candidates[selected].engine_index,
-            Phase::Composing if self.live => self.candidates.first().and_then(|c| c.engine_index),
+            Phase::Converting { selected, .. } => self.candidates[selected].engine_rank(),
+            Phase::Composing if self.live => self.candidates.first().and_then(Candidate::engine_rank),
             _ => None,
         };
         match learned.filter(|_| learn) {
-            Some(i) => {
+            Some(EngineRank(i)) => {
                 let _ = self.engine.select(self.generation, i);
             }
             None => self.engine.cancel(),
@@ -551,15 +575,15 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_rerank.is_some()
     }
 
-    /// 変換済み候補列から raw・英単語・絵文字(engine_index なし)を一旦外して display_index 番目を先頭へ昇格し、
+    /// 変換済み候補列から raw・英単語・絵文字(engine 以外)を一旦外して display_index 番目を先頭へ昇格し、
     /// raw・英単語は第 1 候補の直後へ、絵文字は元の位置規則どおりに戻す。
     fn promote_converting(&mut self, display_index: usize) -> Option<String> {
         let (engine, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut self.candidates)
             .into_iter()
-            .partition(|c| c.engine_index.is_some());
+            .partition(|c| c.engine_rank().is_some());
         let (emoji, extras): (Vec<Candidate>, Vec<Candidate>) = extras
             .into_iter()
-            .partition(|c| self.emoji_texts.contains(&c.text));
+            .partition(|c| c.source == Source::Emoji);
         self.candidates = engine;
         let promoted = display_index < self.candidates.len();
         if promoted {
@@ -590,7 +614,7 @@ impl<E: CandidateEngine> Composer<E> {
             .filter(|w| !self.candidates.iter().any(|c| &c.text == w))
             .map(|text| Candidate {
                 text,
-                engine_index: None,
+                source: Source::Loanword,
             })
             .collect();
         let position = self.candidates.len().min(1);
@@ -608,16 +632,15 @@ impl<E: CandidateEngine> Composer<E> {
             .take(EMOJI_LIMIT)
             .map(|text| Candidate {
                 text,
-                engine_index: None,
+                source: Source::Emoji,
             })
             .collect();
-        self.emoji_texts.extend(fresh.iter().map(|c| c.text.clone()));
         self.place_emoji(fresh);
     }
 
     /// 絵文字を、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
     fn place_emoji(&mut self, emoji: Vec<Candidate>) {
-        let engine = self.candidates.iter().filter(|c| c.engine_index.is_some()).count();
+        let engine = self.candidates.iter().filter(|c| c.engine_rank().is_some()).count();
         let extras = self.candidates.len() - engine;
         let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(self.candidates.len());
         self.candidates.splice(position..position, emoji);
@@ -626,13 +649,17 @@ impl<E: CandidateEngine> Composer<E> {
     /// エンジンが候補を 1 つも返さなかったとき (辞書が開けない・未知の読みなど) に、ひらがなとカタカナを候補にする。
     /// これがないと raw (ローマ字) が唯一の候補になり、Space+Enter で日本語がローマ字に化ける。
     fn insert_kana_fallback(&mut self) {
-        let unconverted = self.candidates.iter().all(|c| c.engine_index.is_none());
+        let unconverted = self.candidates.iter().all(|c| c.engine_rank().is_none());
         if !unconverted || self.is_symbol() || !matches!(self.phase, Phase::Composing | Phase::Reverted) {
             return;
         }
-        for text in [self.hiragana.clone(), translit::to_katakana(&self.hiragana)] {
+        let forms = [
+            (self.hiragana.clone(), Source::Hiragana),
+            (translit::to_katakana(&self.hiragana), Source::Katakana),
+        ];
+        for (text, source) in forms {
             if !text.is_empty() && !self.candidates.iter().any(|c| c.text == text) {
-                self.candidates.push(Candidate { text, engine_index: None });
+                self.candidates.push(Candidate { text, source });
             }
         }
     }
@@ -650,7 +677,7 @@ impl<E: CandidateEngine> Composer<E> {
             position,
             Candidate {
                 text: raw,
-                engine_index: None,
+                source: Source::Raw,
             },
         );
     }
@@ -846,7 +873,7 @@ mod tests {
         c.push_input("github", "ぎっとはぶ", "");
         c.begin_conversion();
         assert_eq!(texts(&c), vec!["github"]);
-        assert_eq!(c.candidates()[0].engine_index, Some(0));
+        assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(0)));
     }
 
     #[test]
@@ -861,7 +888,7 @@ mod tests {
         assert!(c.begin_conversion());
         assert_eq!(c.display(), "ぎ");
         assert_eq!(texts(&c), vec!["ぎ", "gi", "ギ"]);
-        assert!(c.candidates().iter().all(|cand| cand.engine_index.is_none()));
+        assert!(c.candidates().iter().all(|cand| cand.engine_rank().is_none()));
         assert_eq!(c.commit(true), "ぎ");
         assert_eq!(*c.engine_cancels(), 1, "学習しない");
     }
@@ -900,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn 同一テキスト候補はdedupeされ先頭のengine_indexが残る() {
+    fn 同一テキスト候補はdedupeされ先頭のengine順位が残る() {
         let log = Log::default();
         let engine = MockEngine {
             log: log.clone(),
@@ -913,9 +940,9 @@ mod tests {
         type_kyou(&mut c);
         assert_eq!(c.candidates().len(), 2);
         assert_eq!(c.candidates()[0].text, "今日");
-        assert_eq!(c.candidates()[0].engine_index, Some(0));
+        assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(0)));
         assert_eq!(c.candidates()[1].text, "京");
-        assert_eq!(c.candidates()[1].engine_index, Some(1));
+        assert_eq!(c.candidates()[1].engine_rank(), Some(EngineRank(1)));
     }
 
     #[test]
@@ -1179,14 +1206,14 @@ mod tests {
     }
 
     #[test]
-    fn liveのリランキングは即座に表示順を変えengine_indexで学習する() {
+    fn liveのリランキングは即座に表示順を変えengine順位で学習する() {
         let (mut c, log) = composer();
         c.set_live(true);
         type_kyou(&mut c);
         let generation = c.current_generation();
         assert_eq!(c.apply_rerank(generation, 1), Some("京".to_string()));
         assert_eq!(c.display(), "京");
-        assert_eq!(c.candidates()[0].engine_index, Some(1));
+        assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(1)));
         assert_eq!(c.candidates()[1].text, "今日");
         assert_eq!(c.commit(true), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
@@ -1575,7 +1602,7 @@ mod tests {
             texts(&c),
             vec!["デスクトップ", "desktop", "desukutoppu", "デス区トップ"]
         );
-        assert_eq!(c.candidates()[1].engine_index, None);
+        assert_eq!(c.candidates()[1].engine_rank(), None);
     }
 
     #[test]
@@ -1688,7 +1715,7 @@ mod tests {
             texts(&c),
             vec!["猫", "neko", "ネコ", "根子", "😺", "😸", "😹", "😻", "😼", "寝こ", "値こ"]
         );
-        assert_eq!(c.candidates()[4].engine_index, None);
+        assert_eq!(c.candidates()[4].engine_rank(), None);
     }
 
     #[test]
