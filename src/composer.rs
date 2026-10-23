@@ -69,6 +69,50 @@ pub enum Phase {
     Transliterated(Form),
 }
 
+/// 入力中の打鍵の解釈。Empty は未確定文が無い状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typing {
+    Empty,
+    Kana,
+    Dangling,
+    Literal,
+    Mixed,
+}
+
+/// 読みが変わらない間 (= 同じ generation の間) 生き続ける、飾りなしの候補列。
+#[derive(Debug)]
+struct ReadingCands {
+    generation: u64,
+    list: Vec<Candidate>,
+    /// 非 live の入力中に届いた LLM の結果。最初の変換で反映する。
+    held_rerank: Option<usize>,
+}
+
+/// 候補を選んでいる間の状態。list は空でない。
+#[derive(Debug)]
+struct Selection {
+    list: Vec<Candidate>,
+    cursor: usize,
+    /// 候補ウィンドウを出している間 true。
+    window: bool,
+}
+
+/// 組成の段階。局面ごとにしか意味のないデータは variant の中に置く。
+#[derive(Debug)]
+enum Stage {
+    Editing(Typing),
+    /// kept は、取り消す直前に見えていた (飾り付きの) 候補列。再変換はこの列から続ける。
+    Reverted { kept: Option<Vec<Candidate>> },
+    Selecting(Selection),
+    /// 字種変換の結果を表示している。base はスペースで変換に戻るときの打鍵の解釈。
+    Transliterated {
+        form: Form,
+        text: String,
+        base: Typing,
+        kept: Option<Vec<Candidate>>,
+    },
+}
+
 /// 1 回の入力で生まれた (打鍵, かな) の組。部分削除後は raw をかなで置き換える。
 #[derive(Debug, Clone)]
 struct Unit {
@@ -88,14 +132,9 @@ pub struct Composer<E: CandidateEngine> {
     units: Vec<Unit>,
     pending_raw: String,
     hiragana: String,
-    candidates: Vec<Candidate>,
-    phase: Phase,
+    reading: ReadingCands,
+    stage: Stage,
     live: bool,
-    generation: u64,
-    pending_rerank: Option<usize>,
-    translit: String,
-    /// 字種変換に入る前の局面。スペースで変換に戻るときに使う。
-    base: Phase,
     /// カタカナ語に対応する英単語を引く関数。テストでは差し替える。
     english_for: fn(&str) -> Vec<String>,
     /// 打鍵列が英単語かを判定する関数。テストでは差し替える。
@@ -115,13 +154,9 @@ impl<E: CandidateEngine> Composer<E> {
             units: Vec::new(),
             pending_raw: String::new(),
             hiragana: String::new(),
-            candidates: Vec::new(),
-            phase: Phase::Empty,
+            reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
+            stage: Stage::Editing(Typing::Empty),
             live: false,
-            generation: 0,
-            pending_rerank: None,
-            translit: String::new(),
-            base: Phase::Empty,
             english_for: |_| Vec::new(),
             is_english_word: |_| false,
             knows_english: |_| false,
@@ -157,7 +192,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 世代番号の開始値。
     pub fn with_generation(mut self, generation: u64) -> Self {
-        self.generation = generation;
+        self.reading.generation = generation;
         self
     }
 
@@ -170,7 +205,16 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     pub fn phase(&self) -> Phase {
-        self.phase
+        match &self.stage {
+            Stage::Editing(Typing::Empty) => Phase::Empty,
+            Stage::Editing(Typing::Kana) => Phase::Composing,
+            Stage::Editing(Typing::Dangling) => Phase::Dangling,
+            Stage::Editing(Typing::Literal) => Phase::Literal,
+            Stage::Editing(Typing::Mixed) => Phase::Mixed,
+            Stage::Reverted { .. } => Phase::Reverted,
+            Stage::Selecting(s) => Phase::Converting { selected: s.cursor, window: s.window },
+            Stage::Transliterated { form, .. } => Phase::Transliterated(*form),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -178,11 +222,16 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     pub fn current_generation(&self) -> u64 {
-        self.generation
+        self.reading.generation
     }
 
+    /// いま見えている候補列。選択中と、選択中だった列を持ち越している取り消し・字種変換の間は飾り付き。
     pub fn candidates(&self) -> &[Candidate] {
-        &self.candidates
+        match &self.stage {
+            Stage::Selecting(s) => &s.list,
+            Stage::Reverted { kept: Some(list) } | Stage::Transliterated { kept: Some(list), .. } => list,
+            _ => &self.reading.list,
+        }
     }
 
     pub fn display_hiragana(&self) -> &str {
@@ -199,13 +248,14 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     pub fn display(&self) -> &str {
-        match self.phase {
-            Phase::Converting { selected, .. } => &self.candidates[selected].text,
-            Phase::Composing if self.live => self
-                .candidates
+        match &self.stage {
+            Stage::Selecting(s) => &s.list[s.cursor].text,
+            Stage::Editing(Typing::Kana) if self.live => self
+                .reading
+                .list
                 .first()
                 .map_or(self.hiragana.as_str(), |c| c.text.as_str()),
-            Phase::Transliterated(_) => &self.translit,
+            Stage::Transliterated { text, .. } => text,
             _ => &self.hiragana,
         }
     }
@@ -215,20 +265,25 @@ impl<E: CandidateEngine> Composer<E> {
         if self.hiragana.is_empty() {
             return false;
         }
-        let current = match self.phase {
-            Phase::Transliterated(form) => Some(form),
+        let current = match &self.stage {
+            Stage::Transliterated { form, .. } => Some(*form),
             _ => None,
         };
-        if current.is_none() {
-            self.base = match self.phase {
-                Phase::Converting { .. } | Phase::Reverted => Phase::Composing,
-                other => other,
-            };
-        }
         let requested = translit::as_typed_first(requested, &self.raw());
         let form = translit::next_form(current, requested);
-        self.translit = translit::render(form, &self.hiragana, &self.raw());
-        self.phase = Phase::Transliterated(form);
+        let rendered = translit::render(form, &self.hiragana, &self.raw());
+        if let Stage::Transliterated { form: f, text, .. } = &mut self.stage {
+            *f = form;
+            *text = rendered;
+            return true;
+        }
+        let (base, kept) = match std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty)) {
+            Stage::Editing(typing) => (typing, None),
+            Stage::Reverted { kept } => (Typing::Kana, kept),
+            Stage::Selecting(s) => (Typing::Kana, Some(s.list)),
+            Stage::Transliterated { .. } => unreachable!("handled above"),
+        };
+        self.stage = Stage::Transliterated { form, text: rendered, base, kept };
         true
     }
 
@@ -237,21 +292,24 @@ impl<E: CandidateEngine> Composer<E> {
     }
 
     fn reset_candidates(&mut self) {
-        self.generation += 1;
-        self.candidates.clear();
-        self.pending_rerank = None;
+        self.reading.generation += 1;
+        self.reading.list.clear();
+        self.reading.held_rerank = None;
+        if let Stage::Reverted { kept } | Stage::Transliterated { kept, .. } = &mut self.stage {
+            *kept = None;
+        }
     }
 
     fn refresh(&mut self) {
         self.reset_candidates();
         self.sync_hiragana();
         if self.hiragana.is_empty() {
-            self.phase = Phase::Empty;
+            self.stage = Stage::Editing(Typing::Empty);
             return;
         }
-        self.phase = Phase::Composing;
+        self.stage = Stage::Editing(Typing::Kana);
         if let Some(forms) = self.symbol_variants() {
-            self.candidates = forms
+            self.reading.list = forms
                 .iter()
                 .map(|form| Candidate {
                     text: (*form).to_string(),
@@ -260,10 +318,10 @@ impl<E: CandidateEngine> Composer<E> {
                 .collect();
             return;
         }
-        let texts = self.engine.convert(self.generation, &self.hiragana);
+        let texts = self.engine.convert(self.reading.generation, &self.hiragana);
         for (engine_index, text) in texts.into_iter().enumerate() {
-            if !self.candidates.iter().any(|c| c.text == text) {
-                self.candidates.push(Candidate {
+            if !self.reading.list.iter().any(|c| c.text == text) {
+                self.reading.list.push(Candidate {
                     text,
                     source: Source::Engine(EngineRank(engine_index)),
                 });
@@ -295,14 +353,18 @@ impl<E: CandidateEngine> Composer<E> {
             self.fix_english_split(split);
             return;
         }
-        if self.phase == Phase::Composing && (english || self.has_ascii_kana()) {
-            self.phase = Phase::Dangling;
+        if self.is_kana_editing() && (english || self.has_ascii_kana()) {
+            self.stage = Stage::Editing(Typing::Dangling);
         }
+    }
+
+    fn is_kana_editing(&self) -> bool {
+        matches!(self.stage, Stage::Editing(Typing::Kana))
     }
 
     /// 英単語のあとに助詞などが続く組成 (artifactni → artifact + に)。finished は打ち終えたとき。
     pub fn english_split(&self, finished: bool) -> Option<english_split::Split> {
-        if self.phase != Phase::Composing {
+        if !self.is_kana_editing() {
             return None;
         }
         english_split::split(&self.raw(), finished, self.knows_english)
@@ -318,12 +380,14 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_raw.clear();
         self.sync_hiragana();
         self.reset_candidates();
-        self.phase = Phase::Mixed;
-        let texts = self.engine.convert(self.generation, &tail_kana);
+        self.stage = Stage::Editing(Typing::Mixed);
+        let texts = self.engine.convert(self.reading.generation, &tail_kana);
         for (engine_index, text) in texts.into_iter().enumerate() {
             let text = format!("{}{text}", split.head);
-            if !self.candidates.iter().any(|c| c.text == text) {
-                self.candidates.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
+            if !self.reading.list.iter().any(|c| c.text == text) {
+                self.reading
+                    .list
+                    .push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
             }
         }
     }
@@ -339,7 +403,7 @@ impl<E: CandidateEngine> Composer<E> {
             !self.pending_raw.is_empty()
                 && ((self.knows_english)(&raw) || (raw.len() >= MIN_LEN && (self.is_english_word)(&raw)))
         };
-        self.phase == Phase::Composing
+        self.is_kana_editing()
             && raw.bytes().all(|b| b.is_ascii_lowercase())
             && (self.has_ascii_kana() || word())
     }
@@ -373,7 +437,7 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 英単語としてそのまま追加する。かな変換も候補生成もしない。
     pub fn push_literal(&mut self, text: &str) {
-        if !self.candidates.is_empty() {
+        if !self.candidates().is_empty() {
             self.engine.cancel();
         }
         let raw = format!("{}{}", std::mem::take(&mut self.pending_raw), text);
@@ -384,11 +448,11 @@ impl<E: CandidateEngine> Composer<E> {
         });
         self.sync_hiragana();
         self.reset_candidates();
-        self.phase = if self.units.iter().all(|u| u.literal) {
-            Phase::Literal
+        self.stage = Stage::Editing(if self.units.iter().all(|u| u.literal) {
+            Typing::Literal
         } else {
-            Phase::Mixed
-        };
+            Typing::Mixed
+        });
     }
 
     pub fn pop_pending_raw(&mut self) {
@@ -409,9 +473,12 @@ impl<E: CandidateEngine> Composer<E> {
         } else {
             last.raw = last.kana.clone();
         }
-        let is_literal = |phase| matches!(phase, Phase::Literal | Phase::Mixed);
-        let was_literal = is_literal(self.phase)
-            || (matches!(self.phase, Phase::Transliterated(_)) && is_literal(self.base));
+        let is_literal = |typing| matches!(typing, Typing::Literal | Typing::Mixed);
+        let was_literal = match &self.stage {
+            Stage::Editing(typing) => is_literal(*typing),
+            Stage::Transliterated { base, .. } => is_literal(*base),
+            _ => false,
+        };
         // 英単語の部分を消しきったら、残ったかなは通常の組成に戻す。
         if was_literal && self.units.iter().any(|u| u.literal) {
             self.sync_hiragana();
@@ -424,77 +491,84 @@ impl<E: CandidateEngine> Composer<E> {
 
     /// 最初の変換。保留中のリランキングを反映し、raw 候補を第 1 候補の直後に入れて先頭を選ぶ。
     pub fn begin_conversion(&mut self) -> bool {
-        if matches!(self.phase, Phase::Transliterated(_)) {
-            self.phase = self.base;
+        let mut kept = None;
+        if matches!(self.stage, Stage::Transliterated { .. }) {
+            if let Stage::Transliterated { base, kept: k, .. } =
+                std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty))
+            {
+                self.stage = Stage::Editing(base);
+                kept = k;
+            }
         }
+        let phase = self.phase();
         if !matches!(
-            self.phase,
+            phase,
             Phase::Composing | Phase::Reverted | Phase::Dangling | Phase::Mixed
         ) {
             return false;
         }
-        if let Some(index) = self.pending_rerank.take() {
-            self.promote(index);
+        if let Stage::Reverted { kept: k } = &mut self.stage {
+            kept = k.take();
         }
-        if self.phase == Phase::Mixed && !self.candidates.iter().any(|c| c.text == self.hiragana) {
+        let mut list = kept.unwrap_or_else(|| self.reading.list.clone());
+        if let Some(index) = self.reading.held_rerank.take() {
+            Self::promote(&mut list, index);
+        }
+        if phase == Phase::Mixed && !list.iter().any(|c| c.text == self.hiragana) {
             // 表示中のかな混じりを第 1 候補にし、raw はその直後に並べる。
-            self.candidates.push(Candidate {
+            list.push(Candidate {
                 text: self.hiragana.clone(),
                 source: Source::MixedReading,
             });
         }
-        self.insert_kana_fallback();
+        self.insert_kana_fallback(&mut list, phase);
         // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
-        self.insert_raw_candidate();
-        self.insert_english_candidates();
-        self.insert_emoji_candidates();
-        if self.candidates.is_empty() {
+        self.insert_raw_candidate(&mut list, phase);
+        self.insert_english_candidates(&mut list, phase);
+        self.insert_emoji_candidates(&mut list, phase);
+        if list.is_empty() {
             return false;
         }
-        self.phase = Phase::Converting {
-            selected: 0,
-            window: false,
-        };
+        self.stage = Stage::Selecting(Selection { list, cursor: 0, window: false });
         true
     }
 
     /// 次の候補へ進み(末尾なら先頭へ戻り)、候補ウィンドウを出す状態にする。
     pub fn advance(&mut self) -> bool {
-        let Phase::Converting { selected, .. } = self.phase else {
+        let Stage::Selecting(s) = &mut self.stage else {
             return false;
         };
-        self.phase = Phase::Converting {
-            selected: (selected + 1) % self.candidates.len(),
-            window: true,
-        };
+        s.cursor = (s.cursor + 1) % s.list.len();
+        s.window = true;
         true
     }
 
     /// 前の候補へ戻り(先頭なら末尾へ回り)、候補ウィンドウを出す状態にする。
     pub fn retreat(&mut self) -> bool {
-        let Phase::Converting { selected, .. } = self.phase else {
+        let Stage::Selecting(s) = &mut self.stage else {
             return false;
         };
-        self.phase = Phase::Converting {
-            selected: (selected + self.candidates.len() - 1) % self.candidates.len(),
-            window: true,
-        };
+        s.cursor = (s.cursor + s.list.len() - 1) % s.list.len();
+        s.window = true;
         true
     }
 
     pub fn select_candidate(&mut self, index: usize) -> bool {
-        if index >= self.candidates.len() {
+        if index >= self.candidates().len() {
             return false;
         }
-        self.phase = Phase::Converting {
-            selected: index,
-            window: true,
-        };
+        if let Stage::Selecting(s) = &mut self.stage {
+            s.cursor = index;
+            s.window = true;
+            return true;
+        }
+        let list = self.candidates().to_vec();
+        self.stage = Stage::Selecting(Selection { list, cursor: index, window: true });
         true
     }
 
     pub fn select_candidate_text(&mut self, text: &str) -> bool {
-        match self.candidates.iter().position(|c| c.text == text) {
+        match self.candidates().iter().position(|c| c.text == text) {
             Some(index) => self.select_candidate(index),
             None => false,
         }
@@ -507,34 +581,43 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();
-        self.phase = Phase::Empty;
+        self.stage = Stage::Editing(Typing::Empty);
     }
 
     pub fn revert(&mut self) {
-        if self.phase != Phase::Empty {
-            self.phase = Phase::Reverted;
+        if self.phase() == Phase::Empty {
+            return;
         }
+        let kept = match std::mem::replace(&mut self.stage, Stage::Editing(Typing::Empty)) {
+            Stage::Selecting(s) => Some(s.list),
+            Stage::Reverted { kept } | Stage::Transliterated { kept, .. } => kept,
+            Stage::Editing(_) => None,
+        };
+        self.stage = Stage::Reverted { kept };
     }
 
     pub fn commit(&mut self, learn: bool) -> String {
-        let out = match self.phase {
+        let phase = self.phase();
+        let out = match phase {
             Phase::Dangling => self.raw(),
             _ => self.display().to_string(),
         };
-        if learn && self.phase == Phase::Dangling {
+        if learn && phase == Phase::Dangling {
             (self.learn_english)(&out);
         }
         for unit in self.units.iter().filter(|u| u.literal && learn) {
             (self.learn_english)(&unit.raw);
         }
-        let learned = match self.phase {
-            Phase::Converting { selected, .. } => self.candidates[selected].engine_rank(),
-            Phase::Composing if self.live => self.candidates.first().and_then(Candidate::engine_rank),
+        let learned = match &self.stage {
+            Stage::Selecting(s) => s.list[s.cursor].engine_rank(),
+            Stage::Editing(Typing::Kana) if self.live => {
+                self.reading.list.first().and_then(Candidate::engine_rank)
+            }
             _ => None,
         };
         match learned.filter(|_| learn) {
             Some(EngineRank(i)) => {
-                let _ = self.engine.select(self.generation, i);
+                let _ = self.engine.select(self.reading.generation, i);
             }
             None => self.engine.cancel(),
         }
@@ -542,7 +625,7 @@ impl<E: CandidateEngine> Composer<E> {
         self.pending_raw.clear();
         self.hiragana.clear();
         self.reset_candidates();
-        self.phase = Phase::Empty;
+        self.stage = Stage::Editing(Typing::Empty);
         out
     }
 
@@ -550,107 +633,109 @@ impl<E: CandidateEngine> Composer<E> {
     /// live なら即反映して新しい表示を返す。非 live では保留し、最初の変換時に反映する。
     /// 変換済みでも、まだ送りも選択もしていない(先頭選択でウィンドウなし)間は反映する。
     pub fn apply_rerank(&mut self, generation: u64, display_index: usize) -> Option<String> {
-        if generation != self.generation || display_index == 0 {
+        if generation != self.reading.generation || display_index == 0 {
             return None;
         }
-        match self.phase {
-            Phase::Composing if display_index < self.candidates.len() => {
+        match &self.stage {
+            Stage::Editing(Typing::Kana) if display_index < self.reading.list.len() => {
                 if self.live {
-                    self.promote(display_index);
+                    Self::promote(&mut self.reading.list, display_index);
                     Some(self.display().to_string())
                 } else {
-                    self.pending_rerank = Some(display_index);
+                    self.reading.held_rerank = Some(display_index);
                     None
                 }
             }
-            Phase::Converting {
-                selected: 0,
-                window: false,
-            } => self.promote_converting(display_index),
+            Stage::Selecting(Selection { cursor: 0, window: false, .. }) => {
+                self.promote_converting(display_index)
+            }
             _ => None,
         }
     }
 
     pub fn has_pending_rerank(&self) -> bool {
-        self.pending_rerank.is_some()
+        self.reading.held_rerank.is_some()
     }
 
     /// 変換済み候補列から raw・英単語・絵文字(engine 以外)を一旦外して display_index 番目を先頭へ昇格し、
     /// raw・英単語は第 1 候補の直後へ、絵文字は元の位置規則どおりに戻す。
     fn promote_converting(&mut self, display_index: usize) -> Option<String> {
-        let (engine, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut self.candidates)
+        let Stage::Selecting(selection) = &mut self.stage else {
+            return None;
+        };
+        let (mut list, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut selection.list)
             .into_iter()
             .partition(|c| c.engine_rank().is_some());
         let (emoji, extras): (Vec<Candidate>, Vec<Candidate>) = extras
             .into_iter()
             .partition(|c| c.source == Source::Emoji);
-        self.candidates = engine;
-        let promoted = display_index < self.candidates.len();
+        let promoted = display_index < list.len();
         if promoted {
-            self.promote(display_index);
+            Self::promote(&mut list, display_index);
         }
         // 外す前の並びは復元できないので、第 1 候補の直後へ戻す。
-        let position = self.candidates.len().min(1);
-        self.candidates.splice(position..position, extras);
-        self.place_emoji(emoji);
+        let position = list.len().min(1);
+        list.splice(position..position, extras);
+        Self::place_emoji(&mut list, emoji);
+        selection.list = list;
         promoted.then(|| self.display().to_string())
     }
 
-    fn promote(&mut self, display_index: usize) {
-        if display_index < self.candidates.len() {
-            let chosen = self.candidates.remove(display_index);
-            self.candidates.insert(0, chosen);
+    fn promote(list: &mut Vec<Candidate>, display_index: usize) {
+        if display_index < list.len() {
+            let chosen = list.remove(display_index);
+            list.insert(0, chosen);
         }
     }
 
     /// 組成全体がカタカナ語として引ける場合、英単語を第 1 候補の直後に入れる (raw はその後ろ)。
-    fn insert_english_candidates(&mut self) {
-        if matches!(self.phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
+    fn insert_english_candidates(&self, list: &mut Vec<Candidate>, phase: Phase) {
+        if matches!(phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
             return;
         }
         let words = (self.english_for)(&translit::to_katakana(&self.hiragana));
         let fresh: Vec<Candidate> = words
             .into_iter()
-            .filter(|w| !self.candidates.iter().any(|c| &c.text == w))
+            .filter(|w| !list.iter().any(|c| &c.text == w))
             .map(|text| Candidate {
                 text,
                 source: Source::Loanword,
             })
             .collect();
-        let position = self.candidates.len().min(1);
-        self.candidates.splice(position..position, fresh);
+        let position = list.len().min(1);
+        list.splice(position..position, fresh);
     }
 
     /// 組成全体が絵文字の読みと一致する場合、絵文字を最大 EMOJI_LIMIT 件入れる。
-    fn insert_emoji_candidates(&mut self) {
-        if matches!(self.phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
+    fn insert_emoji_candidates(&self, list: &mut Vec<Candidate>, phase: Phase) {
+        if matches!(phase, Phase::Dangling | Phase::Mixed) || self.is_symbol() {
             return;
         }
         let fresh: Vec<Candidate> = (self.emoji_for)(&self.hiragana)
             .into_iter()
-            .filter(|e| !self.candidates.iter().any(|c| &c.text == e))
+            .filter(|e| !list.iter().any(|c| &c.text == e))
             .take(EMOJI_LIMIT)
             .map(|text| Candidate {
                 text,
                 source: Source::Emoji,
             })
             .collect();
-        self.place_emoji(fresh);
+        Self::place_emoji(list, fresh);
     }
 
     /// 絵文字を、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
-    fn place_emoji(&mut self, emoji: Vec<Candidate>) {
-        let engine = self.candidates.iter().filter(|c| c.engine_rank().is_some()).count();
-        let extras = self.candidates.len() - engine;
-        let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(self.candidates.len());
-        self.candidates.splice(position..position, emoji);
+    fn place_emoji(list: &mut Vec<Candidate>, emoji: Vec<Candidate>) {
+        let engine = list.iter().filter(|c| c.engine_rank().is_some()).count();
+        let extras = list.len() - engine;
+        let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(list.len());
+        list.splice(position..position, emoji);
     }
 
     /// エンジンが候補を 1 つも返さなかったとき (辞書が開けない・未知の読みなど) に、ひらがなとカタカナを候補にする。
     /// これがないと raw (ローマ字) が唯一の候補になり、Space+Enter で日本語がローマ字に化ける。
-    fn insert_kana_fallback(&mut self) {
-        let unconverted = self.candidates.iter().all(|c| c.engine_rank().is_none());
-        if !unconverted || self.is_symbol() || !matches!(self.phase, Phase::Composing | Phase::Reverted) {
+    fn insert_kana_fallback(&self, list: &mut Vec<Candidate>, phase: Phase) {
+        let unconverted = list.iter().all(|c| c.engine_rank().is_none());
+        if !unconverted || self.is_symbol() || !matches!(phase, Phase::Composing | Phase::Reverted) {
             return;
         }
         let forms = [
@@ -658,22 +743,22 @@ impl<E: CandidateEngine> Composer<E> {
             (translit::to_katakana(&self.hiragana), Source::Katakana),
         ];
         for (text, source) in forms {
-            if !text.is_empty() && !self.candidates.iter().any(|c| c.text == text) {
-                self.candidates.push(Candidate { text, source });
+            if !text.is_empty() && !list.iter().any(|c| c.text == text) {
+                list.push(Candidate { text, source });
             }
         }
     }
 
-    fn insert_raw_candidate(&mut self) {
+    fn insert_raw_candidate(&self, list: &mut Vec<Candidate>, phase: Phase) {
         let raw = self.raw();
-        if raw.is_empty() || self.is_symbol() || self.candidates.iter().any(|c| c.text == raw) {
+        if raw.is_empty() || self.is_symbol() || list.iter().any(|c| c.text == raw) {
             return;
         }
-        let position = match self.phase {
+        let position = match phase {
             Phase::Dangling => 0,
-            _ => self.candidates.len().min(1),
+            _ => list.len().min(1),
         };
-        self.candidates.insert(
+        list.insert(
             position,
             Candidate {
                 text: raw,
@@ -682,6 +767,7 @@ impl<E: CandidateEngine> Composer<E> {
         );
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1524,6 +1610,45 @@ mod tests {
         c.push_literal("okyo");
         assert_eq!(c.display(), "きょうTokyo");
         assert_eq!(c.raw(), "kyouTokyo");
+    }
+
+    #[test]
+    fn 取り消しからの再変換は直前の候補列から続く_mixed() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.push_literal("T");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["きょうT", "kyouT"]);
+        c.revert();
+        assert_eq!(texts(&c), vec!["きょうT", "kyouT"]);
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["きょうT", "kyouT", "キョウT"]);
+    }
+
+    #[test]
+    fn 取り消しからの再変換は直前の候補列から続く_dangling() {
+        let engine = MockEngine { log: Log::default(), table: vec![("きょうh".to_string(), vec![])] };
+        let mut c = Composer::new(engine);
+        c.push_flush(Flush::Dangling("きょうh".to_string()));
+        c.push_input("kyouh", "", "");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["kyouh"]);
+        c.revert();
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["kyouh", "きょうh", "キョウh"]);
+    }
+
+    #[test]
+    fn 字種変換から変換へ戻ると_変換中だった候補列から続く() {
+        let (mut c, _) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        c.advance();
+        assert!(c.transliterate(Form::Katakana));
+        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
+        assert!(c.begin_conversion());
+        assert_eq!(c.phase(), Phase::Converting { selected: 0, window: false });
+        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
     }
 
     #[test]
