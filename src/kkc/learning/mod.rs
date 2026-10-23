@@ -389,7 +389,7 @@ impl Learning {
     }
 
     /// 上限を超えた分を、読みの長いものから捨てる (今回触れたものは残す)。捨てたキーを返す。
-    /// 全件を並べ替えるので、上限ちょうどからは毎回ではなく、上限の 1/16 を超えたときにまとめて上限まで減らす。
+    /// 捨てるものを選ぶのに全件を舐めるので、上限ちょうどからは毎回ではなく、上限の 1/16 を超えたときにまとめて上限まで減らす。
     fn enforce_cap(&mut self, touched: &HashSet<EntryKey>) -> Vec<EntryKey> {
         if self.len <= self.cap + self.cap / 16 {
             return Vec::new();
