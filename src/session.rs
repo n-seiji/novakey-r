@@ -50,11 +50,18 @@ pub enum ConversionMode {
     Space,
 }
 
+/// 1 回の入力処理で許される外向きの動き。入口で必ず渡し、既定は何も許さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Gates {
+    /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
+    pub learning: bool,
+    /// AI 並べ替えの要求を出してよい。
+    pub rerank: bool,
+}
+
 pub struct Session<E: CandidateEngine> {
     converter: RomajiConverter,
     composer: Composer<E>,
-    /// true のときだけ RequestRerank を出す。
-    rerank: bool,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
     playful: fn(&str) -> Option<String>,
     /// RequestRerank を出してから、まだ CancelRerank を出していない。
@@ -67,7 +74,6 @@ impl<E: CandidateEngine> Session<E> {
         Self {
             converter: RomajiConverter::new(),
             composer,
-            rerank: false,
             playful: playful_convert,
             rerank_outstanding: false,
         }
@@ -87,10 +93,6 @@ impl<E: CandidateEngine> Session<E> {
 
     pub fn generation(&self) -> u64 {
         self.composer.current_generation()
-    }
-
-    pub fn set_rerank(&mut self, enabled: bool) {
-        self.rerank = enabled;
     }
 
     pub fn set_playful(&mut self, playful: fn(&str) -> Option<String>) {
@@ -148,7 +150,7 @@ impl<E: CandidateEngine> Session<E> {
     }
 
     /// キー処理の入口。キーを動作表で解決して実行する。
-    pub fn handle(&mut self, key: Key, text: &str) -> Outcome {
+    pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
@@ -158,39 +160,39 @@ impl<E: CandidateEngine> Session<E> {
             }
             _ => key,
         };
-        if let Some(handled) = self.prepare(key, &mut fx) {
+        if let Some(handled) = self.prepare(gates, key, &mut fx) {
             self.finish(&mut fx);
             return Outcome { handled, action: None, phase, effects: fx };
         }
         let phase = self.phase();
         let action = keymap::action_for(phase, key);
         if action == Action::CommitThenRestart {
-            self.commit_and_insert("", &mut fx);
-            let restarted = self.handle(key, text);
+            self.commit_and_insert(gates, "", &mut fx);
+            let restarted = self.handle(gates, key, text);
             fx.extend(restarted.effects);
             self.finish(&mut fx);
             return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
         }
-        let handled = self.perform(action, text, &mut fx);
+        let handled = self.perform(gates, action, text, &mut fx);
         self.finish(&mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
 
     /// 候補ウィンドウでの選択を確定する (candidateSelected:)。
-    pub fn commit_selected(&mut self, text: &str) -> Vec<Effect> {
+    pub fn commit_selected(&mut self, gates: &Gates, text: &str) -> Vec<Effect> {
         self.composer.select_candidate_text(text);
         let mut fx = Vec::new();
-        self.commit_and_insert("", &mut fx);
+        self.commit_and_insert(gates, "", &mut fx);
         self.finish(&mut fx);
         fx
     }
 
     /// 入力ソースの切り替えなどによる確定 (commitComposition:)。
-    pub fn commit_composition(&mut self) -> Vec<Effect> {
+    pub fn commit_composition(&mut self, gates: &Gates) -> Vec<Effect> {
         let mut fx = Vec::new();
-        self.flush_romaji(true, &mut fx);
+        self.flush_romaji(gates, true, &mut fx);
         if !self.composer.is_empty() {
-            fx.push(Effect::Insert(self.composer.commit()));
+            fx.push(Effect::Insert(self.composer.commit(gates.learning)));
         }
         fx.push(Effect::HideCandidates);
         self.finish(&mut fx);
@@ -217,8 +219,8 @@ impl<E: CandidateEngine> Session<E> {
             })
     }
 
-    fn request_rerank(&mut self, urgent: bool, fx: &mut Vec<Effect>) {
-        if !self.rerank {
+    fn request_rerank(&mut self, gates: &Gates, urgent: bool, fx: &mut Vec<Effect>) {
+        if !gates.rerank {
             return;
         }
         if let Some(job) = self.rerank_job() {
@@ -232,26 +234,26 @@ impl<E: CandidateEngine> Session<E> {
     }
 
     /// 未変換のローマ字を確定かなとして composer へ流す。
-    fn flush_romaji(&mut self, rerank: bool, fx: &mut Vec<Effect>) {
+    fn flush_romaji(&mut self, gates: &Gates, rerank: bool, fx: &mut Vec<Effect>) {
         let flush = self.converter.flush();
         let ranks = matches!(flush, Flush::Kana(_));
         self.composer.push_flush(flush);
         if ranks && rerank {
-            self.request_rerank(false, fx);
+            self.request_rerank(gates, false, fx);
         }
     }
 
-    fn push_input(&mut self, raw: &str, kana: &str, fx: &mut Vec<Effect>) {
+    fn push_input(&mut self, gates: &Gates, raw: &str, kana: &str, fx: &mut Vec<Effect>) {
         let carry = self.converter.buffer().to_string();
         self.composer.push_input(raw, kana, &carry);
         if !kana.is_empty() {
-            self.request_rerank(false, fx);
+            self.request_rerank(gates, false, fx);
         }
     }
 
     /// 現在の表示内容を確定して挿入する。suffix は確定直後に続けて入れる文字列。
-    fn commit_and_insert(&mut self, suffix: &str, fx: &mut Vec<Effect>) {
-        let text = self.composer.commit();
+    fn commit_and_insert(&mut self, gates: &Gates, suffix: &str, fx: &mut Vec<Effect>) {
+        let text = self.composer.commit(gates.learning);
         fx.push(Effect::SetMarked(String::new()));
         fx.push(Effect::Insert(format!("{text}{suffix}")));
         fx.push(Effect::HideCandidates);
@@ -274,7 +276,7 @@ impl<E: CandidateEngine> Session<E> {
     }
 
     /// 動作表に引く前の、ローマ字バッファ側の後始末。ここで処理が済んだら Some。
-    fn prepare(&mut self, key: Key, fx: &mut Vec<Effect>) -> Option<bool> {
+    fn prepare(&mut self, gates: &Gates, key: Key, fx: &mut Vec<Effect>) -> Option<bool> {
         let flushes = matches!(
             key,
             Key::Space
@@ -290,7 +292,7 @@ impl<E: CandidateEngine> Session<E> {
                 | Key::Translit(_)
         );
         if flushes {
-            self.flush_romaji(!matches!(key, Key::Translit(_)), fx);
+            self.flush_romaji(gates, !matches!(key, Key::Translit(_)), fx);
         }
         let has_romaji = !self.converter.buffer().is_empty();
         match key {
@@ -313,7 +315,7 @@ impl<E: CandidateEngine> Session<E> {
         }
     }
 
-    fn perform(&mut self, action: Action, text: &str, fx: &mut Vec<Effect>) -> bool {
+    fn perform(&mut self, gates: &Gates, action: Action, text: &str, fx: &mut Vec<Effect>) -> bool {
         match action {
             Action::PassThrough => false,
             Action::InsertSpace => {
@@ -328,7 +330,7 @@ impl<E: CandidateEngine> Session<E> {
                     .chars()
                     .filter_map(|ch| self.converter.process_input(ch.to_ascii_lowercase()))
                     .collect::<String>();
-                self.push_input(text, &kana, fx);
+                self.push_input(gates, text, &kana, fx);
                 self.show_typing(fx)
             }
             Action::StartLiteral | Action::TypeLiteral => {
@@ -336,14 +338,14 @@ impl<E: CandidateEngine> Session<E> {
                 self.show_typing(fx)
             }
             Action::TypeText => {
-                self.push_input(text, symbols::default_form(text).unwrap_or(text), fx);
+                self.push_input(gates, text, symbols::default_form(text).unwrap_or(text), fx);
                 self.show_typing(fx)
             }
             Action::Convert => {
                 let needs_rerank =
                     self.composer.phase() != Phase::Dangling && !self.composer.has_pending_rerank();
                 if needs_rerank {
-                    self.request_rerank(true, fx);
+                    self.request_rerank(gates, true, fx);
                 }
                 self.composer.begin_conversion();
                 self.refresh_marked(fx);
@@ -358,25 +360,25 @@ impl<E: CandidateEngine> Session<E> {
                 self.show_selection(fx)
             }
             Action::CommitThenPassThrough => {
-                self.commit_and_insert("", fx);
+                self.commit_and_insert(gates, "", fx);
                 false
             }
             Action::PickCandidate(number) => {
                 if self.composer.select_candidate(usize::from(number) - 1) {
-                    self.commit_and_insert("", fx);
+                    self.commit_and_insert(gates, "", fx);
                 }
                 true
             }
             Action::Commit => {
-                self.commit_and_insert("", fx);
+                self.commit_and_insert(gates, "", fx);
                 true
             }
             Action::CommitThenSpace => {
-                self.commit_and_insert(" ", fx);
+                self.commit_and_insert(gates, " ", fx);
                 true
             }
             Action::CommitThenInsert => {
-                self.commit_and_insert(text, fx);
+                self.commit_and_insert(gates, text, fx);
                 true
             }
             // handle が先に処理するのでここには来ない。
@@ -396,7 +398,7 @@ impl<E: CandidateEngine> Session<E> {
             Action::DeleteBack => {
                 let deleted = self.composer.backspace();
                 if deleted {
-                    self.request_rerank(false, fx);
+                    self.request_rerank(gates, false, fx);
                     self.show_typing(fx);
                 }
                 deleted
@@ -441,6 +443,9 @@ mod tests {
     }
     use crate::keymap::classify;
 
+    const ALLOW: Gates = Gates { learning: true, rerank: false };
+    const RERANK: Gates = Gates { learning: true, rerank: true };
+
     struct NullEngine;
     impl CandidateEngine for NullEngine {
         fn convert(&mut self, _: u64, _: &str) -> Vec<String> {
@@ -457,7 +462,7 @@ mod tests {
         let mut session = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         let mut out = String::new();
         for ch in keys.chars().chain(['\r']) {
-            let outcome = session.handle(classify(ch), &ch.to_string());
+            let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());
             for effect in outcome.effects {
                 if let Effect::Insert(text) = effect {
                     out.push_str(&text);
@@ -480,7 +485,7 @@ mod tests {
         let mut shown = Vec::new();
         let mut out = String::new();
         for ch in keys.chars().chain(['\r']) {
-            for effect in session.handle(classify(ch), &ch.to_string()).effects {
+            for effect in session.handle(&ALLOW, classify(ch), &ch.to_string()).effects {
                 if let Effect::Insert(text) = effect {
                     out.push_str(&text);
                 }
@@ -535,7 +540,7 @@ mod tests {
 
     fn shown_after(session: &mut Session<NullEngine>, keys: &str) -> String {
         for ch in keys.chars() {
-            session.handle(classify(ch), &ch.to_string());
+            session.handle(&ALLOW, classify(ch), &ch.to_string());
         }
         session.marked_text()
     }
@@ -544,7 +549,7 @@ mod tests {
     fn 英語として確定した語は次から打ちかけでも英字で表示する() {
         let mut session = remembering_session();
         assert_eq!(shown_after(&mut session, "git"), "ぎt");
-        session.handle(Key::Enter, "\r");
+        session.handle(&ALLOW, Key::Enter, "\r");
         assert_eq!(shown_after(&mut session, "git"), "git");
         assert_eq!(shown_after(&mut session, "a"), "ぎた");
     }
@@ -553,7 +558,7 @@ mod tests {
     fn かなで確定した語は覚えない() {
         let mut session = remembering_session();
         shown_after(&mut session, "gita");
-        session.handle(Key::Enter, "\r");
+        session.handle(&ALLOW, Key::Enter, "\r");
         assert_eq!(shown_after(&mut session, "git"), "ぎt");
     }
 
@@ -575,7 +580,7 @@ mod tests {
 
     fn shown_after_english(session: &mut Session<NullEngine>, keys: &str) {
         for ch in keys.chars() {
-            session.handle(classify(ch), &ch.to_string());
+            session.handle(&ALLOW, classify(ch), &ch.to_string());
         }
     }
 
@@ -595,9 +600,9 @@ mod tests {
     fn 英語の途中のシフトスペースは英字を第1候補にして変換する() {
         let mut session = english_session();
         for ch in "rain".chars() {
-            session.handle(classify(ch), &ch.to_string());
+            session.handle(&ALLOW, classify(ch), &ch.to_string());
         }
-        session.handle(Key::ShiftSpace, " ");
+        session.handle(&ALLOW, Key::ShiftSpace, " ");
         assert_eq!(session.marked_text(), "rain");
         assert!(matches!(session.phase(), Phase::Converting { .. }));
     }
@@ -625,7 +630,7 @@ mod tests {
         session.set_playful(|text| Some(text.to_string()));
         let (mut committed, mut marked) = (String::new(), String::new());
         for ch in keys.chars() {
-            let outcome = session.handle(classify(ch), &ch.to_string());
+            let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());
             for effect in outcome.effects {
                 match effect {
                     Effect::SetMarked(text) => marked = text,
@@ -681,38 +686,39 @@ mod tests {
     }
 
     fn effects_of(session: &mut Session<TwoEngine>, keys: &str) -> Vec<Effect> {
+        effects_with(&ALLOW, session, keys)
+    }
+
+    fn effects_with(gates: &Gates, session: &mut Session<TwoEngine>, keys: &str) -> Vec<Effect> {
         keys.chars()
-            .flat_map(|ch| session.handle(classify(ch), &ch.to_string()).effects)
+            .flat_map(|ch| session.handle(gates, classify(ch), &ch.to_string()).effects)
             .collect()
     }
 
     #[test]
     fn 確定したらai要求の取り消しを1度だけ出す() {
         let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
-        session.set_rerank(true);
-        let typing = effects_of(&mut session, "kyou");
+        let typing = effects_with(&RERANK, &mut session, "kyou");
         assert!(typing.iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
         assert!(!typing.contains(&Effect::CancelRerank), "組成中は取り消さない");
-        let commit = effects_of(&mut session, "\r");
+        let commit = effects_with(&RERANK, &mut session, "\r");
         assert_eq!(commit.iter().filter(|e| **e == Effect::CancelRerank).count(), 1);
-        let again = effects_of(&mut session, "\r");
+        let again = effects_with(&RERANK, &mut session, "\r");
         assert!(!again.contains(&Effect::CancelRerank), "取り消しは 1 度だけ");
     }
 
     #[test]
     fn escで組成を捨てても取り消しを出す() {
         let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
-        session.set_rerank(true);
-        effects_of(&mut session, "kyou");
-        assert!(effects_of(&mut session, "\u{1b}").contains(&Effect::CancelRerank));
+        effects_with(&RERANK, &mut session, "kyou");
+        assert!(effects_with(&RERANK, &mut session, "\u{1b}").contains(&Effect::CancelRerank));
     }
 
     #[test]
     fn commit_compositionでも取り消しを出す() {
         let mut session = Session::new(Composer::new(TwoEngine), ConversionMode::Space);
-        session.set_rerank(true);
-        effects_of(&mut session, "kyou");
-        assert!(session.commit_composition().contains(&Effect::CancelRerank));
+        effects_with(&RERANK, &mut session, "kyou");
+        assert!(session.commit_composition(&RERANK).contains(&Effect::CancelRerank));
     }
 
     #[test]
@@ -783,7 +789,7 @@ mod tests {
                 }
             };
             rest = &rest[len..];
-            for effect in session.handle(key, &text).effects {
+            for effect in session.handle(&ALLOW, key, &text).effects {
                 if let Effect::Insert(text) = effect {
                     committed.push_str(&text);
                 }

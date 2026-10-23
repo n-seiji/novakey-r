@@ -492,15 +492,15 @@ impl<E: CandidateEngine> Composer<E> {
         }
     }
 
-    pub fn commit(&mut self) -> String {
+    pub fn commit(&mut self, learn: bool) -> String {
         let out = match self.phase {
             Phase::Dangling => self.raw(),
             _ => self.display().to_string(),
         };
-        if self.phase == Phase::Dangling {
+        if learn && self.phase == Phase::Dangling {
             (self.learn_english)(&out);
         }
-        for unit in self.units.iter().filter(|u| u.literal) {
+        for unit in self.units.iter().filter(|u| u.literal && learn) {
             (self.learn_english)(&unit.raw);
         }
         let learned = match self.phase {
@@ -508,7 +508,7 @@ impl<E: CandidateEngine> Composer<E> {
             Phase::Composing if self.live => self.candidates.first().and_then(|c| c.engine_index),
             _ => None,
         };
-        match learned {
+        match learned.filter(|_| learn) {
             Some(i) => {
                 let _ = self.engine.select(self.generation, i);
             }
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(c.display(), "ぎ");
         assert_eq!(texts(&c), vec!["ぎ", "gi", "ギ"]);
         assert!(c.candidates().iter().all(|cand| cand.engine_index.is_none()));
-        assert_eq!(c.commit(), "ぎ");
+        assert_eq!(c.commit(true), "ぎ");
         assert_eq!(*c.engine_cancels(), 1, "学習しない");
     }
 
@@ -992,7 +992,7 @@ mod tests {
     fn 未変換のままcommitすると生ひらがなを返しcancelする() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        assert_eq!(c.commit(), "きょう");
+        assert_eq!(c.commit(true), "きょう");
         assert_eq!(*log.cancels.borrow(), 1);
         assert!(log.selects.borrow().is_empty());
         assert!(c.is_empty());
@@ -1005,14 +1005,24 @@ mod tests {
         type_kyou(&mut c);
         let generation = c.current_generation();
         c.begin_conversion();
-        assert_eq!(c.commit(), "今日");
+        assert_eq!(c.commit(true), "今日");
         assert_eq!(*log.selects.borrow(), vec![(generation, 0)]);
 
         type_kyou(&mut c);
         c.begin_conversion();
         c.select_candidate(2);
-        assert_eq!(c.commit(), "京");
+        assert_eq!(c.commit(true), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
+    }
+
+    #[test]
+    fn learnがfalseならcommitしても学習せずcancelする() {
+        let (mut c, log) = composer();
+        type_kyou(&mut c);
+        c.begin_conversion();
+        assert_eq!(c.commit(false), "今日");
+        assert!(log.selects.borrow().is_empty());
+        assert_eq!(*log.cancels.borrow(), 1);
     }
 
     #[test]
@@ -1021,7 +1031,7 @@ mod tests {
         type_kyou(&mut c);
         c.begin_conversion();
         c.advance();
-        assert_eq!(c.commit(), "kyou");
+        assert_eq!(c.commit(true), "kyou");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(*log.cancels.borrow(), 1);
     }
@@ -1031,7 +1041,7 @@ mod tests {
         let (mut c, log) = composer();
         c.set_live(true);
         type_kyou(&mut c);
-        assert_eq!(c.commit(), "今日");
+        assert_eq!(c.commit(true), "今日");
         assert_eq!(log.selects.borrow().last().unwrap().1, 0);
     }
 
@@ -1041,7 +1051,7 @@ mod tests {
         c.set_live(true);
         type_kyou(&mut c);
         c.revert();
-        assert_eq!(c.commit(), "きょう");
+        assert_eq!(c.commit(true), "きょう");
         assert_eq!(*log.cancels.borrow(), 1);
     }
 
@@ -1054,7 +1064,7 @@ mod tests {
         assert_eq!(c.display(), "Git");
         assert!(log.converts.borrow().is_empty());
         assert!(!c.begin_conversion());
-        assert_eq!(c.commit(), "Git");
+        assert_eq!(c.commit(true), "Git");
         assert_eq!(*log.cancels.borrow(), 1);
         assert_eq!(c.phase(), Phase::Empty);
     }
@@ -1082,7 +1092,7 @@ mod tests {
         c.begin_conversion();
         assert_eq!(c.display(), "京");
         assert_eq!(texts(&c), vec!["京", "kyou", "今日", "教"]);
-        assert_eq!(c.commit(), "京");
+        assert_eq!(c.commit(true), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
     }
 
@@ -1123,7 +1133,7 @@ mod tests {
                 window: false
             }
         );
-        assert_eq!(c.commit(), "教");
+        assert_eq!(c.commit(true), "教");
         assert_eq!(log.selects.borrow().last().unwrap().1, 2);
     }
 
@@ -1178,7 +1188,7 @@ mod tests {
         assert_eq!(c.display(), "京");
         assert_eq!(c.candidates()[0].engine_index, Some(1));
         assert_eq!(c.candidates()[1].text, "今日");
-        assert_eq!(c.commit(), "京");
+        assert_eq!(c.commit(true), "京");
         assert_eq!(log.selects.borrow().last().unwrap().1, 1);
     }
 
@@ -1231,7 +1241,7 @@ mod tests {
     fn 変換しきれない子音が残る語はenterでrawのまま確定する() {
         let mut c = typed_and_flushed("enter");
         assert_eq!(c.phase(), Phase::Dangling);
-        assert_eq!(c.commit(), "enter");
+        assert_eq!(c.commit(true), "enter");
     }
 
     #[test]
@@ -1242,7 +1252,7 @@ mod tests {
         assert_eq!(c.display(), "github");
         assert_eq!(texts(&c)[0], "github");
         assert!(texts(&c).len() >= 2);
-        assert_eq!(c.commit(), "github");
+        assert_eq!(c.commit(true), "github");
         assert_eq!(*c.engine_cancels(), 1);
     }
 
@@ -1250,7 +1260,7 @@ mod tests {
     fn 末尾のnはかなのまま確定する() {
         let mut c = typed_and_flushed("kan");
         assert_eq!(c.phase(), Phase::Composing);
-        assert_eq!(c.commit(), "かん");
+        assert_eq!(c.commit(true), "かん");
     }
 
     #[test]
@@ -1277,7 +1287,7 @@ mod tests {
             action_for(c.phase(), Key::Punct),
             Action::CommitThenInsert
         );
-        assert_eq!(format!("{}{}", c.commit(), "."), "enter.");
+        assert_eq!(format!("{}{}", c.commit(true), "."), "enter.");
     }
 
     #[test]
@@ -1289,7 +1299,7 @@ mod tests {
         c.pop_pending_raw();
         c.push_flush(conv.flush());
         assert_eq!(c.phase(), Phase::Dangling);
-        assert_eq!(c.commit(), "enter");
+        assert_eq!(c.commit(true), "enter");
     }
 
     fn type_symbol(c: &mut Composer<MockEngine>, ascii: &str) {
@@ -1304,7 +1314,7 @@ mod tests {
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(c.display(), "「");
         assert!(log.converts.borrow().is_empty());
-        assert_eq!(c.commit(), "「");
+        assert_eq!(c.commit(true), "「");
         assert!(log.selects.borrow().is_empty());
     }
 
@@ -1320,7 +1330,7 @@ mod tests {
         );
         assert!(c.advance());
         assert_eq!(c.display(), "『");
-        assert_eq!(c.commit(), "『");
+        assert_eq!(c.commit(true), "『");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(*c.engine_cancels(), 1);
     }
@@ -1333,7 +1343,7 @@ mod tests {
         assert!(c.retreat());
         assert_eq!(c.display(), ".");
         assert!(c.select_candidate(1));
-        assert_eq!(c.commit(), "．");
+        assert_eq!(c.commit(true), "．");
     }
 
     #[test]
@@ -1360,7 +1370,7 @@ mod tests {
         type_word(&mut c, &mut conv, "a");
         c.push_flush(conv.flush());
         assert_eq!(c.display_hiragana(), "（あ");
-        assert_eq!(c.commit(), "（あ");
+        assert_eq!(c.commit(true), "（あ");
     }
 
     #[test]
@@ -1391,7 +1401,7 @@ mod tests {
         let mut c = typed_and_flushed("world");
         assert_eq!(c.phase(), Phase::Dangling);
         assert!(!c.is_symbol());
-        assert_eq!(c.commit(), "world");
+        assert_eq!(c.commit(true), "world");
     }
 
     #[test]
@@ -1403,7 +1413,7 @@ mod tests {
         assert_eq!(c.display(), "キョウ");
         assert!(c.transliterate(Form::FullAlnum(translit::Case::Lower)));
         assert_eq!(c.display(), "ｋｙｏｕ");
-        assert_eq!(c.commit(), "ｋｙｏｕ");
+        assert_eq!(c.commit(true), "ｋｙｏｕ");
         assert!(log.selects.borrow().is_empty());
         assert_eq!(c.phase(), Phase::Empty);
     }
@@ -1510,7 +1520,7 @@ mod tests {
         c.push_literal("Phone");
         assert!(c.begin_conversion());
         assert_eq!(texts(&c), vec!["いPhone", "iPhone"]);
-        assert_eq!(c.commit(), "いPhone");
+        assert_eq!(c.commit(true), "いPhone");
         assert!(log.selects.borrow().is_empty());
     }
 
@@ -1575,7 +1585,7 @@ mod tests {
         c.begin_conversion();
         assert!(c.advance());
         assert_eq!(c.display(), "desktop");
-        assert_eq!(c.commit(), "desktop");
+        assert_eq!(c.commit(true), "desktop");
         assert!(c.engine.log.selects.borrow().is_empty());
     }
 
@@ -1700,7 +1710,7 @@ mod tests {
         c.begin_conversion();
         let index = texts(&c).iter().position(|t| *t == "🍻").unwrap();
         assert!(c.select_candidate(index));
-        assert_eq!(c.commit(), "🍻");
+        assert_eq!(c.commit(true), "🍻");
         assert!(c.engine.log.selects.borrow().is_empty());
     }
 

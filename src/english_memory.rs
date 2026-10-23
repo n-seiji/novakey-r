@@ -73,9 +73,9 @@ pub fn knows(word: &str) -> bool {
     with_store(|s| s.words.iter().any(|w| w == word))
 }
 
-/// 英語として確定した語を覚える。パスワード欄やパスワード管理アプリでは覚えない。
+/// 英語として確定した語を覚える。学習してよいかは呼び出し側 (Composer::commit) が決める。
 pub fn learn(word: &str) {
-    if !is_memorable(word) || !crate::kkc::learning_allowed() {
+    if !is_memorable(word) {
         return;
     }
     with_store(|s| {
