@@ -46,6 +46,17 @@ impl fmt::Display for DictError {
     }
 }
 
+impl DictError {
+    /// ログ用の種別。パスや読みなど入力由来の情報は含まない。
+    pub fn kind(&self) -> String {
+        match self {
+            DictError::NotFound(_) => "not_found".into(),
+            DictError::Io { source, .. } => format!("io:{:?}", source.kind()),
+            DictError::Corrupt { .. } => "corrupt".into(),
+        }
+    }
+}
+
 impl std::error::Error for DictError {}
 
 /// 辞書の 1 エントリ。`ruby` はカタカナ。
@@ -424,6 +435,15 @@ mod tests {
 
     fn dict() -> Dictionary {
         Dictionary::open_default().expect("辞書を開けること")
+    }
+
+    #[test]
+    fn error_kind_does_not_contain_paths_or_reasons() {
+        let path = PathBuf::from("/secret/ア/shard");
+        let io = DictError::Io { path: path.clone(), source: io::Error::from(io::ErrorKind::NotFound) };
+        assert_eq!(io.kind(), "io:NotFound");
+        assert_eq!(DictError::Corrupt { path, reason: "ア".into() }.kind(), "corrupt");
+        assert_eq!(DictError::NotFound("ア".into()).kind(), "not_found");
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod english_split;
 mod loanword;
 mod outbound;
 mod platform;
+mod private_fs;
 mod rerank;
 mod romaji_converter;
 mod session;
@@ -46,6 +47,7 @@ fn main() {
         return;
     }
 
+    platform::install_panic_hook();
     imk::register_controller();
     imk::init_llm_dispatch();
     imk::run();

@@ -5,3 +5,9 @@ target
 
 # 計画・設計メモはコミットしない
 docs/superpowers/
+
+# ローカル専用
+.DS_Store
+__pycache__/
+.claude/settings.local.json
+.claude/worktrees/

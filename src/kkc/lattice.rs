@@ -47,7 +47,7 @@ impl LookupCache {
                 // 読み (ユーザーの入力) はログに出さない。毎回出ないよう 1 度だけ。
                 static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    crate::platform::log(&format!("dictionary lookup failed: {err}"));
+                    crate::platform::log(&format!("dictionary lookup failed: {}", err.kind()));
                 }
                 Vec::new()
             }
