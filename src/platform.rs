@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use objc2::rc::{autoreleasepool, Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{class, extern_class, msg_send, msg_send_id, mutability, sel, ClassType};
-use objc2_foundation::{NSBundle, NSObject, NSString};
+use objc2_foundation::{NSBundle, NSObject, NSRange, NSString};
 
 #[link(name = "InputMethodKit", kind = "framework")]
 extern "C" {
@@ -113,6 +113,24 @@ pub fn is_secure_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() }
 }
 
+/// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。
+pub fn utf16_units(string: &NSString) -> Vec<u16> {
+    // SAFETY: length は NSUInteger、getCharacters:range: は range が文字列内なら buffer に unichar を書き込む。
+    // buffer は length 個の領域を確保してあり、範囲は 0..length。
+    unsafe {
+        let length: usize = msg_send![string, length];
+        let mut buffer: Vec<u16> = vec![0; length];
+        let range = NSRange { location: 0, length };
+        let _: () = msg_send![string, getCharacters: buffer.as_mut_ptr(), range: range];
+        buffer
+    }
+}
+
+/// ホスト由来の NSString を String にする。不正なサロゲートは U+FFFD になる。
+pub fn lossy_string(string: &NSString) -> String {
+    String::from_utf16_lossy(&utf16_units(string))
+}
+
 /// 候補パネルが渡す候補 (NSString か NSAttributedString) の文字列。どちらでもなければ None。
 pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
     // SAFETY: isKindOfClass: は Class を取り BOOL を返す。NSAttributedString の `string` は NSString を返し、
@@ -121,12 +139,12 @@ pub fn candidate_text(candidate: &AnyObject) -> Option<String> {
         let attributed: Bool = msg_send![candidate, isKindOfClass: class!(NSAttributedString)];
         if attributed.as_bool() {
             let string: Option<Id<NSString>> = msg_send_id![candidate, string];
-            return string.map(|s| s.to_string());
+            return string.map(|s| lossy_string(&s));
         }
         let plain: Bool = msg_send![candidate, isKindOfClass: class!(NSString)];
         plain
             .as_bool()
-            .then(|| (*(candidate as *const AnyObject as *const NSString)).to_string())
+            .then(|| lossy_string(&*(candidate as *const AnyObject as *const NSString)))
     }
 }
 
@@ -163,8 +181,8 @@ pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
         let bare: Option<Id<NSString>> = msg_send_id![event, charactersIgnoringModifiers];
         Some(KeyEvent {
             key_code,
-            characters: characters.map(|s| s.to_string()).unwrap_or_default(),
-            characters_ignoring_modifiers: bare.map(|s| s.to_string()).unwrap_or_default(),
+            characters: characters.map(|s| lossy_string(&s)).unwrap_or_default(),
+            characters_ignoring_modifiers: bare.map(|s| lossy_string(&s)).unwrap_or_default(),
             is_control: modifiers & CONTROL_MODIFIER != 0,
             is_command_or_option: modifiers & COMMAND_OR_OPTION_MODIFIERS != 0,
             is_shift: modifiers & SHIFT_MODIFIER != 0,
@@ -334,6 +352,24 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn ns_from_units(units: &[u16]) -> Id<NSString> {
+        // SAFETY: stringWithCharacters:length: は unichar 配列とその長さを取り NSString を返す。
+        unsafe { msg_send_id![class!(NSString), stringWithCharacters: units.as_ptr(), length: units.len()] }
+    }
+
+    #[test]
+    fn lone_surrogates_become_replacement_characters() {
+        let ns = ns_from_units(&[0x61, 0xDC00, 0x62, 0xD800]);
+        assert_eq!(lossy_string(&ns), "a\u{FFFD}b\u{FFFD}");
+    }
+
+    #[test]
+    fn valid_pairs_and_empty_strings_round_trip() {
+        assert_eq!(lossy_string(&ns_from_units(&[0xD83D, 0xDE00, 0x3042])), "\u{1F600}あ");
+        assert_eq!(lossy_string(&ns_from_units(&[])), "");
+    }
     #[test]
     fn guard_returns_fallback_on_panic_and_value_otherwise() {
         assert_eq!(super::guard(|| 0, || 7), 7);
