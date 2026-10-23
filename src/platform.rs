@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use objc2::rc::{autoreleasepool, Allocated, Id};
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{class, extern_class, msg_send, msg_send_id, mutability, sel, ClassType};
+use crate::input::{KeyInput, Modifiers};
 use objc2_foundation::{NSBundle, NSObject, NSRange, NSString};
 
 #[link(name = "InputMethodKit", kind = "framework")]
@@ -155,20 +156,8 @@ const SHIFT_MODIFIER: usize = 1 << 17;
 const CONTROL_MODIFIER: usize = 1 << 18;
 const COMMAND_OR_OPTION_MODIFIERS: usize = (1 << 19) | (1 << 20);
 
-/// keyDown の NSEvent から取り出した値。
-pub struct KeyEvent {
-    pub key_code: u16,
-    pub characters: String,
-    /// Shift 以外の修飾キーを無視した文字 (Ctrl 押下中にどのキーかを読む)。
-    pub characters_ignoring_modifiers: String,
-    pub is_control: bool,
-    /// Command / Option のいずれかが押されている。
-    pub is_command_or_option: bool,
-    pub is_shift: bool,
-}
-
 /// NSEvent が keyDown なら中身を返す。
-pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
+pub fn key_event(event: &AnyObject) -> Option<KeyInput> {
     // SAFETY: event は IMK が handleEvent:client: に渡す NSEvent。type / modifierFlags は NSUInteger、keyCode は
     // unsigned short を返し、characters と charactersIgnoringModifiers は keyDown でのみ呼ぶ (NSString、nil 可)。
     unsafe {
@@ -180,13 +169,15 @@ pub fn key_event(event: &AnyObject) -> Option<KeyEvent> {
         let modifiers: usize = msg_send![event, modifierFlags];
         let characters: Option<Id<NSString>> = msg_send_id![event, characters];
         let bare: Option<Id<NSString>> = msg_send_id![event, charactersIgnoringModifiers];
-        Some(KeyEvent {
+        Some(KeyInput {
             key_code,
             characters: characters.map(|s| lossy_string(&s)).unwrap_or_default(),
             characters_ignoring_modifiers: bare.map(|s| lossy_string(&s)).unwrap_or_default(),
-            is_control: modifiers & CONTROL_MODIFIER != 0,
-            is_command_or_option: modifiers & COMMAND_OR_OPTION_MODIFIERS != 0,
-            is_shift: modifiers & SHIFT_MODIFIER != 0,
+            mods: Modifiers {
+                shift: modifiers & SHIFT_MODIFIER != 0,
+                control: modifiers & CONTROL_MODIFIER != 0,
+                command_or_option: modifiers & COMMAND_OR_OPTION_MODIFIERS != 0,
+            },
         })
     }
 }
@@ -383,5 +374,74 @@ mod tests {
     fn a_panicking_callback_is_contained() {
         assert!(guarded(|| panic!("boom")).is_err());
         assert!(guarded(|| {}).is_ok());
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    // SAFETY: CGPoint は f64 を 2 つ並べた構造体で、エンコーディングは {CGPoint=dd}。
+    unsafe impl objc2::Encode for Point {
+        const ENCODING: objc2::Encoding =
+            objc2::Encoding::Struct("CGPoint", &[objc2::Encoding::Double, objc2::Encoding::Double]);
+    }
+
+    fn synth_event(event_type: usize, flags: usize, chars: &str, bare: &str, key_code: u16) -> Id<AnyObject> {
+        let chars = NSString::from_str(chars);
+        let bare = NSString::from_str(bare);
+        let location = Point { x: 0.0, y: 0.0 };
+        let context: Option<&AnyObject> = None;
+        // SAFETY: keyEventWithType:... は NSEvent を返すクラスメソッド。引数の型は AppKit のヘッダどおり。
+        unsafe {
+            msg_send_id![
+                class!(NSEvent),
+                keyEventWithType: event_type,
+                location: location,
+                modifierFlags: flags,
+                timestamp: 0.0f64,
+                windowNumber: 0isize,
+                context: context,
+                characters: &*chars,
+                charactersIgnoringModifiers: &*bare,
+                isARepeat: Bool::NO,
+                keyCode: key_code
+            ]
+        }
+    }
+
+    #[test]
+    fn key_down_converts_characters_and_modifiers() {
+        let ev = synth_event(NS_EVENT_TYPE_KEY_DOWN, SHIFT_MODIFIER | CONTROL_MODIFIER, "\u{b}", "k", 40);
+        let input = key_event(&ev).expect("keyDown");
+        assert_eq!(input.key_code, 40);
+        assert_eq!(input.characters, "\u{b}");
+        assert_eq!(input.characters_ignoring_modifiers, "k");
+        assert_eq!(input.mods, Modifiers { shift: true, control: true, command_or_option: false });
+    }
+
+    #[test]
+    fn command_and_option_both_map_to_command_or_option() {
+        for flag in [1usize << 19, 1 << 20] {
+            let ev = synth_event(NS_EVENT_TYPE_KEY_DOWN, flag, "a", "a", 0);
+            assert_eq!(
+                key_event(&ev).unwrap().mods,
+                Modifiers { shift: false, control: false, command_or_option: true }
+            );
+        }
+    }
+
+    #[test]
+    fn plain_key_has_no_modifiers() {
+        let ev = synth_event(NS_EVENT_TYPE_KEY_DOWN, 0, "a", "a", 0);
+        assert_eq!(key_event(&ev).unwrap().mods, Modifiers::default());
+    }
+
+    #[test]
+    fn key_up_is_not_converted() {
+        let ev = synth_event(11, 0, "a", "a", 0);
+        assert!(key_event(&ev).is_none());
     }
 }

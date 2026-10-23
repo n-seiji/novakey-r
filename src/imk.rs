@@ -11,7 +11,8 @@ use objc2_foundation::{NSArray, NSObject, NSString};
 
 use crate::composer::{Composer, Phase};
 use crate::imk_client::Client;
-use crate::keymap::{self, Key, Stroke};
+use crate::input::{self, Route};
+use crate::keymap::Key;
 use crate::kkc::{self, RustEngine};
 use crate::llm_bridge;
 use crate::outbound::{self, Outbound, Snapshot};
@@ -193,29 +194,20 @@ declare_class!(
                 let (Some(event), Some(client)) = (event.and_then(platform::key_event), client) else {
                     return Bool::NO;
                 };
-                let translit = (!event.is_command_or_option)
-                    .then(|| {
-                        keymap::translit_form(
-                            event.key_code,
-                            event.is_control,
-                            &event.characters_ignoring_modifiers,
-                        )
-                    })
-                    .flatten();
-                if translit.is_none() && (event.is_control || event.is_command_or_option) {
+                let route = input::route(&event);
+                if route == Route::PassThrough {
                     trace::record("handleEvent", "key=Shortcut action=PassThrough");
                     return Bool::NO;
                 }
                 let client = Client::new(client);
                 *self.ivars().last_client.borrow_mut() = Some(client.clone());
-                if let Some(form) = translit {
-                    return Bool::new(self.dispatch(Key::Translit(form), "", &client));
-                }
-                let handled = match keymap::stroke(event.key_code, &event.characters, event.is_shift) {
-                    Stroke::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
+                let handled = match route {
+                    Route::PassThrough => false,
+                    Route::Translit(form) => self.dispatch(Key::Translit(form), "", &client),
+                    Route::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
                         self.dispatch(*key, text, &client) || handled
                     }),
-                    Stroke::Navigation => {
+                    Route::Navigation => {
                         let has_pending = {
                             let session = self.ivars().session.borrow();
                             !session.converter.buffer().is_empty() || !session.composer.is_empty()

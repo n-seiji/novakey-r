@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-// simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (keymap::stroke → Session) を headless で動かす。
+// simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (input::route → Session) を headless で動かす。
 // 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
 //
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
@@ -9,7 +9,8 @@
 use std::path::PathBuf;
 
 use crate::composer::{Composer, Phase};
-use crate::keymap::{self, Key, Stroke};
+use crate::input::{self, KeyInput, Modifiers, Route};
+use crate::keymap::Key;
 use crate::kkc::RustEngine;
 use crate::session::{Effect, Session};
 use crate::translit::Form;
@@ -26,6 +27,16 @@ struct Event {
 impl Event {
     fn new(key_code: u16, characters: &str) -> Self {
         Self { key_code, characters: characters.to_string(), shift: false, control: false }
+    }
+
+    fn to_input(&self) -> KeyInput {
+        KeyInput {
+            key_code: self.key_code,
+            characters: self.characters.clone(),
+            // Ctrl 付きでも文字は変わらないので、そのまま「修飾キーを無視した文字」として使う。
+            characters_ignoring_modifiers: self.characters.clone(),
+            mods: Modifiers { shift: self.shift, control: self.control, command_or_option: false },
+        }
     }
 }
 
@@ -147,39 +158,27 @@ impl Sim {
         }
     }
 
-    /// imk.rs の handleEvent と同じ手順でキーを処理する。
+    /// imk.rs の handleEvent と同じ input::route でキーを処理する。
     fn press(&mut self, ev: &Event) {
-        let translit = keymap::translit_form(ev.key_code, ev.control, &ev.characters.to_lowercase());
-        if translit.is_none() && ev.control {
+        let handled = match input::route(&ev.to_input()) {
+            Route::PassThrough => false,
+            Route::Translit(form) => self.dispatch(Key::Translit(form), ""),
+            Route::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
+                self.dispatch(*key, text) || handled
+            }),
+            Route::Navigation => {
+                !self.session.converter.buffer().is_empty() || !self.session.composer.is_empty()
+            }
+        };
+        if !handled {
             self.pass_through(ev);
-            return;
-        }
-        if let Some(form) = translit {
-            self.dispatch(Key::Translit(form), "", ev);
-            return;
-        }
-        match keymap::stroke(ev.key_code, &ev.characters, ev.shift) {
-            Stroke::Keys(keys) => {
-                for (key, text) in &keys {
-                    self.dispatch(*key, text, ev);
-                }
-            }
-            Stroke::Navigation => {
-                let pending =
-                    !self.session.converter.buffer().is_empty() || !self.session.composer.is_empty();
-                if !pending {
-                    self.pass_through(ev);
-                }
-            }
         }
     }
 
-    fn dispatch(&mut self, key: Key, text: &str, ev: &Event) {
+    fn dispatch(&mut self, key: Key, text: &str) -> bool {
         let outcome = self.session.handle(key, text);
         self.apply(outcome.effects);
-        if !outcome.handled {
-            self.pass_through(ev);
-        }
+        outcome.handled
     }
 
     fn candidates_line(&self) -> String {

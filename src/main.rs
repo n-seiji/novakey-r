@@ -2,6 +2,7 @@
 mod composer;
 mod imk;
 mod imk_client;
+mod input;
 mod keymap;
 mod kkc;
 mod llm_bridge;
