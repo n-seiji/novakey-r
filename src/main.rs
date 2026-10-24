@@ -18,6 +18,7 @@ mod platform;
 mod private_fs;
 mod registry;
 mod rerank;
+mod rerank_gate;
 mod romaji_converter;
 mod session;
 mod simulate;
