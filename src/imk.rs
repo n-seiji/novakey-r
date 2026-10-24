@@ -263,7 +263,7 @@ declare_class!(
 
         #[method_id(menu)]
         fn menu(&self) -> Id<AnyObject> {
-            platform::guard(|| platform::build_menu(&[], None), || {
+            self.guard_session(|| platform::build_menu(&[], None), || {
                 self.ivars().controller.sync_conversion_mode();
                 let mode_title = match self.ivars().controller.mode() {
                     ConversionMode::Live => "ライブ変換: オン",

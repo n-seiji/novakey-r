@@ -154,7 +154,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                 let has_pending = self.session.borrow().has_pending();
                 self.env.trace(
                     "handleEvent",
-                    &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
+                    &format!("id={} mode={:?} key=Navigation phase={:?} handled={has_pending}", self.id, self.mode(), self.phase()),
                 );
                 has_pending
             }
