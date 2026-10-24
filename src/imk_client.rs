@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! IMK のクライアント (IMKTextInput を実装するホストアプリ側オブジェクト) の安全なラッパー。
 use objc2::rc::Id;
 use objc2::runtime::AnyObject;

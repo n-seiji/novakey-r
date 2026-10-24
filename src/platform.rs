@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Cocoa / InputMethodKit への薄い境界。unsafe はこのモジュールと imk_client.rs に閉じ込める。
 use std::cell::RefCell;
 
@@ -7,20 +8,20 @@ use objc2::{class, extern_class, msg_send, msg_send_id, mutability, sel, ClassTy
 use objc2_foundation::{NSBundle, NSObject, NSRange, NSString};
 
 #[link(name = "InputMethodKit", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     static IMKCandidatesSendServerKeyEventFirst: &'static NSString;
 }
 
 #[link(name = "AppKit", kind = "framework")]
-extern "C" {}
+unsafe extern "C" {}
 
 #[link(name = "Carbon", kind = "framework")]
-extern "C" {
-    fn IsSecureEventInputEnabled() -> bool;
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
 }
 
 #[link(name = "Foundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn NSLog(fmt: *mut AnyObject, ...);
 }
 
@@ -59,7 +60,7 @@ pub fn log(message: &str) {
     });
 }
 
-extern "C" {
+unsafe extern "C" {
     /// libdispatch (libSystem) のメインキュー本体。`dispatch_get_main_queue()` はこの番地を返すマクロ。
     static _dispatch_main_q: std::ffi::c_void;
     fn dispatch_async_f(
@@ -110,7 +111,7 @@ pub fn run_on_main(f: fn()) {
 
 pub fn is_secure_input_enabled() -> bool {
     // SAFETY: Carbon の引数なし C 関数で、状態を読むだけ。
-    unsafe { IsSecureEventInputEnabled() }
+    unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
 /// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。

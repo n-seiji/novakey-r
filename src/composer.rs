@@ -993,10 +993,10 @@ mod tests {
     fn 選択中の候補をcommitしその元indexで学習する() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
+        let generation = c.current_generation();
         c.begin_conversion();
         assert_eq!(c.commit(), "今日");
-        assert_eq!(*log.selects.borrow(), vec![(gen, 0)]);
+        assert_eq!(*log.selects.borrow(), vec![(generation, 0)]);
 
         type_kyou(&mut c);
         c.begin_conversion();
@@ -1065,8 +1065,8 @@ mod tests {
     fn 非liveのリランキングは保留され最初の変換で反映される() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
-        assert_eq!(c.apply_rerank(gen, 1), None);
+        let generation = c.current_generation();
+        assert_eq!(c.apply_rerank(generation, 1), None);
         assert_eq!(c.display(), "きょう");
         assert_eq!(texts(&c), vec!["今日", "京", "教"]);
         c.begin_conversion();
@@ -1080,9 +1080,9 @@ mod tests {
     fn 保留中のリランキングは後の結果で上書きされる() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
-        c.apply_rerank(gen, 1);
-        c.apply_rerank(gen, 2);
+        let generation = c.current_generation();
+        c.apply_rerank(generation, 1);
+        c.apply_rerank(generation, 2);
         c.begin_conversion();
         assert_eq!(c.display(), "教");
     }
@@ -1091,8 +1091,8 @@ mod tests {
     fn 保留中のリランキングは入力が進むと破棄される() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
-        c.apply_rerank(gen, 1);
+        let generation = c.current_generation();
+        c.apply_rerank(generation, 1);
         c.push_input("ha", "は", "");
         c.begin_conversion();
         assert_eq!(c.display(), "きょうはK1");
@@ -1102,9 +1102,9 @@ mod tests {
     fn 変換直後で未操作ならリランキング結果を先頭へ反映しrawは直後に残す() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
+        let generation = c.current_generation();
         c.begin_conversion();
-        assert_eq!(c.apply_rerank(gen, 2), Some("教".to_string()));
+        assert_eq!(c.apply_rerank(generation, 2), Some("教".to_string()));
         assert_eq!(texts(&c), vec!["教", "kyou", "今日", "京"]);
         assert_eq!(
             c.phase(),
@@ -1121,10 +1121,10 @@ mod tests {
     fn 送りの後はリランキングで並べ替えない() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
+        let generation = c.current_generation();
         c.begin_conversion();
         c.advance();
-        assert_eq!(c.apply_rerank(gen, 2), None);
+        assert_eq!(c.apply_rerank(generation, 2), None);
         assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
     }
 
@@ -1132,10 +1132,10 @@ mod tests {
     fn 候補ウィンドウ表示中や候補選択後はリランキングで並べ替えない() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
-        let gen = c.current_generation();
+        let generation = c.current_generation();
         c.begin_conversion();
         assert!(c.select_candidate(2));
-        assert_eq!(c.apply_rerank(gen, 1), None);
+        assert_eq!(c.apply_rerank(generation, 1), None);
         assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
         assert_eq!(c.display(), "京");
     }
@@ -1163,8 +1163,8 @@ mod tests {
         let (mut c, log) = composer();
         c.set_live(true);
         type_kyou(&mut c);
-        let gen = c.current_generation();
-        assert_eq!(c.apply_rerank(gen, 1), Some("京".to_string()));
+        let generation = c.current_generation();
+        assert_eq!(c.apply_rerank(generation, 1), Some("京".to_string()));
         assert_eq!(c.display(), "京");
         assert_eq!(c.candidates()[0].engine_index, Some(1));
         assert_eq!(c.candidates()[1].text, "今日");
@@ -1194,9 +1194,9 @@ mod tests {
         let (mut c, _) = composer();
         c.set_live(true);
         type_kyou(&mut c);
-        let gen = c.current_generation();
+        let generation = c.current_generation();
         c.revert();
-        assert_eq!(c.apply_rerank(gen, 1), None);
+        assert_eq!(c.apply_rerank(generation, 1), None);
     }
 
     use crate::keymap::{action_for, Action, Key};

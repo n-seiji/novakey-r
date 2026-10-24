@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 mod composer;
 mod imk;
 mod imk_client;
