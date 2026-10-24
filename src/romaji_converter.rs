@@ -123,9 +123,8 @@ impl RomajiConverter {
         &self.buffer
     }
 
-    /// マーク文字列に出す未確定ローマ字。
-    pub fn pending_display(&self) -> String {
-        self.buffer.clone()
+    pub fn set_buffer(&mut self, buffer: &str) {
+        self.buffer = buffer.to_string();
     }
 
     pub fn clear(&mut self) {
@@ -159,7 +158,7 @@ mod tests {
         input.chars().for_each(|ch| {
             converter.process_input(ch);
         });
-        converter.pending_display()
+        converter.buffer().to_string()
     }
 
     /// 入力中に確定したかなと、最後の flush の結果。

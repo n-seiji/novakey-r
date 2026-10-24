@@ -275,6 +275,9 @@ struct Sim {
     env: FakeEnv,
     /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
     stale: Vec<String>,
+    /// 表示 (preedit) と、Enter で確定される文字列 (commit_preview) が食い違った打鍵 (ラベル)。
+    /// 検査は opt-in。未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない。
+    wysiwyg_broken: Vec<String>,
 }
 
 impl Sim {
@@ -290,6 +293,7 @@ impl Sim {
             panel,
             env,
             stale: Vec::new(),
+            wysiwyg_broken: Vec::new(),
         }
     }
 
@@ -415,14 +419,19 @@ struct Run {
     marked: String,
     /// 下線付き文字列が session の表示とずれた打鍵。空であるべき。
     stale: Vec<String>,
+    /// 表示と確定される文字列がずれた打鍵 (検査を有効にしたときだけ入る)。空であるべき。
+    wysiwyg_broken: Vec<String>,
 }
 
-fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
+fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
     let mut sim = Sim::new();
     for (label, step) in parse_keys(keys)? {
         sim.apply(&label, &step)?;
         if sim.client.marked() != sim.controller.marked_text() {
             sim.stale.push(label.clone());
+        }
+        if check_preedit && sim.controller.commit_preview().is_some_and(|p| p != sim.controller.marked_text()) {
+            sim.wysiwyg_broken.push(label.clone());
         }
         if verbose {
             let panel = if sim.panel.visible() { format!(" panel@{}", sim.panel.line() + 1) } else { String::new() };
@@ -438,20 +447,23 @@ fn run_keys(keys: &str, verbose: bool) -> Result<Run, String> {
             }
         }
     }
-    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale: sim.stale })
+    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale: sim.stale, wysiwyg_broken: sim.wysiwyg_broken })
 }
 
 /// `--simulate '<keys>'`
-pub fn simulate(keys: &str) {
+pub fn simulate(keys: &str, check_preedit: bool) {
     setup_env();
-    match run_keys(keys, true) {
-        Ok(Run { committed, marked, stale }) => {
+    match run_keys(keys, true, check_preedit) {
+        Ok(Run { committed, marked, stale, wysiwyg_broken }) => {
             println!("final: {committed:?}");
             if !marked.is_empty() {
                 println!("still composing: {marked:?}");
             }
             if !stale.is_empty() {
                 println!("STALE marked text after: {stale:?}");
+            }
+            if !wysiwyg_broken.is_empty() {
+                println!("WYSIWYG preedit differs from commit preview after: {wysiwyg_broken:?}");
             }
         }
         Err(err) => {
@@ -482,7 +494,7 @@ fn unescape(text: &str) -> String {
 
 /// `--simulate-file path`: 1 行 1 シナリオ。`キー列<TAB>期待する確定文字列` なら一致を検査し、
 /// 期待が無ければ結果を表示するだけ。`#` 始まりと空行は読み飛ばす。不一致があれば終了コード 1。
-pub fn simulate_file(path: &str) {
+pub fn simulate_file(path: &str, check_preedit: bool) {
     setup_env();
     let text = std::fs::read_to_string(path).unwrap_or_else(|err| {
         eprintln!("{path}: {err}");
@@ -495,17 +507,22 @@ pub fn simulate_file(path: &str) {
             Some((keys, expected)) => (keys, Some(unescape(expected))),
             None => (line, None),
         };
-        let result = run_keys(keys, false);
+        let result = run_keys(keys, false, check_preedit);
         let shown = match &result {
             Ok(run) if run.marked.is_empty() => format!("{:?}", run.committed),
             Ok(run) => format!("{:?} +composing {:?}", run.committed, run.marked),
             Err(err) => format!("ERROR {err}"),
         };
         let stale = result.as_ref().is_ok_and(|run| !run.stale.is_empty());
+        let wysiwyg = result.as_ref().is_ok_and(|run| !run.wysiwyg_broken.is_empty());
         let verdict = match (&expected, &result) {
             _ if stale => {
                 failures += 1;
                 "STAL"
+            }
+            _ if wysiwyg => {
+                failures += 1;
+                "WYSI"
             }
             (None, _) => "    ",
             (Some(want), Ok(run)) if run.marked.is_empty() && run.committed == *want => "ok  ",

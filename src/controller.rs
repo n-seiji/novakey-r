@@ -129,6 +129,12 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         self.session.borrow().marked_text()
     }
 
+    /// 未確定ローマ字が無いときの、いま確定した場合の文字列。あれば None (表示と一致しなくてよい)。
+    pub fn commit_preview(&self) -> Option<String> {
+        let session = self.session.borrow();
+        (!session.has_romaji()).then(|| session.commit_preview())
+    }
+
     fn client(&self) -> Option<C> {
         self.last_client.borrow().clone()
     }
