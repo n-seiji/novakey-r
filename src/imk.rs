@@ -1,8 +1,5 @@
 #![allow(unsafe_code)]
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-use objc2::rc::{Allocated, Id};
+use objc2::rc::{Allocated, Id, WeakId};
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{
     declare_class, extern_class, msg_send_id, mutability, sel, ClassType, DeclaredClass,
@@ -14,6 +11,7 @@ use crate::imk_client::Client;
 use crate::input::{self, Route};
 use crate::llm_bridge;
 use crate::platform;
+use crate::registry::Registry;
 use crate::session::{ConversionMode, RerankJob};
 use crate::trace;
 
@@ -21,8 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static CONTROLLERS: RefCell<HashMap<u64, Id<NovakeyRInputController>>> =
-        RefCell::new(HashMap::new());
+    static CONTROLLERS: Registry<WeakId<NovakeyRInputController>> = Registry::new();
     static CREDENTIALS_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AI_RERANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -31,14 +28,9 @@ const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
 
 fn dispatch_llm_result(controller_id: u64, generation: u64, status: i32, text: &str) {
     CONTROLLERS.with(|c| {
-        // run loop が入れ子で回って登録処理の途中に再入しても、abort せず結果を捨てる。
-        let Ok(controllers) = c.try_borrow() else {
-            return;
-        };
-        let Some(controller) = controllers.get(&controller_id) else {
-            return;
-        };
-        controller.handle_llm_result(generation, status, text);
+        c.deliver(controller_id, |weak| weak.load(), |controller| {
+            controller.handle_llm_result(generation, status, text);
+        });
     });
 }
 
@@ -125,7 +117,18 @@ impl Environment for PlatformEnv {
 }
 
 pub struct Ivars {
+    id: u64,
     controller: Controller<Client, PlatformPanel, PlatformEnv>,
+}
+
+/// objc2 は Ivars が Drop を持つとき dealloc を生成し、そこで drop する。登録簿から外し、AI 要求を取り消す。
+impl Drop for Ivars {
+    fn drop(&mut self) {
+        platform::guard(|| (), || {
+            let _ = CONTROLLERS.try_with(|c| c.remove(self.id));
+            llm_bridge::cancel(self.id);
+        });
+    }
 }
 
 declare_class!(
@@ -152,6 +155,7 @@ declare_class!(
             platform::guard(|| None, || {
                 let controller_id = NEXT_CONTROLLER_ID.fetch_add(1, Ordering::SeqCst);
                 let this = this.set_ivars(Ivars {
+                    id: controller_id,
                     controller: Controller::new(
                         controller_id,
                         new_session(ConversionMode::Space, 0),
@@ -164,11 +168,10 @@ declare_class!(
                     msg_send_id![super(this), initWithServer: server, delegate: delegate, client: client]
                 };
                 if let Some(ref obj) = this {
-                    CONTROLLERS.with(|c| match c.try_borrow_mut() {
-                        Ok(mut controllers) => {
-                            controllers.insert(controller_id, obj.clone());
+                    CONTROLLERS.with(|c| {
+                        if !c.insert(controller_id, WeakId::from_id(obj)) {
+                            platform::log("controller registry busy; AI results disabled for this controller");
                         }
-                        Err(_) => platform::log("controller registry busy; AI results disabled for this controller"),
                     });
                 }
                 this
@@ -357,6 +360,27 @@ mod tests {
     fn the_controller_class_registers_with_imk_overrides() {
         // debug ビルドの objc2 は、上書きしたメソッドの型を IMKInputController 側と照合する。
         let _ = NovakeyRInputController::class();
+    }
+
+    #[test]
+    fn dropping_a_controller_removes_it_from_the_registry() {
+        // 実際の dealloc で Ivars の Drop が走り、登録簿から外れることの確認。
+        use objc2::msg_send_id;
+        use objc2::rc::Id;
+        use objc2::runtime::AnyObject;
+
+        use super::CONTROLLERS;
+
+        let before = CONTROLLERS.with(|c| c.len());
+        let null: *mut AnyObject = std::ptr::null_mut();
+        // SAFETY: nil の server / delegate / client で親の指定イニシャライザを呼ぶ (IMK 本体なしのテスト用)。
+        let controller: Option<Id<NovakeyRInputController>> = unsafe {
+            msg_send_id![NovakeyRInputController::alloc(), initWithServer: null, delegate: null, client: null]
+        };
+        let controller = controller.expect("init");
+        assert_eq!(CONTROLLERS.with(|c| c.len()), before + 1);
+        drop(controller);
+        assert_eq!(CONTROLLERS.with(|c| c.len()), before);
     }
 
     #[test]

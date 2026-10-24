@@ -15,6 +15,7 @@ mod loanword;
 mod outbound;
 mod platform;
 mod private_fs;
+mod registry;
 mod rerank;
 mod romaji_converter;
 mod session;
