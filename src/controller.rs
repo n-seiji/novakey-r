@@ -38,6 +38,9 @@ pub trait CandidatePanel {
 /// アプリ全体の状態・外部への出口。
 pub trait Environment {
     fn secure_input(&self) -> bool;
+    /// ライブ変換が有効か。アプリ全体で 1 つの設定 (全コントローラが共有し、再起動後も残る)。
+    fn live_conversion(&self) -> bool;
+    fn set_live_conversion(&self, enabled: bool);
     /// AI 並べ替えが有効で、認証情報も揃っているか。
     fn rerank_allowed(&self) -> bool;
     fn log(&self, line: &str);
@@ -139,6 +142,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     pub fn on_key(&self, route: Route, client: C) -> bool {
         if route != Route::PassThrough {
             *self.last_client.borrow_mut() = Some(client.clone());
+            self.sync_conversion_mode();
         }
         match route {
             Route::PassThrough => false,
@@ -150,7 +154,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                 let has_pending = self.session.borrow().has_pending();
                 self.env.trace(
                     "handleEvent",
-                    &format!("key=Navigation phase={:?} handled={has_pending}", self.phase()),
+                    &format!("id={} mode={:?} key=Navigation phase={:?} handled={has_pending}", self.id, self.mode(), self.phase()),
                 );
                 has_pending
             }
@@ -187,12 +191,20 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.run(effects, client.as_ref());
     }
 
+    /// 全体の設定を反転して保存し、このコントローラにも反映する。ほかのコントローラは次のキーかメニューで追従する。
     pub fn on_toggle_conversion_mode(&self) {
-        let effects = {
-            let mut session = self.session.borrow_mut();
-            let live = session.mode() != ConversionMode::Live;
-            session.set_live(live)
-        };
+        self.env.set_live_conversion(!self.env.live_conversion());
+        self.sync_conversion_mode();
+        self.env.trace("toggleConversionMode", &format!("id={} mode={:?}", self.id, self.mode()));
+    }
+
+    /// 全体の設定とこのコントローラのモードが食い違っていれば、設定に合わせる。
+    pub fn sync_conversion_mode(&self) {
+        let live = self.env.live_conversion();
+        if (self.mode() == ConversionMode::Live) == live {
+            return;
+        }
+        let effects = self.session.borrow_mut().set_live(live);
         if let Some(client) = self.client() {
             self.run(effects, Some(&client));
         }
@@ -245,12 +257,14 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         match action {
             None => self.env.trace(
                 "handleEvent",
-                &format!("key={} phase={phase:?} action=Romaji handled={handled}", key.name()),
+                &format!("id={} mode={:?} key={} phase={phase:?} action=Romaji handled={handled}", self.id, self.mode(), key.name()),
             ),
             Some(action) => self.env.trace(
                 "handleEvent",
                 &format!(
-                    "key={} phase={phase:?} action={} handled={handled} now={:?}",
+                    "id={} mode={:?} key={} phase={phase:?} action={} handled={handled} now={:?}",
+                    self.id,
+                    self.mode(),
                     key.name(),
                     action.name(),
                     self.phase()
@@ -410,6 +424,47 @@ mod tests {
     }
 
     #[test]
+    fn ライブ変換の切り替えは全体設定として保存される() {
+        let f = fixture();
+        assert!(!f.0.env.live_conversion());
+        f.0.on_toggle_conversion_mode();
+        assert!(f.0.env.live_conversion());
+        f.0.on_toggle_conversion_mode();
+        assert!(!f.0.env.live_conversion());
+    }
+
+    #[test]
+    fn 別のコントローラで切り替えても_次のキーでライブ変換に追従する() {
+        let a = fixture();
+        let b = Controller::new(2, new_session(ConversionMode::Space, 0), FakePanel::default(), a.0.env.clone());
+        let client = FakeClient::default();
+        b.on_key(Route::Navigation, client.clone());
+        a.0.on_key(Route::Navigation, a.1.clone());
+
+        a.0.on_toggle_conversion_mode();
+        assert_eq!(b.mode(), ConversionMode::Space);
+        b.on_key(Route::Navigation, client);
+
+        assert_eq!(b.mode(), ConversionMode::Live);
+    }
+
+    #[test]
+    fn 保存済みの設定がライブなら_スペース変換で作ったコントローラも最初のキーでライブになる() {
+        let f = fixture();
+        f.0.env.set_live_conversion(true);
+        assert_eq!(f.0.mode(), ConversionMode::Space);
+        f.0.on_key(Route::Navigation, f.1.clone());
+        assert_eq!(f.0.mode(), ConversionMode::Live);
+    }
+
+    #[test]
+    fn 設定が未保存なら_ライブ変換はオフのまま() {
+        let f = fixture();
+        f.0.on_key(Route::Navigation, f.1.clone());
+        assert_eq!(f.0.mode(), ConversionMode::Space);
+    }
+
+    #[test]
     fn ライブ変換の切り替えはモードを反転する() {
         let f = fixture();
         f.0.on_key(Route::Navigation, f.1.clone());
@@ -459,11 +514,18 @@ mod tests {
         payloads: Rc<RefCell<Vec<(String, Option<&'static str>)>>>,
         cancels: Rc<Cell<usize>>,
         logs: Rc<RefCell<Vec<String>>>,
+        live: Rc<Cell<bool>>,
     }
 
     impl Environment for RecEnv {
         fn secure_input(&self) -> bool {
             self.secure.get()
+        }
+        fn live_conversion(&self) -> bool {
+            self.live.get()
+        }
+        fn set_live_conversion(&self, enabled: bool) {
+            self.live.set(enabled);
         }
         fn rerank_allowed(&self) -> bool {
             self.allowed.get()

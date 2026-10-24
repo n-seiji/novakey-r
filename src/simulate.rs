@@ -241,6 +241,8 @@ pub(crate) struct FakeEnv(Rc<RefCell<EnvState>>);
 #[derive(Default)]
 pub(crate) struct EnvState {
     pub rerank: bool,
+    /// ライブ変換の全体設定。ユーザー defaults の代わり (既定は Space = false)。
+    pub live: bool,
     /// 送られて、まだ取り消されていない AI 要求の世代 (古い順)。
     pub sent: Vec<u64>,
     /// `sent` と同じ順の、送られた候補列。
@@ -252,6 +254,14 @@ pub(crate) struct EnvState {
 impl Environment for FakeEnv {
     fn secure_input(&self) -> bool {
         false
+    }
+
+    fn live_conversion(&self) -> bool {
+        self.0.borrow().live
+    }
+
+    fn set_live_conversion(&self, enabled: bool) {
+        self.0.borrow_mut().live = enabled;
     }
 
     fn rerank_allowed(&self) -> bool {
