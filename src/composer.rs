@@ -134,6 +134,10 @@ impl<E: CandidateEngine> Composer<E> {
         self.live = live;
     }
 
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
     pub fn phase(&self) -> Phase {
         self.phase
     }
