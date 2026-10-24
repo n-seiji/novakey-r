@@ -1,10 +1,9 @@
 //! AI 並べ替えの実行部分。判断は `rerank::State`、ここは Keychain (security-framework)・HTTPS (ureq + rustls)・
 //! ワーカースレッド・メインスレッドへの結果配信を受け持つ。unsafe は持たない (メインキューへの投入は `platform`)。
 //!
-//! 契約: 結果ハンドラはメインスレッドで呼ばれる。認証情報・トークン・リクエスト本文はログに出さない。
+//! 契約: 結果は `MainQueue` を通ってメインスレッドへ渡る (本番の `TaskQueue` は、ハンドラを呼ぶ直前に世代を見直して古いものを捨てる)。認証情報・トークン・リクエスト本文はログに出さない。
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
@@ -12,10 +11,10 @@ use std::time::Instant;
 use crate::outbound::{self, Decision, Screened};
 use crate::platform;
 use crate::rerank::{
-    self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport, TransportFailure,
+    self, CredentialStore, Credentials, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport, TransportFailure,
 };
 
-pub use crate::rerank::{Availability, STATUS_CREDENTIALS_MISSING, STATUS_OK};
+pub use crate::rerank::{Availability, Choice, Delivery, Unavailable};
 
 /// 時刻の取得元。デバウンスや待ち時間をテストで進められるようにする。
 trait Clock: Send + Sync {
@@ -109,40 +108,45 @@ struct Engine<S: CredentialStore, T: Transport> {
     wake: Condvar,
     transport: T,
     clock: Box<dyn Clock>,
-    /// ワーカーが作った結果。メインキューの drain が取り出す。
-    results: Mutex<VecDeque<Delivery>>,
-    /// 結果が積まれたことをメインスレッドへ知らせる。
-    notify_main: Box<dyn Fn() + Send + Sync>,
+    /// ワーカーが作った結果を、メインスレッドへ渡す。
+    main: Arc<dyn MainQueue>,
     log: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 type KeychainEngine = Engine<KeychainStore, UreqTransport>;
 
-type ResultHandler = fn(controller_id: u64, generation: u64, status: i32, text: &str);
+/// 結果をメインスレッドへ渡す口。`deliver` はワーカーのスレッドから呼ばれる。
+pub trait MainQueue: Send + Sync {
+    fn deliver(&self, d: Delivery);
+}
 
-static RESULT_HANDLER: OnceLock<ResultHandler> = OnceLock::new();
-static SHARED: OnceLock<Arc<KeychainEngine>> = OnceLock::new();
+/// 配信されようとしている結果が、いまも最新の世代のものか。
+type IsCurrent = Arc<dyn Fn(&Delivery) -> bool + Send + Sync>;
+
+/// メインスレッドで動く処理を投入する関数 (本番は `platform::post_to_main`)。
+type Post = Box<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
+
+/// 結果を「メインスレッドで handler を呼ぶ処理」として `post` で投入する。
+/// 投入から実行までの間に取り消されたり新しい世代が来たりした結果は、実行時に捨てる。
+struct TaskQueue {
+    is_current: IsCurrent,
+    post: Post,
+    handler: Arc<dyn Fn(Delivery) + Send + Sync>,
+}
+
+impl MainQueue for TaskQueue {
+    fn deliver(&self, d: Delivery) {
+        let (is_current, handler) = (self.is_current.clone(), self.handler.clone());
+        (self.post)(Box::new(move || {
+            if is_current(&d) {
+                handler(d);
+            }
+        }));
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// 結果ハンドラを登録する。最初の 1 回だけ有効。
-pub fn set_result_handler(f: ResultHandler) {
-    let _ = RESULT_HANDLER.set(f);
-}
-
-/// 共有状態。初回にワーカースレッドを起こす。
-fn shared() -> &'static Arc<KeychainEngine> {
-    SHARED.get_or_init(|| {
-        let engine = Arc::new(Engine::new(KeychainStore, UreqTransport::new(), Box::new(SystemClock), Box::new(notify_main), Box::new(platform::log)));
-        engine.start();
-        engine
-    })
-}
-
-fn notify_main() {
-    platform::run_on_main(drain_results);
 }
 
 /// 送信 1 件ぶんの枠。スレッドが panic しても必ず返す。
@@ -155,17 +159,31 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
 }
 
 impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> Engine<S, T> {
-    fn new(store: S, transport: T, clock: Box<dyn Clock>, notify_main: Box<dyn Fn() + Send + Sync>, log: Box<dyn Fn(&str) + Send + Sync>) -> Self {
-        Self {
-            state: Mutex::new(State::new()),
-            store,
-            wake: Condvar::new(),
-            transport,
-            clock,
-            results: Mutex::new(VecDeque::new()),
-            notify_main,
-            log,
-        }
+    /// `make_main` は、結果の古さを判定する関数を受け取って `MainQueue` を作る (判定にはこのエンジン自身の状態が要る)。
+    fn new(
+        store: S,
+        transport: T,
+        clock: Box<dyn Clock>,
+        log: Box<dyn Fn(&str) + Send + Sync>,
+        make_main: impl FnOnce(IsCurrent) -> Arc<dyn MainQueue>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
+            let weak = weak.clone();
+            let is_current: IsCurrent = Arc::new(move |d| weak.upgrade().is_some_and(|e| e.is_latest(d)));
+            Self {
+                state: Mutex::new(State::new()),
+                store,
+                wake: Condvar::new(),
+                transport,
+                clock,
+                main: make_main(is_current),
+                log,
+            }
+        })
+    }
+
+    fn is_latest(&self, d: &Delivery) -> bool {
+        lock(&self.state).is_latest(d.controller_id, d.generation)
     }
 
     /// ワーカーを起こす。起こせなければ無効化する。
@@ -281,12 +299,7 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
     }
 
     fn push_result(&self, delivery: Delivery) {
-        lock(&self.results).push_back(delivery);
-        (self.notify_main)();
-    }
-
-    fn pop_result(&self) -> Option<Delivery> {
-        lock(&self.results).pop_front()
+        self.main.deliver(delivery);
     }
 
     fn cancel(&self, controller_id: u64) {
@@ -309,67 +322,68 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
     }
 }
 
-/// メインスレッドで呼ばれる。配信までの間に世代が古くなったものは捨てる。
-fn drain_results() {
-    let Some(engine) = SHARED.get() else { return };
-    while let Some(d) = engine.pop_result() {
-        if !lock(&engine.state).is_latest(d.controller_id, d.generation) {
-            continue;
+/// AI 並べ替えの送信側。スケジューラ・ワーカースレッド・Keychain・通信を持つ。
+pub struct RerankService {
+    engine: Arc<KeychainEngine>,
+}
+
+impl RerankService {
+    /// ワーカースレッドを起こす。`handler` は、メインスレッドで、まだ最新の世代の結果に対してだけ呼ばれる。
+    pub fn start(handler: fn(Delivery)) -> Arc<Self> {
+        let engine = Engine::new(KeychainStore, UreqTransport::new(), Box::new(SystemClock), Box::new(platform::log), |is_current| {
+            Arc::new(TaskQueue { is_current, post: Box::new(platform::post_to_main), handler: Arc::new(handler) })
+        });
+        engine.start();
+        Arc::new(Self { engine })
+    }
+
+    /// 組成が終わった・外へ送れない・AI をオフにした、のいずれかで、そのコントローラの要求を捨てる。
+    pub fn cancel(&self, controller_id: u64) {
+        self.engine.cancel(controller_id);
+    }
+
+    pub fn cancel_all(&self) {
+        self.engine.cancel_all();
+    }
+
+    /// トグル ON 時に、認証情報の読み出しをバックグラウンドで始めさせる。待たない。
+    pub fn prepare(&self) {
+        self.engine.prepare();
+    }
+
+    /// 今分かっている状態を返すだけで、Keychain には触れない (読み出し中・未読込は使えるとみなす)。
+    pub fn availability(&self) -> Availability {
+        lock(&self.engine.state).availability(self.engine.clock.now())
+    }
+
+    /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済み・キャッシュ命中なら何もしない)。
+    /// 結果は後でメインスレッドのハンドラに届く。
+    pub fn submit(&self, controller_id: u64, generation: u64, payload: Screened, urgent: bool) {
+        if payload.candidates().len() < 2 {
+            return;
         }
-        if let Some(handler) = RESULT_HANDLER.get() {
-            handler(d.controller_id, d.generation, d.status, &d.text);
-        }
+        self.engine.submit(Job { controller_id, generation, payload, urgent });
     }
-}
-
-/// 組成が終わった・外へ送れない・AI をオフにした、のいずれかで、そのコントローラの要求を捨てる。
-/// ワーカーをまだ起こしていなければ何もしない。
-pub fn cancel(controller_id: u64) {
-    if let Some(engine) = SHARED.get() {
-        engine.cancel(controller_id);
-    }
-}
-
-pub fn cancel_all() {
-    if let Some(engine) = SHARED.get() {
-        engine.cancel_all();
-    }
-}
-
-/// トグル ON 時に、認証情報の読み出しをバックグラウンドで始めさせる。待たない。
-pub fn prepare() {
-    shared().prepare();
-}
-
-/// 今分かっている状態を返すだけで、Keychain には触れない (読み出し中・未読込は使えるとみなす)。
-pub fn availability() -> Availability {
-    let Some(engine) = SHARED.get() else { return Availability::Ready };
-    lock(&engine.state).availability(engine.clock.now())
-}
-
-/// urgent は Space 押下時用。デバウンスを待たずに送る(送信済み・キャッシュ命中なら何もしない)。
-/// 結果は後でメインスレッドのハンドラに届く。
-pub fn rerank_async(
-    controller_id: u64,
-    generation: u64,
-    payload: Screened,
-    urgent: bool,
-) {
-    if payload.candidates().len() < 2 {
-        return;
-    }
-    shared().submit(Job { controller_id, generation, payload, urgent });
 }
 
 static SMOKE_START: OnceLock<Instant> = OnceLock::new();
 
 /// 実際に 1 回送るスモークテスト (`--test-llm`)。ネットワークを使うので自動テストからは呼ばない。
 pub fn smoke_test() {
-    println!("availability: {:?}", availability());
-    set_result_handler(|_, _, status, text| {
-        println!("status={} text={} elapsed={}ms", status, text, SMOKE_START.get().map_or(0, |t| t.elapsed().as_millis()));
-        std::process::exit(if status == STATUS_OK { 0 } else { 1 });
+    let service = RerankService::start(|d| {
+        let elapsed = SMOKE_START.get().map_or(0, |t| t.elapsed().as_millis());
+        match d.outcome {
+            Ok(choice) => {
+                println!("ok index={} elapsed={}ms", choice.index, elapsed);
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                println!("unavailable={:?} elapsed={}ms", reason, elapsed);
+                std::process::exit(1);
+            }
+        }
     });
+    println!("availability: {:?}", service.availability());
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(15));
         eprintln!("timeout: no terminal status within 15s");
@@ -383,7 +397,7 @@ pub fn smoke_test() {
         std::process::exit(2);
     };
     let _ = SMOKE_START.set(Instant::now());
-    rerank_async(0, 0, payload, true);
+    service.submit(0, 0, payload, true);
     platform::run_main_run_loop();
 }
 
@@ -457,8 +471,22 @@ mod tests {
         }
     }
 
+    /// 配信された結果をためる `MainQueue`。届くたびに `signal` へも知らせる。
+    struct Recorder {
+        results: Mutex<std::collections::VecDeque<Delivery>>,
+        signal: Mutex<mpsc::Sender<()>>,
+    }
+
+    impl MainQueue for Arc<Recorder> {
+        fn deliver(&self, d: Delivery) {
+            lock(&self.results).push_back(d);
+            let _ = lock(&self.signal).send(());
+        }
+    }
+
     struct Harness {
         engine: Arc<Engine<Store, Gate>>,
+        recorder: Arc<Recorder>,
         clock: Arc<ManualClock>,
         slow_started: mpsc::Receiver<()>,
         release: mpsc::Sender<()>,
@@ -469,6 +497,10 @@ mod tests {
     }
 
     impl Harness {
+        fn pop_result(&self) -> Option<Delivery> {
+            lock(&self.recorder.results).pop_front()
+        }
+
         /// 時計を進めてワーカーを起こす。
         fn advance(&self, by: Duration) {
             self.clock.advance(by);
@@ -507,7 +539,8 @@ mod tests {
         let (slow_tx, slow_rx) = mpsc::channel();
         let (rel_tx, rel_rx) = mpsc::channel();
         let (del_tx, del_rx) = mpsc::channel();
-        let del_tx = Mutex::new(del_tx);
+        let recorder = Arc::new(Recorder { results: Mutex::new(Default::default()), signal: Mutex::new(del_tx) });
+        let main = recorder.clone();
         let logs = Arc::new(Mutex::new(Vec::new()));
         let log_sink = logs.clone();
         let clock = Arc::new(ManualClock(Mutex::new(Instant::now())));
@@ -516,17 +549,15 @@ mod tests {
             entered: Mutex::new(entered_tx),
             release: hang_store.then(|| Mutex::new(store_rel_rx)),
         };
-        let engine = Arc::new(Engine::new(
+        let engine = Engine::new(
             store,
             Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on, script: Mutex::new(None), posts: Default::default() },
             Box::new(clock.clone()),
-            Box::new(move || {
-                let _ = lock(&del_tx).send(());
-            }),
             Box::new(move |m| lock(&log_sink).push(m.to_string())),
-        ));
+            |_| Arc::new(main),
+        );
         engine.start();
-        Harness { engine, clock, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs, store_entered: entered_rx, store_release: store_rel_tx }
+        Harness { engine, recorder, clock, slow_started: slow_rx, release: rel_tx, delivered: del_rx, logs, store_entered: entered_rx, store_release: store_rel_tx }
     }
 
     fn job(id: u64, generation: u64, reading: &str) -> Job {
@@ -537,6 +568,88 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    type Task = Box<dyn FnOnce() + Send>;
+
+    /// 結果を `TaskQueue` 経由で渡す。投入された処理は channel にたまり、テストが「メインスレッドで実行」する。
+    struct MainSim {
+        engine: Arc<Engine<Store, Gate>>,
+        tasks: mpsc::Receiver<Task>,
+        handled: Arc<Mutex<Vec<Delivery>>>,
+    }
+
+    fn main_sim() -> MainSim {
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (slow_tx, _slow_rx) = mpsc::channel();
+        let (_rel_tx, rel_rx) = mpsc::channel();
+        let (task_tx, tasks) = mpsc::channel::<Task>();
+        let task_tx = Mutex::new(task_tx);
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let sink = handled.clone();
+        let engine = Engine::new(
+            Store { threads: Mutex::new(Vec::new()), entered: Mutex::new(entered_tx), release: None },
+            Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on: None, script: Mutex::new(None), posts: Default::default() },
+            Box::new(Arc::new(ManualClock(Mutex::new(Instant::now())))),
+            Box::new(|_| {}),
+            |is_current| {
+                Arc::new(TaskQueue {
+                    is_current,
+                    post: Box::new(move |task| {
+                        let _ = lock(&task_tx).send(task);
+                    }),
+                    handler: Arc::new(move |d| lock(&sink).push(d)),
+                })
+            },
+        );
+        engine.start();
+        MainSim { engine, tasks, handled }
+    }
+
+    #[test]
+    fn a_result_reaches_the_handler_when_main_runs_it() {
+        let m = main_sim();
+        m.engine.submit(job(1, 1, "fast"));
+        let task = m.tasks.recv_timeout(WAIT).expect("結果がメインへ投入される");
+        assert!(lock(&m.handled).is_empty(), "メインが実行するまで handler は呼ばれない");
+        task();
+        let handled = lock(&m.handled);
+        assert_eq!(handled.len(), 1);
+        assert_eq!((handled[0].controller_id, handled[0].generation), (1, 1));
+        assert_eq!(handled[0].outcome, Ok(Choice { index: 1, text: "b".into() }));
+    }
+
+    #[test]
+    fn a_result_cancelled_while_waiting_for_main_is_dropped() {
+        let m = main_sim();
+        m.engine.submit(job(1, 1, "fast"));
+        let task = m.tasks.recv_timeout(WAIT).expect("結果がメインへ投入される");
+        m.engine.cancel(1);
+        task();
+        assert!(lock(&m.handled).is_empty(), "取り消しのあとに届いた結果は捨てる");
+    }
+
+    #[test]
+    fn a_result_superseded_while_waiting_for_main_is_dropped() {
+        let m = main_sim();
+        m.engine.submit(job(1, 1, "fast"));
+        let old = m.tasks.recv_timeout(WAIT).expect("結果がメインへ投入される");
+        m.engine.submit(job(1, 2, "fast2"));
+        let new = m.tasks.recv_timeout(WAIT).expect("新しい世代の結果も投入される");
+        old();
+        assert!(lock(&m.handled).is_empty(), "古い世代の結果は捨てる");
+        new();
+        assert_eq!(lock(&m.handled).iter().map(|d| d.generation).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn cancel_all_drops_results_waiting_for_main() {
+        let m = main_sim();
+        m.engine.submit(job(1, 1, "fast"));
+        let task = m.tasks.recv_timeout(WAIT).expect("結果がメインへ投入される");
+        m.engine.cancel_all();
+        task();
+        assert!(lock(&m.handled).is_empty());
+    }
 
     #[test]
     fn credentials_are_read_off_the_calling_thread_and_only_once() {
@@ -578,8 +691,8 @@ mod tests {
         let _ = h.store_release.send(());
         h.engine.submit(job(1, 3, "fast3"));
         h.delivered.recv_timeout(WAIT).expect("読み出しが済めば送れる");
-        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(3), "取り消した世代 2 の結果は届かない");
-        assert!(h.engine.pop_result().is_none());
+        assert_eq!(h.pop_result().map(|d| d.generation), Some(3), "取り消した世代 2 の結果は届かない");
+        assert!(h.pop_result().is_none());
     }
 
     #[test]
@@ -589,12 +702,12 @@ mod tests {
         h.slow_started.recv_timeout(WAIT).expect("古い送信が始まる");
         h.engine.submit(job(1, 2, "fast"));
         h.delivered.recv_timeout(WAIT).expect("古い送信が詰まっていても新しい結果が届く");
-        let d = h.engine.pop_result().expect("結果");
-        assert_eq!((d.generation, d.status), (2, rerank::STATUS_OK));
+        let d = h.pop_result().expect("結果");
+        assert_eq!((d.generation, d.outcome.is_ok()), (2, true));
         let _ = h.release.send(());
         // 古い世代の結果は、返ってきても配信されない。送信スレッドが終わる (枠が返る) のを待ってから確かめる。
         h.wait_idle();
-        assert!(h.engine.pop_result().is_none());
+        assert!(h.pop_result().is_none());
     }
 
     #[test]
@@ -605,7 +718,7 @@ mod tests {
         h.engine.cancel(1);
         let _ = h.release.send(());
         h.wait_idle();
-        assert!(h.engine.pop_result().is_none(), "送信中だった要求の結果は採用しない");
+        assert!(h.pop_result().is_none(), "送信中だった要求の結果は採用しない");
         // デバウンス中 (まだ送っていない) の要求も消える。時計を十分進めても何も送られない。
         let mut j = job(2, 1, "fast");
         j.urgent = false;
@@ -616,7 +729,7 @@ mod tests {
         assert!(state.next_deadline().is_none());
         assert!(state.take_due(h.clock.now()).is_empty());
         drop(state);
-        assert!(h.engine.pop_result().is_none());
+        assert!(h.pop_result().is_none());
     }
 
     #[test]
@@ -634,7 +747,7 @@ mod tests {
         assert!(state.next_deadline().is_none());
         assert!(state.take_due(h.clock.now()).is_empty());
         drop(state);
-        assert!(h.engine.pop_result().is_none());
+        assert!(h.pop_result().is_none());
     }
 
     #[test]
@@ -649,7 +762,7 @@ mod tests {
         assert_eq!(lock(&h.engine.state).next_deadline(), Some(t0 + rerank::DEBOUNCE), "期限は注入した時計から決まる");
         h.advance(rerank::DEBOUNCE);
         h.delivered.recv_timeout(WAIT).expect("時計が期限に達すると送られる");
-        assert_eq!(h.engine.pop_result().map(|d| d.generation), Some(1));
+        assert_eq!(h.pop_result().map(|d| d.generation), Some(1));
     }
 
     #[test]
@@ -681,7 +794,7 @@ mod tests {
         assert_eq!(lock(&h.engine.state).availability(h.clock.now()), Availability::Disabled);
         h.engine.submit(job(1, 2, "fast"));
         h.engine.submit(job(1, 3, "fast"));
-        assert!(h.engine.pop_result().is_none(), "無効化後は何も送らない");
+        assert!(h.pop_result().is_none(), "無効化後は何も送らない");
         assert!(lock(&h.engine.state).next_deadline().is_none(), "ジョブを溜めない");
         let logs = lock(&h.logs);
         assert_eq!(logs.iter().filter(|m| m.contains("disabled")).count(), 1, "{logs:?}");
@@ -706,7 +819,7 @@ mod tests {
         h.wait_until("認証情報が拒否される", |s| s.availability(Instant::now()) == Availability::CredentialsRejected);
         h.wait_idle();
         assert_eq!(h.posts(), 1);
-        assert!(h.engine.pop_result().is_none(), "拒否された要求の結果は配信しない");
+        assert!(h.pop_result().is_none(), "拒否された要求の結果は配信しない");
         h.engine.submit(job(1, 2, "fast2"));
         h.engine.submit(job(1, 3, "fast3"));
         h.engine.cancel(1);
@@ -735,7 +848,7 @@ mod tests {
         h.script(None);
         h.engine.submit(job(1, 2, "fast2"));
         assert_eq!(h.posts(), 1, "止めている間は送らない");
-        assert!(h.engine.pop_result().is_none());
+        assert!(h.pop_result().is_none());
         h.advance(Duration::from_secs(59));
         assert_eq!(lock(&h.engine.state).availability(h.clock.now()), Availability::Paused);
         h.advance(Duration::from_secs(1));
@@ -753,11 +866,11 @@ mod tests {
         h.script(Some(Err(TransportFailure::Timeout)));
         h.engine.submit(job(1, 1, "fast"));
         h.delivered.recv_timeout(WAIT).expect("失敗が届く");
-        assert_eq!(h.engine.pop_result().map(|d| d.status), Some(rerank::STATUS_FAILED));
+        assert_eq!(h.pop_result().map(|d| d.outcome), Some(Err(Unavailable::Failed)));
         h.script(None);
         h.engine.submit(job(1, 2, "fast2"));
         h.delivered.recv_timeout(WAIT).expect("次の要求は普通に送られる");
-        assert_eq!(h.engine.pop_result().map(|d| d.status), Some(rerank::STATUS_OK));
+        assert_eq!(h.pop_result().map(|d| d.outcome.is_ok()), Some(true));
         assert_eq!(h.posts(), 2, "再送しない");
     }
 
@@ -769,7 +882,7 @@ mod tests {
             h.engine.submit(job(1, g, &format!("fast{g}")));
             h.delivered.recv_timeout(WAIT).expect("失敗が届く");
             h.wait_idle();
-            let _ = h.engine.pop_result();
+            let _ = h.pop_result();
         }
         assert_eq!(lock(&h.engine.state).availability(Instant::now()), Availability::Disabled);
         h.engine.submit(job(1, 4, "fast4"));

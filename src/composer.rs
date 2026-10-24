@@ -6,6 +6,7 @@
 
 use crate::deps::Lexicon;
 use crate::english_split;
+use crate::rerank::Choice;
 use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::symbols;
 use crate::translit::{self, Form};
@@ -764,15 +765,20 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         &mut self.engine
     }
 
-    /// LLM が選んだ表示位置 display_index を先頭へ昇格する。display_index は要求時の候補列(raw なし)での位置。
+    /// LLM が選んだ候補 `choice` を先頭へ昇格する。`choice.index` は要求時の候補列(raw なし)での位置で、
+    /// その位置の文字列が `choice.text` と違えば (同じ世代でも並びが変わっていれば) 反映しない。
     /// live なら即反映して新しい表示を返す。非 live では保留し、最初の変換時に反映する。
     /// 変換済みでも、まだ送りも選択もしていない(先頭選択でウィンドウなし)間は反映する。
-    pub fn apply_rerank(&mut self, generation: u64, display_index: usize) -> Option<String> {
+    pub fn apply_rerank(&mut self, generation: u64, choice: &Choice) -> Option<String> {
+        let display_index = choice.index;
         if generation != self.reading.generation || display_index == 0 {
             return None;
         }
         match &self.stage {
-            Stage::Editing if self.typing == Typing::Kana && display_index < self.reading.list.len() => {
+            Stage::Editing
+                if self.typing == Typing::Kana
+                    && self.reading.list.get(display_index).is_some_and(|c| c.text == choice.text) =>
+            {
                 if self.live {
                     Self::promote(&mut self.reading.list, display_index);
                     Some(self.display().to_string())
@@ -782,7 +788,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 }
             }
             Stage::Selecting(Selection { cursor: 0, window: false, .. }) => {
-                self.promote_converting(display_index)
+                self.promote_converting(display_index, &choice.text)
             }
             _ => None,
         }
@@ -794,7 +800,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 変換済み候補列から raw・英単語・絵文字(engine 以外)を一旦外して display_index 番目を先頭へ昇格し、
     /// raw・英単語は第 1 候補の直後へ、絵文字は元の位置規則どおりに戻す。
-    fn promote_converting(&mut self, display_index: usize) -> Option<String> {
+    fn promote_converting(&mut self, display_index: usize, text: &str) -> Option<String> {
         let Stage::Selecting(selection) = &mut self.stage else {
             return None;
         };
@@ -804,7 +810,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let (emoji, extras): (Vec<Candidate>, Vec<Candidate>) = extras
             .into_iter()
             .partition(|c| c.source == Source::Emoji);
-        let promoted = display_index < list.len();
+        let promoted = list.get(display_index).is_some_and(|c| c.text == text);
         if promoted {
             Self::promote(&mut list, display_index);
         }
@@ -979,6 +985,11 @@ mod tests {
         c.push_input("k", "", "");
         c.push_input("yo", "きょ", "");
         c.push_input("u", "う", "");
+    }
+
+    /// `type_kyou` で要求する候補列 (今日・京・教) の index 番目を選んだ結果。範囲外は text が空。
+    fn ch(index: usize) -> Choice {
+        Choice { index, text: ["今日", "京", "教"].get(index).copied().unwrap_or("").to_string() }
     }
 
     fn texts(c: &Composer<MockEngine, FakeLexicon>) -> Vec<&str> {
@@ -1337,7 +1348,7 @@ mod tests {
         let (mut c, log) = composer();
         type_kyou(&mut c);
         let generation = c.current_generation();
-        assert_eq!(c.apply_rerank(generation, 1), None);
+        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
         assert_eq!(c.display(), "きょう");
         assert_eq!(texts(&c), vec!["今日", "京", "教"]);
         c.begin_conversion();
@@ -1352,8 +1363,8 @@ mod tests {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let generation = c.current_generation();
-        c.apply_rerank(generation, 1);
-        c.apply_rerank(generation, 2);
+        c.apply_rerank(generation, &ch(1));
+        c.apply_rerank(generation, &ch(2));
         c.begin_conversion();
         assert_eq!(c.display(), "教");
     }
@@ -1363,7 +1374,7 @@ mod tests {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let generation = c.current_generation();
-        c.apply_rerank(generation, 1);
+        c.apply_rerank(generation, &ch(1));
         c.push_input("ha", "は", "");
         c.begin_conversion();
         assert_eq!(c.display(), "きょうはK1");
@@ -1375,7 +1386,7 @@ mod tests {
         type_kyou(&mut c);
         let generation = c.current_generation();
         c.begin_conversion();
-        assert_eq!(c.apply_rerank(generation, 2), Some("教".to_string()));
+        assert_eq!(c.apply_rerank(generation, &ch(2)), Some("教".to_string()));
         assert_eq!(texts(&c), vec!["教", "kyou", "今日", "京"]);
         assert_eq!(
             c.phase(),
@@ -1395,7 +1406,7 @@ mod tests {
         let generation = c.current_generation();
         c.begin_conversion();
         c.advance();
-        assert_eq!(c.apply_rerank(generation, 2), None);
+        assert_eq!(c.apply_rerank(generation, &ch(2)), None);
         assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
     }
 
@@ -1406,7 +1417,7 @@ mod tests {
         let generation = c.current_generation();
         c.begin_conversion();
         assert!(c.select_candidate(2));
-        assert_eq!(c.apply_rerank(generation, 1), None);
+        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
         assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
         assert_eq!(c.display(), "京");
     }
@@ -1418,14 +1429,14 @@ mod tests {
         let old = c.current_generation();
         c.push_input("ha", "は", "");
         c.begin_conversion();
-        assert_eq!(c.apply_rerank(old, 1), None);
+        assert_eq!(c.apply_rerank(old, &ch(1)), None);
 
         let (mut c2, _) = composer();
         type_kyou(&mut c2);
         let gen2 = c2.current_generation();
         c2.begin_conversion();
-        assert_eq!(c2.apply_rerank(gen2, 99), None);
-        assert_eq!(c2.apply_rerank(gen2, 0), None);
+        assert_eq!(c2.apply_rerank(gen2, &ch(99)), None);
+        assert_eq!(c2.apply_rerank(gen2, &ch(0)), None);
         assert_eq!(texts(&c2), vec!["今日", "kyou", "京", "教"]);
     }
 
@@ -1435,7 +1446,7 @@ mod tests {
         c.set_live(true);
         type_kyou(&mut c);
         let generation = c.current_generation();
-        assert_eq!(c.apply_rerank(generation, 1), Some("京".to_string()));
+        assert_eq!(c.apply_rerank(generation, &ch(1)), Some("京".to_string()));
         assert_eq!(c.display(), "京");
         assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(1)));
         assert_eq!(c.candidates()[1].text, "今日");
@@ -1444,18 +1455,43 @@ mod tests {
     }
 
     #[test]
+    fn 同じ世代でも候補の文字列が違えばリランキングは適用しない() {
+        let wrong = Choice { index: 1, text: "教".into() };
+
+        let (mut live, _) = composer();
+        live.set_live(true);
+        type_kyou(&mut live);
+        let generation = live.current_generation();
+        assert_eq!(live.apply_rerank(generation, &wrong), None);
+        assert_eq!(texts(&live), vec!["今日", "京", "教"]);
+
+        let (mut held, _) = composer();
+        type_kyou(&mut held);
+        let generation = held.current_generation();
+        assert_eq!(held.apply_rerank(generation, &wrong), None);
+        assert!(!held.has_pending_rerank());
+
+        let (mut converted, _) = composer();
+        type_kyou(&mut converted);
+        let generation = converted.current_generation();
+        converted.begin_conversion();
+        assert_eq!(converted.apply_rerank(generation, &wrong), None);
+        assert_eq!(texts(&converted), vec!["今日", "kyou", "京", "教"]);
+    }
+
+    #[test]
     fn リランキングは旧世代_範囲外_先頭指定で無効() {
         let (mut c, _) = composer();
         type_kyou(&mut c);
         let old = c.current_generation();
         c.push_input("ha", "は", "");
-        assert_eq!(c.apply_rerank(old, 1), None);
+        assert_eq!(c.apply_rerank(old, &ch(1)), None);
 
         let (mut c2, _) = composer();
         type_kyou(&mut c2);
         let gen2 = c2.current_generation();
-        assert_eq!(c2.apply_rerank(gen2, 99), None);
-        assert_eq!(c2.apply_rerank(gen2, 0), None);
+        assert_eq!(c2.apply_rerank(gen2, &ch(99)), None);
+        assert_eq!(c2.apply_rerank(gen2, &ch(0)), None);
         c2.begin_conversion();
         assert_eq!(c2.display(), "今日");
     }
@@ -1467,7 +1503,7 @@ mod tests {
         type_kyou(&mut c);
         let generation = c.current_generation();
         c.revert();
-        assert_eq!(c.apply_rerank(generation, 1), None);
+        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
     }
 
     use crate::keymap::{action_for, Action, Key};
@@ -1953,7 +1989,7 @@ mod tests {
         let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ"]);
         c.push_input("desukutoppu", "ですくとっぷ", "");
         c.begin_conversion();
-        assert_eq!(c.apply_rerank(c.current_generation(), 1).as_deref(), Some("デス区トップ"));
+        assert_eq!(c.apply_rerank(c.current_generation(), &Choice { index: 1, text: "デス区トップ".into() }).as_deref(), Some("デス区トップ"));
         assert_eq!(
             texts(&c),
             vec!["デス区トップ", "desktop", "desukutoppu", "デスクトップ"]
@@ -2065,7 +2101,7 @@ mod tests {
         c.push_input("inu", "いぬ", "");
         c.begin_conversion();
         assert_eq!(texts(&c), vec!["犬", "inu", "戌", "乾", "🐶", "伊奴"]);
-        assert_eq!(c.apply_rerank(c.current_generation(), 1).as_deref(), Some("戌"));
+        assert_eq!(c.apply_rerank(c.current_generation(), &Choice { index: 1, text: "戌".into() }).as_deref(), Some("戌"));
         assert_eq!(texts(&c), vec!["戌", "inu", "犬", "乾", "🐶", "伊奴"]);
     }
 
