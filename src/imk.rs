@@ -28,6 +28,8 @@ thread_local! {
 }
 
 const AI_RERANK_KEY: &str = "NovakeyRAIRerankEnabled";
+/// 未設定ならスペース変換 (オフ)。全コントローラで共有する。
+const LIVE_CONVERSION_KEY: &str = "NovakeyRLiveConversionEnabled";
 
 /// AI 並べ替えの送信側。プロセスに 1 つだけ、最初の送信かトグル ON で起こす。
 /// グローバルなのは、IMK のコールバック (Environment を作るのは Cocoa 側) から届く経路がほかにないため。
@@ -99,6 +101,14 @@ impl CandidatePanel for PlatformPanel {
 struct PlatformEnv;
 
 impl Environment for PlatformEnv {
+    fn live_conversion(&self) -> bool {
+        platform::defaults_bool(LIVE_CONVERSION_KEY)
+    }
+
+    fn set_live_conversion(&self, enabled: bool) {
+        platform::set_defaults_bool(LIVE_CONVERSION_KEY, enabled);
+    }
+
     fn secure_input(&self) -> bool {
         platform::is_secure_input_enabled()
     }
@@ -168,7 +178,10 @@ declare_class!(
                     id: controller_id,
                     controller: Controller::new(
                         controller_id,
-                        new_session(ConversionMode::Space, 0),
+                        new_session(
+                            if PlatformEnv.live_conversion() { ConversionMode::Live } else { ConversionMode::Space },
+                            0,
+                        ),
                         PlatformPanel,
                         PlatformEnv,
                     ),
@@ -251,6 +264,7 @@ declare_class!(
         #[method_id(menu)]
         fn menu(&self) -> Id<AnyObject> {
             platform::guard(|| platform::build_menu(&[], None), || {
+                self.ivars().controller.sync_conversion_mode();
                 let mode_title = match self.ivars().controller.mode() {
                     ConversionMode::Live => "ライブ変換: オン",
                     ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
