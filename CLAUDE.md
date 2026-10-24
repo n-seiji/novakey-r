@@ -24,6 +24,7 @@ Tasks are defined in `mise.toml`.
 - `mise run simulate -- 'kyouha<space><enter>'` - Run a key sequence through the real key path without Cocoa (`NOVAKEY_SIM_LEARNING=1` to enable learning)
   - Besides keys, the sequence takes IMK-side event tokens (numbers are 1-based): `<pick:N>` (click a candidate), `<highlight:N>`, `<live>` / `<space-mode>`, `<commit-all>` (commitComposition), `<ai-on>` (first token; pretend AI re-rank is on, sends are only recorded), `<rerank:N>` / `<rerank-old:N>` (a re-rank result arrives for the latest / first request). See the header of `src/simulate.rs`.
 - `mise run wysiwyg` - Same files with `--check-preedit` (also valid for `--simulate`): after each key, if no romaji is pending, the underlined text must equal what Enter would commit (`Composer::preedit` vs `commit_preview`); a break fails the line as `WYSI`
+- `mise run main-queue` - Post tasks from another thread with `platform::run_on_main_boxed` and check they run on the main thread, in order, with a panic in one not stopping the rest (no network)
 - `mise run kkc-compare` - Compare the Rust engine against the Swift golden data in `tools/golden/` (top-1/3/9 must stay at 100%)
 - Other dev tools: `--kkc-check`, `--kkc-convert <reading>`, `--kkc-bench <reading>` (run `./target/release/novakey_r <flag>`)
 - Never run `mise run test-llm` / `--test-llm` or enable AI re-rank in automated checks: they call the real Cloudflare API. Tests inject fakes.

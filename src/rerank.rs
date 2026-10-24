@@ -33,6 +33,8 @@ pub enum Availability {
     CredentialsMissing,
     CredentialsRejected,
     Paused,
+    /// 設定の誤りなどで失敗が続いて止めた。トグルの入れ直しで再開する。
+    ErrorsPersisted,
     /// 送信スレッドなどが落ちて、以後は何も送らない。
     Disabled,
 }
@@ -218,10 +220,17 @@ pub struct InFlight {
 
 /// 選ばれた候補。`index` は要求した候補列での位置、`text` はその位置にあった文字列。
 /// 受け取り側は text も照合し、候補の並びが変わっていたら適用しない。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Choice {
     pub index: usize,
     pub text: String,
+}
+
+/// text はユーザーの候補文字列なので、Debug には出さない。
+impl fmt::Debug for Choice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Choice").field("index", &self.index).field("text", &format_args!("..")).finish()
+    }
 }
 
 impl Choice {
@@ -238,11 +247,25 @@ pub enum Unavailable {
 }
 
 /// メインスレッドへ返す結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub controller_id: u64,
     pub generation: u64,
     pub outcome: Result<Choice, Unavailable>,
+}
+
+impl fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let outcome = match &self.outcome {
+            Ok(choice) => format!("Ok(index {})", choice.index),
+            Err(reason) => format!("Err({reason:?})"),
+        };
+        f.debug_struct("Delivery")
+            .field("controller_id", &self.controller_id)
+            .field("generation", &self.generation)
+            .field("outcome", &format_args!("{outcome}"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -288,7 +311,9 @@ enum Health {
     PausedUntil(Instant),
     /// 401 / 403。認証情報の読み直し (トグルの入れ直し) まで送らない。
     Rejected,
-    /// 落ちた・失敗が続いた。以後は何も受け付けない。
+    /// その他の失敗が続いた。トグルの入れ直しで数え直して再開する。
+    GivenUp,
+    /// 送信スレッドが落ちた。以後は何も受け付けない。
     Disabled,
 }
 
@@ -338,6 +363,7 @@ impl State {
         match self.health {
             Health::Disabled => return Availability::Disabled,
             Health::Rejected => return Availability::CredentialsRejected,
+            Health::GivenUp => return Availability::ErrorsPersisted,
             Health::PausedUntil(until) if now < until => return Availability::Paused,
             Health::PausedUntil(_) | Health::Ready => {}
         }
@@ -354,6 +380,11 @@ impl State {
         self.health = Health::Disabled;
         self.cancel_all();
         first
+    }
+
+    /// 認証拒否・失敗続き・無効化のいずれかで、通信の結果をもう状態に反映しない。
+    fn is_stopped(&self) -> bool {
+        matches!(self.health, Health::Rejected | Health::GivenUp | Health::Disabled)
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -380,8 +411,9 @@ impl State {
         if self.is_disabled() {
             return;
         }
-        if matches!(self.health, Health::Rejected) {
+        if matches!(self.health, Health::Rejected | Health::GivenUp) {
             self.health = Health::Ready;
+            self.permanent_failures = 0;
             self.creds = CredState::Wanted;
         }
         if matches!(self.creds, CredState::Unknown | CredState::Missing | CredState::Unreadable) {
@@ -399,7 +431,7 @@ impl State {
     }
 
     /// 読み出しの結果を受ける。待っていた要求は、まだ最新のものだけ続きを進める。
-    pub fn credentials_loaded(&mut self, result: Result<Option<Credentials>, StoreError>) -> Loaded {
+    pub fn credentials_loaded(&mut self, now: Instant, result: Result<Option<Credentials>, StoreError>) -> Loaded {
         let loaded = match result {
             Ok(Some(c)) => {
                 self.creds = CredState::Loaded(c.clone());
@@ -421,7 +453,7 @@ impl State {
         let mut waiting: Vec<(u64, Awaiting)> = self.awaiting.drain().collect();
         waiting.sort_unstable_by_key(|(id, _)| *id);
         for (id, a) in waiting {
-            if !self.is_latest(id, a.job.generation) {
+            if !self.is_latest(id, a.job.generation) || !self.may_send(now) {
                 continue;
             }
             let submitted = match &loaded {
@@ -450,15 +482,22 @@ impl State {
         self.latest.get(&id) == Some(&generation)
     }
 
-    pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
-        if job.payload.candidates().len() < 2 {
-            return Submitted::default();
-        }
+    /// 今送信を進めてよいか。止まっている間は `false`。一時停止が明けていれば戻して `true`。
+    fn may_send(&mut self, now: Instant) -> bool {
         match self.health {
-            Health::Disabled | Health::Rejected => return Submitted::default(),
-            Health::PausedUntil(until) if now < until => return Submitted::default(),
-            Health::PausedUntil(_) => self.health = Health::Ready,
-            Health::Ready => {}
+            Health::Disabled | Health::Rejected | Health::GivenUp => false,
+            Health::PausedUntil(until) if now < until => false,
+            Health::PausedUntil(_) => {
+                self.health = Health::Ready;
+                true
+            }
+            Health::Ready => true,
+        }
+    }
+
+    pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
+        if job.payload.candidates().len() < 2 || !self.may_send(now) {
+            return Submitted::default();
         }
         match &self.creds {
             CredState::Loaded(c) => {
@@ -521,6 +560,9 @@ impl State {
     /// 時刻が来た送信を、空き枠の分だけ取り出す。取り出した時点で「送信済み」として数え、枠を埋める。
     /// 残りは待機に残り、枠が返ったあとの呼び出しで取り出す。
     pub fn take_due(&mut self, now: Instant) -> Vec<InFlight> {
+        if !self.may_send(now) {
+            return Vec::new();
+        }
         let free = MAX_IN_FLIGHT.saturating_sub(self.in_flight);
         if free == 0 {
             return Vec::new();
@@ -587,7 +629,7 @@ impl State {
             }
             Err(err) => {
                 let class = err.classify();
-                log = self.note_failure(now, &err, class);
+                log = self.note_failure(now, &sent.creds, &err, class);
                 if matches!(class, FailureClass::AuthRejected | FailureClass::Backoff) {
                     // 止めた要求の結果は配信しない。メインスレッドは availability から状態を知る。
                     return Completed { delivery: None, log };
@@ -600,11 +642,12 @@ impl State {
     }
 
     /// 失敗を状態に反映する。状態が変わったときだけログの 1 行を返す (理由名と数だけ)。
-    fn note_failure(&mut self, now: Instant, err: &FetchError, class: FailureClass) -> Option<String> {
+    fn note_failure(&mut self, now: Instant, creds: &Credentials, err: &FetchError, class: FailureClass) -> Option<String> {
         match class {
             FailureClass::Transient => None,
             FailureClass::AuthRejected => {
-                if matches!(self.health, Health::Rejected | Health::Disabled) {
+                // 読み直した新しい認証情報ではなく、古いもので送った分の拒否は無視する。
+                if !matches!(&self.creds, CredState::Loaded(c) if c == creds) || self.is_stopped() {
                     return None;
                 }
                 self.health = Health::Rejected;
@@ -614,7 +657,7 @@ impl State {
                 Some(format!("LLM rerank stopped: credentials rejected ({})", err.reason()))
             }
             FailureClass::Backoff => {
-                if matches!(self.health, Health::Rejected | Health::Disabled) {
+                if self.is_stopped() {
                     return None;
                 }
                 if matches!(self.health, Health::PausedUntil(until) if now < until) {
@@ -622,15 +665,17 @@ impl State {
                 }
                 self.health = Health::PausedUntil(now + PAUSE);
                 self.pending.clear();
+                self.awaiting.clear();
                 Some(format!("LLM rerank paused for {}s ({})", PAUSE.as_secs(), err.reason()))
             }
             FailureClass::Permanent => {
                 self.permanent_failures += 1;
-                if self.permanent_failures < MAX_PERMANENT_FAILURES || self.is_disabled() {
+                if self.permanent_failures < MAX_PERMANENT_FAILURES || self.is_stopped() {
                     return None;
                 }
-                self.disable()
-                    .then(|| format!("LLM rerank disabled: {} consecutive failures ({})", self.permanent_failures, err.reason()))
+                self.health = Health::GivenUp;
+                self.cancel_all();
+                Some(format!("LLM rerank disabled: {} consecutive failures ({})", self.permanent_failures, err.reason()))
             }
         }
     }
@@ -696,7 +741,7 @@ mod tests {
         /// 頼まれていれば store を読んで結果を渡す (ワーカーの `load_credentials` 相当)。
         fn pump(&mut self) -> Loaded {
             if self.state.take_load_request() {
-                self.state.credentials_loaded(self.store.load())
+                self.state.credentials_loaded(Instant::now(), self.store.load())
             } else {
                 Loaded::default()
             }
@@ -836,7 +881,7 @@ mod tests {
         assert!(s.state.submit(t0, job(1, 2, "あい", false)).delivery.is_none());
         assert!(s.take_load_request());
         assert!(!s.take_load_request(), "読み出しは 1 度しか頼まれない");
-        let loaded = s.state.credentials_loaded(s.store.load());
+        let loaded = s.state.credentials_loaded(Instant::now(), s.store.load());
         assert_eq!(loaded, Loaded::default());
         let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.len(), 1);
@@ -851,7 +896,7 @@ mod tests {
         s.state.submit(t0, job(2, 1, "い", false));
         s.cancel(1);
         assert!(s.take_load_request());
-        let loaded = s.state.credentials_loaded(s.store.load());
+        let loaded = s.state.credentials_loaded(Instant::now(), s.store.load());
         assert_eq!(loaded.deliveries.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![2]);
         assert!(!s.is_latest(1, 1));
         s.state.submit(t0, job(3, 1, "う", false));
@@ -1138,10 +1183,8 @@ mod tests {
         for code in [401, 403] {
             let (mut s, loads) = state(true);
             let t0 = Instant::now();
-            s.submit(t0, job(1, 1, "あ", false));
             s.submit(t0, job(2, 1, "い", false));
-            let sent = s.take_all_due(ms(t0, 250)).remove(0);
-            let done = s.complete(t0, sent, Err(FetchError::Status(code)));
+            let done = fail(&mut s, t0, 1, 1, "あ", FetchError::Status(code));
             assert_eq!(done.delivery, None, "{code}");
             let log = done.log.expect("状態が変わったので 1 度ログを出す");
             assert!(log.contains(&code.to_string()), "{log}");
@@ -1242,10 +1285,95 @@ mod tests {
         }
         let done = fail(&mut s, t0, 1, 20, "う", errors[2].clone());
         assert!(done.log.expect("無効化したとき 1 度だけログ").contains("disabled"));
-        assert_eq!(s.availability(t0), Availability::Disabled);
+        assert_eq!(s.availability(t0), Availability::ErrorsPersisted);
         assert!(s.next_deadline().is_none());
-        s.request_credentials();
-        assert!(!s.take_load_request(), "トグルでは戻らない");
         assert_eq!(s.submit(t0, job(1, 30, "え", true)), Submitted::default());
+        assert!(s.next_deadline().is_none(), "止まっている間は受け付けない");
+    }
+
+    #[test]
+    fn reenabling_after_persistent_errors_reloads_credentials_and_counts_again() {
+        let (mut s, loads) = state(true);
+        let t0 = Instant::now();
+        for g in 1..=3 {
+            fail(&mut s, t0, 1, g, &format!("あ{g}"), FetchError::Status(404));
+        }
+        assert_eq!(s.availability(t0), Availability::ErrorsPersisted);
+        assert_eq!(loads.get(), 1);
+        s.request_credentials();
+        s.pump();
+        assert_eq!(loads.get(), 2, "設定を直した可能性があるので読み直す");
+        assert_eq!(s.availability(t0), Availability::Ready);
+        for g in 10..12 {
+            fail(&mut s, t0, 1, g, &format!("い{g}"), FetchError::Status(404));
+            assert_eq!(s.availability(t0), Availability::Ready, "失敗の数え直し");
+        }
+        let done = fail(&mut s, t0, 1, 12, "う", FetchError::Status(404));
+        assert!(done.log.is_some());
+        assert_eq!(s.availability(t0), Availability::ErrorsPersisted);
+    }
+
+    #[test]
+    fn a_disabled_scheduler_is_not_revived_by_the_toggle() {
+        let (mut s, _) = state(true);
+        assert!(s.disable());
+        s.request_credentials();
+        assert!(!s.take_load_request());
+        assert_eq!(s.availability(Instant::now()), Availability::Disabled);
+    }
+
+    #[test]
+    fn a_rejection_for_replaced_credentials_does_not_stop_sending_again() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", true));
+        s.submit(t0, job(2, 1, "い", true));
+        let mut due = s.take_all_due(t0);
+        let (b, a) = (due.remove(1), due.remove(0));
+        assert!(s.complete(t0, a, Err(FetchError::Status(401))).log.is_some());
+        *s.store.result.lock().unwrap() = Ok(Some(Credentials { api_token: "tok2".into(), account_id: "acct".into() }));
+        s.request_credentials();
+        s.pump();
+        assert_eq!(s.complete(t0, b, Err(FetchError::Status(401))), Completed::default(), "古い認証情報での拒否は新しい認証情報に及ばない");
+        assert_eq!(s.availability(t0), Availability::Ready);
+    }
+
+    #[test]
+    fn a_pause_while_credentials_reload_keeps_the_new_request_from_being_sent() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", true));
+        s.submit(t0, job(2, 1, "い", true));
+        let mut due = s.take_all_due(t0);
+        let (b, a) = (due.remove(1), due.remove(0));
+        s.complete(t0, a, Err(FetchError::Status(401)));
+        s.request_credentials();
+        assert!(s.take_load_request());
+        s.state.submit(t0, job(3, 1, "う", true));
+        s.complete(t0, b, Err(FetchError::Status(429)));
+        assert_eq!(s.availability(t0), Availability::Paused);
+        let loaded = s.state.credentials_loaded(t0, Ok(Some(creds())));
+        assert!(loaded.deliveries.is_empty());
+        assert!(s.next_deadline().is_none(), "一時停止中に送信待機へ入れない");
+        assert!(s.take_due(t0).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_taken_for_sending_while_paused() {
+        let (mut s, _) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", false));
+        s.state.health = Health::PausedUntil(t0 + PAUSE);
+        assert!(s.take_due(ms(t0, 250)).is_empty());
+        assert_eq!(s.in_flight(), 0);
+    }
+
+    #[test]
+    fn debug_output_hides_candidate_text() {
+        let choice = Choice { index: 1, text: "秘密の候補".into() };
+        let delivery = Delivery { controller_id: 1, generation: 1, outcome: Ok(choice.clone()) };
+        for shown in [format!("{choice:?}"), format!("{delivery:?}")] {
+            assert!(!shown.contains("秘密の候補"), "{shown}");
+        }
     }
 }

@@ -2,7 +2,6 @@
 //! Cocoa / InputMethodKit への薄い境界。unsafe はこのモジュールと imk_client.rs に閉じ込める。
 use std::cell::RefCell;
 use std::ptr::NonNull;
-use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use objc2::rc::{autoreleasepool, Allocated, Id};
@@ -74,9 +73,10 @@ unsafe extern "C" {
     );
 }
 
-/// `f` を実行し、panic したら `Err` にする。
-fn guarded(f: fn()) -> std::thread::Result<()> {
-    std::panic::catch_unwind(f)
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+    fn CFRunLoopRunInMode(mode: *const std::ffi::c_void, seconds: f64, return_after_source_handled: u8) -> i32;
 }
 
 /// panic の場所 (file:line) だけを NSLog に出す panic hook を入れる。標準の hook はペイロードを stderr に出し、
@@ -258,45 +258,67 @@ fn log_exception_once(name: &str) {
     }
 }
 
-/// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。
-pub fn run_on_main(f: fn()) {
-    extern "C" fn trampoline(context: *mut std::ffi::c_void) {
-        // SAFETY: run_on_main が `fn()` をそのままポインタ値として渡したもの。
-        let f: fn() = unsafe { std::mem::transmute::<*mut std::ffi::c_void, fn()>(context) };
-        // panic が extern "C" の境界を越えると IME ごと abort するので、ここで止めて続行する。
-        // ペイロードにはユーザーの入力が入りうるので、ログには出さない。
-        if guarded(f).is_err() {
-            log("panic in main-queue callback (ignored)");
-        }
+/// `f` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。投入した順に実行される。
+/// `f` が panic しても、ログだけ残して続行する。
+pub fn run_on_main_boxed(f: Box<dyn FnOnce() + Send + 'static>) {
+    // Box<dyn FnOnce> は太いポインタなので、もう一段 Box に入れて細いポインタにしてから context に渡す。
+    let context = Box::into_raw(Box::new(f)).cast::<std::ffi::c_void>();
+    // SAFETY: メインキューの番地は常に有効。context は上で作った `Box<Box<dyn FnOnce() + Send>>` の所有権で、
+    // dispatch_async_f は work を必ず 1 回だけ呼ぶので、run_boxed が 1 回だけ Box に戻して解放する。
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, context, run_boxed) };
+}
+
+extern "C" fn run_boxed(context: *mut std::ffi::c_void) {
+    // SAFETY: run_on_main_boxed が `Box::into_raw` で渡した `Box<Box<dyn FnOnce() + Send>>` で、ここで 1 回だけ戻す。
+    let task = unsafe { Box::from_raw(context.cast::<Box<dyn FnOnce() + Send + 'static>>()) };
+    // panic が extern "C" の境界を越えると IME ごと abort するので、ここで止めて続行する。
+    // ペイロードにはユーザーの入力が入りうるので、ログには出さない。
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+        log("panic in main-queue task (ignored)");
     }
-    // SAFETY: メインキューの番地は常に有効。context は fn ポインタ値で、trampoline が同じ型に戻す。
-    unsafe { dispatch_async_f(&raw const _dispatch_main_q, f as *mut std::ffi::c_void, trampoline) };
 }
 
-type MainTask = Box<dyn FnOnce() + Send>;
+/// 別スレッドから `run_on_main_boxed` で積んだ処理が、メインスレッドで、投入順に、途中の panic に止められず
+/// 実行されることを確かめて終了する (`--check-main-queue`)。成功なら 0、失敗か 5 秒で終わらなければ 1 で exit する。
+pub fn check_main_queue() -> ! {
+    use std::sync::Arc;
+    use std::thread::{self, ThreadId};
+    use std::time::Duration;
 
-/// `run_on_main` は `fn()` しか運べないので、データを持つ処理はここに積んで取り出し口 (`drain_main_tasks`) を投入する。
-/// プロセスに 1 つだけのグローバルで、データを運べる投入口ができたら (`run_on_main_boxed`) なくす。
-static MAIN_TASKS: Mutex<VecDeque<MainTask>> = Mutex::new(VecDeque::new());
+    const COUNT: usize = 5;
+    const PANIC_AT: usize = 2;
+    let main_id = thread::current().id();
+    let ran: Arc<Mutex<Vec<(usize, ThreadId)>>> = Arc::new(Mutex::new(Vec::new()));
 
-/// `task` をメインスレッドの run loop で 1 回実行する (どのスレッドからでも呼べる)。投入した順に実行される。
-pub fn post_to_main(task: MainTask) {
-    MAIN_TASKS.lock().unwrap_or_else(PoisonError::into_inner).push_back(task);
-    run_on_main(drain_main_tasks);
-}
-
-fn drain_main_tasks() {
-    run_queued(&MAIN_TASKS);
-}
-
-/// 積まれた処理を順に実行する。1 件の panic で残りを止めない。
-fn run_queued(queue: &Mutex<VecDeque<MainTask>>) {
-    loop {
-        let task = queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front();
-        let Some(task) = task else { return };
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
-            log("panic in main-queue task (ignored)");
+    let poster_ran = ran.clone();
+    thread::spawn(move || {
+        for n in 0..COUNT {
+            let ran = poster_ran.clone();
+            run_on_main_boxed(Box::new(move || {
+                ran.lock().unwrap_or_else(PoisonError::into_inner).push((n, thread::current().id()));
+                if n == PANIC_AT {
+                    panic!("check-main-queue deliberate panic");
+                }
+                if n == COUNT - 1 {
+                    let ran = ran.lock().unwrap_or_else(PoisonError::into_inner);
+                    let in_order = ran.iter().map(|&(n, _)| n).eq(0..COUNT);
+                    let on_main = ran.iter().all(|&(_, id)| id == main_id);
+                    println!("main-queue: ran={} in_order={in_order} on_main={on_main}", ran.len());
+                    std::process::exit(if in_order && on_main { 0 } else { 1 });
+                }
+            }));
         }
+    });
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(5));
+        println!("main-queue: timed out");
+        std::process::exit(1);
+    });
+    // IME 本体 (NSApplication の run) と同じく、メインスレッドの CFRunLoop でメインキューを回す。
+    // dispatch_main() は実行を別スレッドに移すので、メインスレッドで動くことの確認には使えない。
+    loop {
+        // SAFETY: メインスレッドから呼ぶ。モードは CoreFoundation の定数で、0.1 秒ごとに戻って終了条件 (exit) を待つ。
+        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, 0) };
     }
 }
 
@@ -566,22 +588,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_main_tasks_run_in_order_and_a_panic_does_not_stop_the_rest() {
-        let queue = Mutex::new(VecDeque::new());
-        let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
-        for n in 1..=3 {
-            let ran = ran.clone();
-            let task: MainTask = Box::new(move || {
-                ran.lock().unwrap().push(n);
-                if n == 2 {
-                    panic!("task panic");
-                }
-            });
-            queue.lock().unwrap().push_back(task);
-        }
-        run_queued(&queue);
-        assert_eq!(*ran.lock().unwrap(), vec![1, 2, 3]);
-        assert!(queue.lock().unwrap().is_empty());
+    fn a_boxed_main_task_runs_once_and_its_panic_stays_inside() {
+        let ran = std::sync::Arc::new(Mutex::new(0));
+        let counter = ran.clone();
+        let task: Box<dyn FnOnce() + Send> = Box::new(move || {
+            *counter.lock().unwrap() += 1;
+            panic!("task panic");
+        });
+        // dispatch を通さず、work として渡される関数を直接呼ぶ (メインキューを回せるのは --check-main-queue)。
+        run_boxed(Box::into_raw(Box::new(task)).cast());
+        assert_eq!(*ran.lock().unwrap(), 1);
     }
 
     fn ns_from_units(units: &[u16]) -> Id<NSString> {
@@ -633,14 +649,6 @@ mod tests {
     fn guard_returns_fallback_on_panic_and_value_otherwise() {
         assert_eq!(super::guard(|| 0, || 7), 7);
         assert_eq!(super::guard(|| 0, || -> i32 { panic!("boom") }), 0);
-    }
-
-    use super::guarded;
-
-    #[test]
-    fn a_panicking_callback_is_contained() {
-        assert!(guarded(|| panic!("boom")).is_err());
-        assert!(guarded(|| {}).is_ok());
     }
 
     #[repr(C)]

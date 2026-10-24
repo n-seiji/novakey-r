@@ -35,6 +35,10 @@ env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "各キーのあと、未確定ローマ字が無ければ下線付きの表示と Enter で確定される文字列が一致するかを scenarios / characterization の全行で確かめる"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt --check-preedit && cargo run --release -- --simulate-file tools/characterization.txt --check-preedit"
 
+[tasks.main-queue]
+description = "別スレッドから積んだ処理がメインスレッドで投入順に実行される (途中の panic で止まらない) ことを確かめる"
+run = "cargo run --release -- --check-main-queue"
+
 [tasks.scenarios-learning]
 env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"
