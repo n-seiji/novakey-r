@@ -20,7 +20,8 @@ use std::rc::Rc;
 use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
-use crate::session::{ConversionMode, RerankJob};
+use crate::outbound::Screened;
+use crate::session::ConversionMode;
 use crate::translit::Form;
 
 /// 物理キー 1 打鍵。imk.rs の handleEvent が受け取るものと同じ粒度。
@@ -241,6 +242,8 @@ pub(crate) struct EnvState {
     pub rerank: bool,
     /// 送られて、まだ取り消されていない AI 要求の世代 (古い順)。
     pub sent: Vec<u64>,
+    /// `sent` と同じ順の、送られた payload の (文脈, 文脈を空にした理由の名前)。取り消しでは消さない。
+    pub payloads: Vec<(String, Option<&'static str>)>,
 }
 
 impl Environment for FakeEnv {
@@ -256,8 +259,10 @@ impl Environment for FakeEnv {
 
     fn trace(&self, _entry: &str, _fields: &str) {}
 
-    fn send_rerank(&self, _controller_id: u64, job: &RerankJob, _context: &str, _urgent: bool) {
-        self.0.borrow_mut().sent.push(job.generation);
+    fn send_rerank(&self, _controller_id: u64, generation: u64, payload: &Screened, _urgent: bool) {
+        let mut state = self.0.borrow_mut();
+        state.sent.push(generation);
+        state.payloads.push((payload.context().to_string(), payload.context_dropped().map(|r| r.name())));
     }
 
     fn cancel_rerank(&self, _controller_id: u64) {

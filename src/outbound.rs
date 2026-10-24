@@ -24,6 +24,55 @@ impl Reason {
     }
 }
 
+/// 送信元アプリの検査 (`gate_app`) を通った証。ここ以外では作れず、Clone / Copy もないので、`screen` 1 回にしか使えない。
+pub struct AppPass(());
+
+/// 検査を通った、外へ送ってよい中身。ここ以外では作れないので、送信経路は検査済みのものしか受け取れない。
+#[derive(Clone, PartialEq, Eq)]
+pub struct Screened {
+    reading: String,
+    candidates: Vec<String>,
+    context: String,
+    /// 文脈だけ秘密に当たって空にしたときの理由。
+    context_dropped: Option<Reason>,
+}
+
+impl Screened {
+    pub fn reading(&self) -> &str {
+        &self.reading
+    }
+
+    pub fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub fn context_dropped(&self) -> Option<Reason> {
+        self.context_dropped
+    }
+}
+
+impl std::fmt::Debug for Screened {
+    // 読み・候補・文脈はユーザーの入力そのものなので、Debug でも出さない。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Screened(..")?;
+        if let Some(reason) = self.context_dropped {
+            write!(f, ", context_dropped: {}", reason.name())?;
+        }
+        write!(f, ")")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Send(Screened),
+    Skip(Reason),
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outbound {
     Skip(Reason),
@@ -31,6 +80,7 @@ pub enum Outbound {
     WithContext(String),
 }
 
+#[cfg(test)]
 pub struct Snapshot<'a> {
     pub secure_input: bool,
     pub bundle_id: Option<&'a str>,
@@ -181,27 +231,49 @@ pub fn learning_allowed(secure_input: bool, bundle_id: Option<&str>) -> bool {
     !secure_input && !bundle_id.is_some_and(|id| PASSWORD_MANAGERS.contains(&id))
 }
 
-pub fn decide(s: &Snapshot) -> Outbound {
-    if s.secure_input {
-        return Outbound::Skip(Reason::SecureInput);
+/// 送信元アプリの検査。内容の検査 (`screen`) より先に呼ぶ。
+pub fn gate_app(secure_input: bool, bundle_id: Option<&str>) -> Result<AppPass, Reason> {
+    if secure_input {
+        return Err(Reason::SecureInput);
     }
     // 送信元アプリが分からないときは、拒否リストに当たるか確認できないので送らない。
-    let Some(bundle_id) = s.bundle_id else {
-        return Outbound::Skip(Reason::UnknownApp);
+    let Some(bundle_id) = bundle_id else {
+        return Err(Reason::UnknownApp);
     };
     if DENIED_APPS.contains(&bundle_id) {
-        return Outbound::Skip(Reason::DeniedApp);
+        return Err(Reason::DeniedApp);
     }
-    let hit = find_secret(&READING_PATTERNS, s.reading)
-        .or_else(|| s.candidates.iter().find_map(|c| find_secret(&CANDIDATE_PATTERNS, c)));
+    Ok(AppPass(()))
+}
+
+/// 読み・候補・直前の文字列を検査する。読みか候補が秘密に当たれば送らず、文脈だけなら文脈を空にして送る。
+pub fn screen(_pass: AppPass, reading: &str, candidates: &[String], preceding: &str) -> Decision {
+    let hit = find_secret(&READING_PATTERNS, reading)
+        .or_else(|| candidates.iter().find_map(|c| find_secret(&CANDIDATE_PATTERNS, c)));
     if let Some(name) = hit {
-        return Outbound::Skip(Reason::SecretPattern(name));
+        return Decision::Skip(Reason::SecretPattern(name));
     }
     // 文区切りや切り詰めの前に窓全体を検査する (境界をまたぐ鍵や改行をまたぐ「パスワード\nxxx」を逃さない)。
-    if let Some(name) = find_secret(&CONTEXT_PATTERNS, s.preceding) {
-        return Outbound::WithoutContext(Reason::SecretPattern(name));
+    let (context, context_dropped) = match find_secret(&CONTEXT_PATTERNS, preceding) {
+        Some(name) => (String::new(), Some(Reason::SecretPattern(name))),
+        None => (current_sentence(preceding).to_string(), None),
+    };
+    Decision::Send(Screened { reading: reading.to_string(), candidates: candidates.to_vec(), context, context_dropped })
+}
+
+#[cfg(test)]
+pub fn decide(s: &Snapshot) -> Outbound {
+    let pass = match gate_app(s.secure_input, s.bundle_id) {
+        Ok(pass) => pass,
+        Err(reason) => return Outbound::Skip(reason),
+    };
+    match screen(pass, s.reading, s.candidates, s.preceding) {
+        Decision::Skip(reason) => Outbound::Skip(reason),
+        Decision::Send(screened) => match screened.context_dropped {
+            Some(reason) => Outbound::WithoutContext(reason),
+            None => Outbound::WithContext(screened.context),
+        },
     }
-    Outbound::WithContext(current_sentence(s.preceding).to_string())
 }
 
 #[cfg(test)]
@@ -450,6 +522,19 @@ mod tests {
         assert_eq!(decide_payload("きょう", &candidates), Outbound::Skip(Reason::SecretPattern("api_key_prefix")));
         let candidates = vec!["今日".to_string(), "京".to_string()];
         assert_eq!(decide_payload("きょう", &candidates), Outbound::WithContext("こんにちは".to_string()));
+    }
+
+    #[test]
+    fn debug_output_hides_reading_candidates_and_context() {
+        let pass = gate_app(false, Some("com.apple.TextEdit")).unwrap();
+        let candidates = vec!["ひみつの候補".to_string()];
+        let decision = screen(pass, "ひみつのよみ", &candidates, "ひみつの文脈");
+        let shown = format!("{decision:?}");
+        assert!(shown.contains("Screened(..") && !shown.contains("ひみつ"), "{shown}");
+
+        let pass = gate_app(false, Some("com.apple.TextEdit")).unwrap();
+        let dropped = format!("{:?}", screen(pass, "よみ", &[], "パスワード ひみつ"));
+        assert!(dropped.contains("secret_word") && !dropped.contains("ひみつ"), "{dropped}");
     }
 
     #[test]
