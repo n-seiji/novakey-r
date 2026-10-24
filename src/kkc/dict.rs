@@ -366,6 +366,19 @@ impl Dictionary {
         Ok(out)
     }
 
+    /// `prefix_entries` が読む (先頭文字, トライのノード) を短い prefix から順に返す。
+    pub fn prefix_nodes(&self, katakana_reading: &str) -> Result<Vec<(char, usize)>, DictError> {
+        let chars: Vec<char> = katakana_reading.chars().collect();
+        let Some(&first) = chars.first() else {
+            return Ok(Vec::new());
+        };
+        let Some(trie) = self.trie(first)? else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<u8> = chars.iter().map(|&c| self.char_id(c)).collect();
+        Ok(trie.walk(&ids).into_iter().map(|(_depth, node)| (first, node)).collect())
+    }
+
     /// 品詞連接コスト。`former` は左の語の rcid、`latter` は右の語の lcid。
     /// 行が無い・読めない・範囲外は -25 (Swift 版と同じ)。
     pub fn cc(&self, rcid: usize, lcid: usize) -> f32 {
