@@ -87,7 +87,8 @@ pub enum Phase {
 enum Typing {
     Empty,
     Kana,
-    Dangling,
+    /// 英語を打っていると判定した間。打鍵ごとに判定し直し、engine の変換と AI 並べ替えの要求は止める。
+    English,
     Literal,
     Mixed,
 }
@@ -175,6 +176,8 @@ pub struct Composer<E: CandidateEngine, L: Lexicon> {
     romaji: RomajiConverter,
     hiragana: String,
     typing: Typing,
+    /// Typing::English が、打鍵中の表示で英字として見えていたか。flush が初めて英語と見なした組成は false。
+    english_shown: bool,
     /// 英語分割で英単語にまとめる前の区切りと未確定の打鍵。取り消しで分割前の打鍵中に戻すために持つ。
     split_origin: Option<(Vec<Segment>, String)>,
     reading: ReadingCands,
@@ -191,6 +194,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             romaji: RomajiConverter::new(),
             hiragana: String::new(),
             typing: Typing::Empty,
+            english_shown: false,
             split_origin: None,
             reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
             stage: Stage::Editing,
@@ -218,7 +222,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Stage::Editing => match self.typing {
                 Typing::Empty => Phase::Empty,
                 Typing::Kana => Phase::Composing,
-                Typing::Dangling => Phase::Dangling,
+                Typing::English => Phase::Dangling,
                 Typing::Literal => Phase::Literal,
                 Typing::Mixed => Phase::Mixed,
             },
@@ -276,7 +280,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if let Some(split) = self.english_split(false) {
             return split.display();
         }
-        if self.is_typing_english() {
+        if (self.typing == Typing::English && self.is_kana_editing()) || self.is_typing_english() {
             return self.raw();
         }
         format!("{}{}", self.display(), self.romaji.buffer())
@@ -347,6 +351,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         }
         self.typing = Typing::Kana;
+        if self.is_typing_english() {
+            self.typing = Typing::English;
+            self.english_shown = true;
+            return;
+        }
         if let Some(forms) = self.symbol_variants() {
             self.reading.list = forms
                 .iter()
@@ -357,15 +366,17 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 .collect();
             return;
         }
-        let texts = self.engine.convert(self.reading.generation, &self.hiragana);
-        for (engine_index, text) in texts.into_iter().enumerate() {
-            if !self.reading.list.iter().any(|c| c.text == text) {
-                self.reading.list.push(Candidate {
-                    text,
-                    source: Source::Engine(EngineRank(engine_index)),
-                });
+        self.reading.list = self.convert_reading();
+    }
+
+    fn convert_reading(&mut self) -> Vec<Candidate> {
+        let mut list: Vec<Candidate> = Vec::new();
+        for (engine_index, text) in self.engine.convert(self.reading.generation, &self.hiragana).into_iter().enumerate() {
+            if !list.iter().any(|c| c.text == text) {
+                list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
             }
         }
+        list
     }
 
     /// 組成全体が記号 1 つだけのときの異体候補。かなと混ざれば None(辞書変換に任せる)。
@@ -400,8 +411,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         match self.settle(english) {
             Settle::Mixed(split) => self.fix_english_split(split),
-            Settle::Dangling => self.typing = Typing::Dangling,
+            Settle::Dangling => self.typing = Typing::English,
             Settle::Unchanged => {}
+        }
+        if self.typing == Typing::English {
+            self.english_shown = english;
         }
     }
 
@@ -417,13 +431,34 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     }
 
     fn is_kana_editing(&self) -> bool {
-        matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana
+        matches!(self.stage, Stage::Editing) && matches!(self.typing, Typing::Kana | Typing::English)
+    }
+
+    /// 打鍵のあと、英語を打っているかの判定を状態に反映する。
+    /// 英語になった時点で読みの候補は捨てる (世代が進むので、届く前の AI 並べ替えの結果も使われない)。
+    fn track_english(&mut self) {
+        if !self.is_kana_editing() {
+            return;
+        }
+        match (self.is_typing_english(), self.typing == Typing::English) {
+            (true, false) => {
+                self.reset_candidates();
+                self.typing = Typing::English;
+                self.english_shown = true;
+            }
+            (false, true) => self.refresh(),
+            _ => {}
+        }
     }
 
     /// 取り消しや字種変換で読みに戻るとき、英語の判定は持ち越さない。
     fn leave_english(&mut self) {
-        if self.typing == Typing::Dangling {
+        if self.typing == Typing::English {
             self.typing = Typing::Kana;
+            if self.reading.list.is_empty() {
+                // 英語を打っている間は変換していないので、読みに戻る前に変換しておく。
+                self.reading.list = self.convert_reading();
+            }
         }
     }
 
@@ -494,6 +529,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             .filter_map(|ch| self.romaji.process_input(ch.to_ascii_lowercase()))
             .collect();
         if kana.is_empty() {
+            self.track_english();
             return false;
         }
         // 確定した単位の打鍵は、ローマ字に残った未確定の打鍵 (`tt` の 2 つ目の t など) を除いたもの。
@@ -531,6 +567,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 未確定のローマ字を 1 文字消す。
     pub fn backspace_romaji(&mut self) {
         self.romaji.handle_backspace();
+        self.track_english();
     }
 
     /// 未確定のローマ字を捨てる。
@@ -569,7 +606,24 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.engine.cancel();
         }
         self.split_origin = None;
-        self.segments.push(Segment::Literal(text.to_string()));
+        let split = if self.typing == Typing::English { self.english_split(false) } else { None };
+        if let Some(split) = split {
+            // 英語分割を表示している間の大文字は、見えているとおり (英単語+かな) の後ろに付ける。
+            self.segments = std::iter::once(Segment::Literal(split.head))
+                .chain(split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana }))
+                .chain((!split.pending.is_empty()).then(|| Segment::Kana { keys: split.pending.clone(), kana: split.pending }))
+                .chain(std::iter::once(Segment::Literal(text.to_string())))
+                .collect();
+            self.romaji.clear();
+        } else if self.typing == Typing::English && self.english_shown && matches!(self.stage, Stage::Editing) {
+            // 英語を打っている途中の大文字は、表示している英字の続きにする (かなには戻さない)。
+            let word = self.raw() + text;
+            self.romaji.clear();
+            self.segments.clear();
+            self.segments.push(Segment::Literal(word));
+        } else {
+            self.segments.push(Segment::Literal(text.to_string()));
+        }
         self.sync_hiragana();
         self.reset_candidates();
         self.stage = Stage::Editing;
@@ -632,6 +686,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         if let Stage::Reverted { kept: k } = &mut self.stage {
             kept = k.take();
+        }
+        if self.typing == Typing::English && matches!(self.stage, Stage::Editing) && self.reading.list.is_empty() {
+            // 英語を打っている間は変換していない。候補を求められたときに読みを変換する。
+            self.reading.list = self.convert_reading();
         }
         let mut list = kept.unwrap_or_else(|| self.reading.list.clone());
         if let Some(index) = self.reading.held_rerank.take() {
@@ -2146,7 +2204,7 @@ mod tests {
     fn 英語と見なす入力中は_preedit_が打鍵のままで_commit_preview_も同じになる() {
         let c = typed_romaji("merge");
         assert!(!c.has_romaji());
-        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.phase(), Phase::Dangling);
         assert_eq!(c.display(), "めrげ");
         assert_eq!(c.preedit(), "merge");
         assert_eq!(c.commit_preview(), "merge");

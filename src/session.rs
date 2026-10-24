@@ -154,6 +154,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
+        let before = phase;
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
         let key = match text.chars().collect::<Vec<_>>()[..] {
             [ch] if !ch.is_ascii_alphabetic() && self.composer.accepts_romaji(ch) => {
@@ -162,6 +163,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             _ => key,
         };
         if let Some(handled) = self.prepare(gates, key, &mut fx) {
+            self.resume_rerank(gates, before, &mut fx);
             self.finish(&mut fx);
             return Outcome { handled, action: None, phase, effects: fx };
         }
@@ -175,6 +177,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
         }
         let handled = self.perform(gates, action, text, &mut fx);
+        self.resume_rerank(gates, before, &mut fx);
         self.finish(&mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
@@ -218,9 +221,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         text
     }
 
-    /// 組成が空になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
+    /// 組成が空になった、または英語を打っている状態になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
     fn finish(&mut self, fx: &mut Vec<Effect>) {
-        if self.rerank_outstanding && self.composer.is_empty() && !self.composer.has_romaji() {
+        let idle = (self.composer.is_empty() && !self.composer.has_romaji()) || self.composer.phase() == Phase::Dangling;
+        if self.rerank_outstanding && idle {
             self.rerank_outstanding = false;
             fx.push(Effect::CancelRerank);
         }
@@ -245,6 +249,14 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         if let Some(job) = self.rerank_job() {
             self.rerank_outstanding = true;
             fx.push(Effect::RequestRerank { urgent, job });
+        }
+    }
+
+    /// 英語の判定が外れてかなの組成に戻った打鍵は、かなが増えなくても (未確定ローマ字の BS など) AI 要求を出し直す。
+    fn resume_rerank(&mut self, gates: &Gates, before: Phase, fx: &mut Vec<Effect>) {
+        let requested = fx.iter().any(|e| matches!(e, Effect::RequestRerank { .. }));
+        if before == Phase::Dangling && self.phase() == Phase::Composing && !requested {
+            self.request_rerank(gates, false, fx);
         }
     }
 
@@ -870,11 +882,35 @@ mod tests {
     }
 
     #[test]
-    fn 現挙動_英語らしい表示は状態に反映されずxでかなに戻る_段3_6で直す予定() {
+    fn 英語らしい表示になったあと大文字を続けても表示どおりに確定する() {
         let mut s = english_session();
         assert_eq!(drive(&mut s, "enter").0, "enter");
-        assert_eq!(drive(&mut s, "X").0, "えんてrX");
-        assert_eq!(drive(&mut s, "<enter>").1, "えんてrX");
+        assert_eq!(drive(&mut s, "X").0, "enterX");
+        assert_eq!(drive(&mut s, "<enter>").1, "enterX");
+        assert_eq!(drive(&mut english_session(), "mergeX<enter>").1, "mergeX");
+    }
+
+    #[test]
+    fn 英語の判定が外れたら打鍵がかなを増やさなくてもai要求を再開する() {
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
+        effects_with(&RERANK, &mut session, "enter");
+        assert_eq!(session.marked_text(), "enter");
+        let back = effects_with(&RERANK, &mut session, "\u{7f}");
+        assert!(back.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{back:?}");
+    }
+
+    #[test]
+    fn 英語を打っている間はai並べ替えを要求しない() {
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
+        assert!(effects_with(&RERANK, &mut session, "ente").iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
+        let english = effects_with(&RERANK, &mut session, "rsaX");
+        assert!(!english.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{english:?}");
+        assert_eq!(english.iter().filter(|e| **e == Effect::CancelRerank).count(), 1, "英語になった時点で出していた要求を取り消す");
+        assert_eq!(session.marked_text(), "entersaX");
     }
 
     #[derive(Clone, Default)]
