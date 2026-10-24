@@ -2,6 +2,7 @@
 mod composer;
 mod config;
 mod controller;
+mod deps;
 mod imk;
 mod imk_client;
 mod input;
