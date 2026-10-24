@@ -13,37 +13,34 @@
 //! - 直前の確定との bigram (`lastData`) は移植しない (NovakeyR は確定のたびに変換を止めるので発火しない)。
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+mod format;
+mod store;
+mod writer;
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::elem::{count_graphemes, include_mm_value_calculation, is_clause, Elem};
 use super::lattice::Found;
+#[cfg(test)]
+use format::{serialize, write_file, HEADER};
+use format::{backup, parse, FILE_NAME};
+use store::{count_entries, pick_evictions, prune_entries, remove_keys, Entries, EntryKey, Text};
+use writer::{Msg, Writer};
+
+pub use store::MemEntry;
+
 
 /// 覚えるエントリ数の上限 (`maxMemoryCount`)
 pub const MAX_MEMORY_COUNT: usize = 65536;
-const HEADER: &str = "# novakey-r learning v1";
-const FILE_NAME: &str = "learning.tsv";
 const DIR_NAME: &str = "rust-learning";
 /// 最初の未保存の変更から、この時間だけ待ってまとめて書く。
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// 学習エントリ 1 件。`ruby` は呼び出し側 (マップのキー) が持つ。
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemEntry {
-    pub word: String,
-    pub lcid: usize,
-    pub rcid: usize,
-    pub mid: usize,
-    pub count: u8,
-    pub last_used: u16,
-    pub last_updated: u16,
-}
 
 /// 値の式 (`valueForData`)。出現数が多いほど、読みが長いほど大きい。
 pub fn value_for(count: u8, ruby_len: usize) -> f32 {
@@ -115,109 +112,12 @@ impl Piece {
     }
 }
 
-/// 学習エントリの一意キー (読み, 表層, lcid, rcid)。
-type EntryKey = (String, String, usize, usize);
-
-/// 背景スレッドに流す差分。メイン側と同じ操作を同じ順序で流すので、写しはメインの記憶と常に同じ内容になる。
-enum Msg {
-    /// 1 件を丸ごと入れ替える (なければ追加)
-    Upsert(String, MemEntry),
-    Prune(u16),
-    Remove(Vec<EntryKey>),
-    /// ここまでの変更を書き終えたら返事をする
-    #[cfg(test)]
-    Flush(Sender<()>),
-}
-
-/// ファイルへの書き出しを受け持つ背景スレッド。落とす (drop) と、未保存の分を書いてから止まる。
-struct Writer {
-    tx: Option<Sender<Msg>>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl Writer {
-    fn spawn(path: PathBuf, entries: HashMap<String, Vec<MemEntry>>, interval: Duration) -> Option<Self> {
-        let (tx, rx) = mpsc::channel();
-        let handle = std::thread::Builder::new()
-            .name("novakey-learning".into())
-            .spawn(move || writer_loop(&rx, &path, entries, interval))
-            .ok()?;
-        Some(Self { tx: Some(tx), handle: Some(handle) })
-    }
-
-    fn send(&self, msg: Msg) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(msg);
-        }
-    }
-}
-
-impl Drop for Writer {
-    fn drop(&mut self) {
-        self.tx.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn writer_loop(rx: &mpsc::Receiver<Msg>, path: &Path, mut entries: HashMap<String, Vec<MemEntry>>, interval: Duration) {
-    let mut dirty_since: Option<Instant> = None;
-    loop {
-        let received = match dirty_since {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(since) => rx.recv_timeout(interval.saturating_sub(since.elapsed())),
-        };
-        match received {
-            #[cfg(test)]
-            Ok(Msg::Flush(reply)) => {
-                if dirty_since.take().is_some() {
-                    write_file(path, &entries);
-                }
-                let _ = reply.send(());
-            }
-            Ok(msg) => {
-                apply(&mut entries, msg);
-                dirty_since.get_or_insert_with(Instant::now);
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                dirty_since = None;
-                write_file(path, &entries);
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if dirty_since.is_some() {
-                    write_file(path, &entries);
-                }
-                return;
-            }
-        }
-    }
-}
-
-fn apply(entries: &mut HashMap<String, Vec<MemEntry>>, msg: Msg) {
-    match msg {
-        Msg::Upsert(ruby, entry) => {
-            let list = entries.entry(ruby).or_default();
-            match list.iter_mut().find(|m| m.word == entry.word && m.lcid == entry.lcid && m.rcid == entry.rcid) {
-                Some(slot) => *slot = entry,
-                None => list.push(entry),
-            }
-        }
-        Msg::Prune(today) => {
-            prune_entries(entries, today);
-        }
-        Msg::Remove(keys) => remove_keys(entries, &keys),
-        #[cfg(test)]
-        Msg::Flush(_) => {}
-    }
-}
-
 pub struct Learning {
     /// `None` なら無効 (読み書きしない)
     enabled: bool,
     /// 保存先。`None` なら保存しない (テスト用)
     path: Option<PathBuf>,
-    entries: HashMap<String, Vec<MemEntry>>,
+    entries: Entries,
     len: usize,
     clock: Box<dyn Fn() -> u16>,
     cap: usize,
@@ -233,7 +133,7 @@ impl Learning {
         Self {
             enabled: false,
             path: None,
-            entries: HashMap::new(),
+            entries: Entries::new(),
             len: 0,
             clock: Box::new(system_today),
             cap: MAX_MEMORY_COUNT,
@@ -273,7 +173,7 @@ impl Learning {
         let today = (me.clock)();
         prune_entries(&mut me.entries, today);
         me.last_pruned = Some(today);
-        me.len = me.entries.values().map(Vec::len).sum();
+        me.len = count_entries(&me.entries);
         me.enforce_cap(&HashSet::new());
         me.writer = Writer::spawn(path, me.entries.clone(), interval);
         if me.writer.is_none() {
@@ -336,7 +236,7 @@ impl Learning {
         };
         match parse(&bytes) {
             Some(parsed) => {
-                self.len = parsed.entries.values().map(Vec::len).sum();
+                self.len = count_entries(&parsed.entries);
                 self.entries = parsed.entries;
                 if parsed.skipped > 0 {
                     // 次の保存で壊れた行が消えるので、元のファイルは写しを残す。
@@ -367,7 +267,7 @@ impl Learning {
             let Some(list) = self.entries.get(ruby) else { continue };
             let ruby_len = count_graphemes(ruby);
             for m in list {
-                let elem = Elem::new(m.word.clone(), ruby.to_string(), m.lcid, m.rcid, m.mid, value_for(m.count, ruby_len));
+                let elem = Elem::new(m.word.to_string(), ruby.to_string(), m.lcid, m.rcid, m.mid, value_for(m.count, ruby_len));
                 out.push(Found { elem: Rc::new(elem), ruby_chars: chars });
             }
         }
@@ -389,8 +289,7 @@ impl Learning {
             if p.ruby.is_empty() || !p.ruby.chars().all(known) {
                 return;
             }
-            me.memorize(p, today);
-            touched.insert((p.ruby.clone(), p.word.clone(), p.lcid, p.rcid));
+            touched.insert(me.memorize(p, today));
         };
 
         // 単語単位
@@ -454,27 +353,32 @@ impl Learning {
             return;
         }
         for (ruby, word, lcid, rcid) in touched {
-            let found = self
-                .entries
-                .get(ruby)
-                .and_then(|list| list.iter().find(|m| m.word == *word && m.lcid == *lcid && m.rcid == *rcid));
-            if let Some(m) = found {
-                self.emit(Msg::Upsert(ruby.clone(), m.clone()));
+            let Some((stored, list)) = self.entries.get_key_value(ruby) else { continue };
+            if let Some(m) = list.iter().find(|m| m.is_key(word, *lcid, *rcid)) {
+                self.emit(Msg::Upsert(stored.clone(), m.clone()));
             }
         }
     }
 
-    /// 1 件を覚える。同じ (読み, 表層, lcid, rcid) があれば出現数を足す。
-    fn memorize(&mut self, p: &Piece, today: u16) {
-        let list = self.entries.entry(p.ruby.clone()).or_default();
-        if let Some(m) = list.iter_mut().find(|m| m.word == p.word && m.lcid == p.lcid && m.rcid == p.rcid) {
-            m.count = m.count.saturating_add(1);
-            m.last_used = today;
-            m.last_updated = today;
-        } else {
-            list.push(MemEntry { word: p.word.clone(), lcid: p.lcid, rcid: p.rcid, mid: p.mid, count: 1, last_used: today, last_updated: today });
-            self.len += 1;
-        }
+    /// 1 件を覚える。同じ (読み, 表層, lcid, rcid) があれば出現数を足す。覚えたエントリのキーを返す。
+    fn memorize(&mut self, p: &Piece, today: u16) -> EntryKey {
+        let ruby = Text::from(p.ruby.as_str());
+        let list = self.entries.entry(ruby.clone()).or_default();
+        let word = match list.iter_mut().find(|m| m.is_key(&p.word, p.lcid, p.rcid)) {
+            Some(m) => {
+                m.count = m.count.saturating_add(1);
+                m.last_used = today;
+                m.last_updated = today;
+                m.word.clone()
+            }
+            None => {
+                let word = Text::from(p.word.as_str());
+                list.push(MemEntry { word: word.clone(), lcid: p.lcid, rcid: p.rcid, mid: p.mid, count: 1, last_used: today, last_updated: today });
+                self.len += 1;
+                word
+            }
+        };
+        (ruby, word, p.lcid, p.rcid)
     }
 
     /// 未来の日付のリセット・128 日以上使っていないものの削除・32 日ごとの半減。
@@ -485,231 +389,22 @@ impl Learning {
     }
 
     /// 上限を超えた分を、読みの長いものから捨てる (今回触れたものは残す)。捨てたキーを返す。
-    /// 全件を並べ替えるので、上限ちょうどからは毎回ではなく、上限の 1/16 を超えたときにまとめて上限まで減らす。
+    /// 捨てるものを選ぶのに全件を舐めるので、上限ちょうどからは毎回ではなく、上限の 1/16 を超えたときにまとめて上限まで減らす。
     fn enforce_cap(&mut self, touched: &HashSet<EntryKey>) -> Vec<EntryKey> {
         if self.len <= self.cap + self.cap / 16 {
             return Vec::new();
         }
-        let mut keys: Vec<(usize, String, String, usize, usize)> = self
-            .entries
-            .iter()
-            .flat_map(|(ruby, list)| list.iter().map(move |m| (count_graphemes(ruby), ruby.clone(), m.word.clone(), m.lcid, m.rcid)))
-            .filter(|(_, ruby, word, l, r)| !touched.contains(&(ruby.clone(), word.clone(), *l, *r)))
-            .collect();
-        // 長い順 (同じ長さなら読み・表層の降順) に並べて先頭から捨てる
-        keys.sort_by(|a, b| b.cmp(a));
-        let excess = self.len - self.cap;
-        let removed: Vec<EntryKey> = keys.into_iter().take(excess).map(|(_, ruby, word, l, r)| (ruby, word, l, r)).collect();
+        let removed = pick_evictions(&self.entries, touched, self.len - self.cap);
         remove_keys(&mut self.entries, &removed);
-        self.len = self.entries.values().map(Vec::len).sum();
+        self.len = count_entries(&self.entries);
         removed
     }
-}
-
-/// 整理して、消した件数を返す。
-fn prune_entries(entries: &mut HashMap<String, Vec<MemEntry>>, today: u16) -> usize {
-    let today = i32::from(today);
-    let mut removed = 0;
-    entries.retain(|_, list| {
-        list.retain_mut(|m| {
-            if today < i32::from(m.last_updated) || today < i32::from(m.last_used) {
-                // 変なデータは入れ直す
-                m.count = 1;
-                m.last_used = today as u16;
-                m.last_updated = today as u16;
-            }
-            if today - i32::from(m.last_used) >= 128 {
-                removed += 1;
-                return false;
-            }
-            while today - i32::from(m.last_updated) > 32 {
-                m.count >>= 1;
-                m.last_updated += 32;
-            }
-            if m.count == 0 {
-                removed += 1;
-                return false;
-            }
-            true
-        });
-        !list.is_empty()
-    });
-    removed
-}
-
-fn remove_keys(entries: &mut HashMap<String, Vec<MemEntry>>, keys: &[EntryKey]) {
-    for (ruby, word, lcid, rcid) in keys {
-        if let Some(list) = entries.get_mut(ruby) {
-            list.retain(|m| !(m.word == *word && m.lcid == *lcid && m.rcid == *rcid));
-            if list.is_empty() {
-                entries.remove(ruby);
-            }
-        }
-    }
-}
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// `learning.tsv` に書く。pid と通し番号で一意にした一時ファイルへ書き、`sync_all` してから rename する
-/// (電源断でも、半端なファイルが本物に置き換わらない)。背景スレッドから呼ぶ。
-/// IME プロセスが同時に複数いると後から書いたものが勝つ (last-writer-wins) が、通常は 1 つなので許容する。
-fn write_file(path: &Path, entries: &HashMap<String, Vec<MemEntry>>) {
-    let result = (|| -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            crate::private_fs::create_dir_all(dir)?;
-        }
-        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tsv.tmp-{}-{n}", std::process::id()));
-        let written = (|| -> std::io::Result<()> {
-            let mut file = crate::private_fs::create_file(&tmp)?;
-            file.write_all(serialize(entries).as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
-    })();
-    if let Err(e) = result {
-        crate::platform::log(&format!("learning file not saved: {e}"));
-    }
-}
-
-/// 壊れたファイルを `<name>.corrupt-<unix 秒>` に残す。同名があれば `-1`, `-2` ... を付けて、前の退避は上書きしない。
-/// `rename` が false なら写しを取る (元のファイルは次の保存で置き換わる)。
-fn backup(path: &Path, rename: bool) -> std::io::Result<()> {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let name = path.file_name().map_or_else(|| FILE_NAME.into(), |n| n.to_string_lossy().into_owned());
-    let mut target = path.with_file_name(format!("{name}.corrupt-{secs}"));
-    let mut n = 0;
-    while target.exists() {
-        n += 1;
-        target = path.with_file_name(format!("{name}.corrupt-{secs}-{n}"));
-    }
-    if rename {
-        std::fs::rename(path, target)
-    } else {
-        crate::private_fs::copy(path, &target)
-    }
-}
-
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn unescape(s: &str) -> Option<String> {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        out.push(match chars.next()? {
-            '\\' => '\\',
-            't' => '\t',
-            'n' => '\n',
-            'r' => '\r',
-            _ => return None,
-        });
-    }
-    Some(out)
-}
-
-/// 読み → 表層 → lcid → rcid の順に並べて書く (内容が同じなら同じバイト列になる)。
-fn serialize(entries: &HashMap<String, Vec<MemEntry>>) -> String {
-    let mut rubies: Vec<&String> = entries.keys().collect();
-    rubies.sort();
-    let mut out = String::from(HEADER);
-    out.push('\n');
-    for ruby in rubies {
-        let mut list: Vec<&MemEntry> = entries[ruby].iter().collect();
-        list.sort_by(|a, b| (&a.word, a.lcid, a.rcid).cmp(&(&b.word, b.lcid, b.rcid)));
-        for m in list {
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                escape(ruby),
-                escape(&m.word),
-                m.lcid,
-                m.rcid,
-                m.mid,
-                m.count,
-                m.last_used,
-                m.last_updated
-            ));
-        }
-    }
-    out
-}
-
-struct Parsed {
-    entries: HashMap<String, Vec<MemEntry>>,
-    /// 読めずに飛ばした行数 (空行は数えない)
-    skipped: usize,
-}
-
-/// 1 行ずつ読み、読めない行・重複する行は飛ばして数える。ヘッダが違う (別のファイル・壊れている) ときだけ `None`。
-fn parse(bytes: &[u8]) -> Option<Parsed> {
-    let mut lines = bytes.split(|&b| b == b'\n');
-    let header = std::str::from_utf8(lines.next()?).ok()?;
-    if header.trim_end_matches('\r') != HEADER {
-        return None;
-    }
-    let mut entries: HashMap<String, Vec<MemEntry>> = HashMap::new();
-    let mut skipped = 0;
-    for raw in lines {
-        if raw.is_empty() {
-            continue;
-        }
-        let Some((ruby, m)) = std::str::from_utf8(raw).ok().and_then(|line| parse_line(line.trim_end_matches('\r'))) else {
-            skipped += 1;
-            continue;
-        };
-        let list = entries.entry(ruby).or_default();
-        if list.iter().any(|x| x.word == m.word && x.lcid == m.lcid && x.rcid == m.rcid) {
-            skipped += 1;
-            continue;
-        }
-        list.push(m);
-    }
-    Some(Parsed { entries, skipped })
-}
-
-fn parse_line(line: &str) -> Option<(String, MemEntry)> {
-    let f: Vec<&str> = line.split('\t').collect();
-    if f.len() != 8 {
-        return None;
-    }
-    let ruby = unescape(f[0])?;
-    if ruby.is_empty() {
-        return None;
-    }
-    let m = MemEntry {
-        word: unescape(f[1])?,
-        lcid: f[2].parse().ok()?,
-        rcid: f[3].parse().ok()?,
-        mid: f[4].parse().ok()?,
-        count: f[5].parse().ok()?,
-        last_used: f[6].parse().ok()?,
-        last_updated: f[7].parse().ok()?,
-    };
-    Some((ruby, m))
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::time::Instant;
 
     use super::*;
 
@@ -954,7 +649,7 @@ mod tests {
         let path = dir.join("learning.tsv");
         std::fs::write(&path, "old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_file(&path, &HashMap::new());
+        write_file(&path, &Entries::new());
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir), 0o700);
@@ -1029,8 +724,8 @@ mod tests {
     #[test]
     fn temp_files_have_unique_names_and_are_synced_then_renamed() {
         let dir = tmp_dir("tmpnames");
-        let mut entries = HashMap::new();
-        entries.insert("ア".to_string(), vec![MemEntry { word: "亜".into(), lcid: 1, rcid: 1, mid: 1, count: 1, last_used: 1, last_updated: 1 }]);
+        let mut entries = Entries::new();
+        entries.insert("ア".into(), vec![MemEntry { word: "亜".into(), lcid: 1, rcid: 1, mid: 1, count: 1, last_used: 1, last_updated: 1 }]);
         let path = dir.join("learning.tsv");
         std::thread::scope(|s| {
             for _ in 0..4 {
