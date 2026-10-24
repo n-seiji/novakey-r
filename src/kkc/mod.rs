@@ -2,7 +2,7 @@
 //!
 //! 辞書ファイル形式 (`dict` / `louds`)、ラティスと N-best Viterbi (`lattice`)、動的エントリ (`wise`)、
 //! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine`。
-//! 学習は `learning` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で無効)。
+//! 学習は `learning` (設定 `learning_enabled` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で false) で無効)。
 #![forbid(unsafe_code)]
 
 pub mod check;
@@ -87,8 +87,8 @@ pub fn learning_allowed() -> bool {
 }
 
 /// 学習データの置き場所。英語の記憶 (english_memory) も同じ場所に置く。
-pub fn learning_dir() -> Option<std::path::PathBuf> {
-    learning::default_dir()
+pub fn learning_dir(config: &crate::config::Config) -> Option<std::path::PathBuf> {
+    learning::default_dir(config)
 }
 
 /// 辞書を開けなかったときに、次に開き直すまで空ける時間。コントローラ (入力クライアント) が増えるたびに
@@ -148,7 +148,7 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
     CORE.with(|c| {
         c.borrow_mut().get(
             std::time::Instant::now(),
-            || KkcCore::open_with_learning(learning::Learning::from_env()).map_err(|e| e.to_string()),
+            || KkcCore::open_with_learning(learning::Learning::from_config(crate::config::get())).map_err(|e| e.to_string()),
             crate::platform::log,
         )
     })
