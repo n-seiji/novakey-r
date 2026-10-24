@@ -251,6 +251,9 @@ declare_class!(
                 } else {
                     "AI並べ替え: オフ"
                 };
+                if ai_rerank_enabled() {
+                    set_credentials_missing(llm_bridge::availability() != llm_bridge::Availability::Available);
+                }
                 let warning = (ai_rerank_enabled() && credentials_missing())
                     .then_some("LLMリランキング無効(Cloudflare認証情報を確認)");
                 platform::build_menu(
@@ -273,11 +276,10 @@ declare_class!(
                     llm_bridge::cancel_all();
                 }
                 if enabled {
-                    let avail = llm_bridge::availability();
-                    set_credentials_missing(avail != llm_bridge::Availability::Available);
-                    if credentials_missing() {
-                        platform::log(&format!("LLM unavailable: {:?}", avail));
-                    }
+                    // Keychain の読み出しは止まりうるので待たない。結果は、メニューを開いたとき (menu) か
+                    // 最初の送信の結果で警告に反映される。
+                    set_credentials_missing(false);
+                    llm_bridge::prepare();
                 }
             })
         }

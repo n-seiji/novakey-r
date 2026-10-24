@@ -2,7 +2,8 @@
 //!
 //! 通信と Keychain は trait (`Transport` / `CredentialStore`)、時刻は引数 (`now`) で渡すので、
 //! デバウンス・最新世代だけを採用する規則・同一リクエストの再利用は、ネットワークなしでテストできる。
-//! 呼び出し側 (`llm_bridge`) は `State` を Mutex で包み、`take_due` で取り出した送信をロックの外で実行して `complete` に返す。
+//! 呼び出し側 (`llm_bridge`) は `State` を Mutex で包み、`take_due` で取り出した送信と、`take_load_request` で頼まれた
+//! 認証情報の読み出しを、ロックの外で実行して `complete` / `credentials_loaded` に返す (ロックの中で I/O をしない)。
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -36,9 +37,14 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// Keychain 等から認証情報を読む。未登録は `None`。
-pub trait CredentialStore {
-    fn load(&self) -> Option<Credentials>;
+/// 認証情報を読めなかった (ロック中・アクセス拒否など)。未登録は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreError;
+
+/// Keychain 等から認証情報を読む。未登録は `Ok(None)`、読めなかったときは `Err`。
+/// 読み出しは長く止まりうるので、`State` のロックを持ったまま呼ばない。
+pub trait CredentialStore: Send + Sync {
+    fn load(&self) -> Result<Option<Credentials>, StoreError>;
 }
 
 pub struct HttpRequest {
@@ -171,10 +177,36 @@ pub struct Submitted {
     pub log_missing: bool,
 }
 
-pub struct State<S: CredentialStore> {
-    store: S,
-    /// `None` は未読込、`Some(None)` は読んだが未登録。Keychain は最初の送信まで触らない。
-    creds: Option<Option<Credentials>>,
+/// `credentials_loaded` の結果。読み出し待ちだった要求の分をまとめて返す。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Loaded {
+    pub deliveries: Vec<Delivery>,
+    pub log_missing: bool,
+}
+
+enum CredState {
+    /// 未読込。Keychain は最初の送信かトグル ON まで触らない。
+    Unknown,
+    /// 読み出しが要求された。ワーカーが `take_load_request` で引き取る。
+    Wanted,
+    /// ワーカーが読み出し中 (ロックの外)。
+    Loading,
+    Loaded(Credentials),
+    /// 読んだが未登録。
+    Missing,
+    /// 読めなかった (ロック中・拒否など)。使えない扱いは `Missing` と同じ。
+    Unreadable,
+}
+
+/// 認証情報の読み出し待ちの要求 (コントローラごとに最新の 1 件)。
+struct Awaiting {
+    since: Instant,
+    job: Job,
+}
+
+pub struct State {
+    creds: CredState,
+    awaiting: HashMap<u64, Awaiting>,
     missing_logged: bool,
     latest: HashMap<u64, u64>,
     /// 送信を始めた (または結果を配信した) 世代。urgent の重複送信を防ぐ。
@@ -185,11 +217,11 @@ pub struct State<S: CredentialStore> {
     pending: HashMap<u64, Pending>,
 }
 
-impl<S: CredentialStore> State<S> {
-    pub fn new(store: S) -> Self {
+impl State {
+    pub fn new() -> Self {
         Self {
-            store,
-            creds: None,
+            creds: CredState::Unknown,
+            awaiting: HashMap::new(),
             missing_logged: false,
             latest: HashMap::new(),
             sent: HashMap::new(),
@@ -199,20 +231,69 @@ impl<S: CredentialStore> State<S> {
         }
     }
 
-    /// トグルを ON にしたときの確認。まだ読んでいなければ Keychain には触れず「使える」とみなす
-    /// (最初の送信で分かる)。未登録と分かっているときだけ読み直す。
-    pub fn availability(&mut self) -> bool {
-        if matches!(self.creds, Some(None)) {
-            self.creds = Some(self.store.load());
-        }
-        !matches!(self.creds, Some(None))
+    /// 使えなさそうか。未読込・読み出し中は「使える」とみなす (送信時に分かる)。読まない。
+    pub fn availability(&self) -> bool {
+        !matches!(self.creds, CredState::Missing | CredState::Unreadable)
     }
 
-    fn credentials(&mut self) -> Option<Credentials> {
-        if self.creds.is_none() {
-            self.creds = Some(self.store.load());
+    /// 認証情報の読み出しを頼む (トグル ON 時)。読み込み済みなら何もしない。
+    /// 未登録・読めなかったときは読み直す。実際に読むのはワーカー。
+    pub fn request_credentials(&mut self) {
+        if matches!(self.creds, CredState::Unknown | CredState::Missing | CredState::Unreadable) {
+            self.creds = CredState::Wanted;
         }
-        self.creds.clone().flatten()
+    }
+
+    /// 読み出しを頼まれていれば引き取る (`true` ならロックを外して `store.load()` し、`credentials_loaded` を呼ぶ)。
+    pub fn take_load_request(&mut self) -> bool {
+        if matches!(self.creds, CredState::Wanted) {
+            self.creds = CredState::Loading;
+            return true;
+        }
+        false
+    }
+
+    /// 読み出しの結果を受ける。待っていた要求は、まだ最新のものだけ続きを進める。
+    pub fn credentials_loaded(&mut self, result: Result<Option<Credentials>, StoreError>) -> Loaded {
+        let loaded = match result {
+            Ok(Some(c)) => {
+                self.creds = CredState::Loaded(c.clone());
+                Some(c)
+            }
+            Ok(None) => {
+                self.creds = CredState::Missing;
+                None
+            }
+            Err(StoreError) => {
+                self.creds = CredState::Unreadable;
+                None
+            }
+        };
+        let mut out = Loaded::default();
+        if loaded.is_none() {
+            out.log_missing = self.note_missing();
+        }
+        let mut waiting: Vec<(u64, Awaiting)> = self.awaiting.drain().collect();
+        waiting.sort_unstable_by_key(|(id, _)| *id);
+        for (id, a) in waiting {
+            if !self.is_latest(id, a.job.generation) {
+                continue;
+            }
+            let submitted = match &loaded {
+                Some(c) => self.admit(a.since, a.job, c.clone()),
+                None => self.deliver_missing(a.job),
+            };
+            out.log_missing |= submitted.log_missing;
+            out.deliveries.extend(submitted.delivery);
+        }
+        out
+    }
+
+    /// 「認証情報なし」のログを出すべきか (1 度だけ true)。
+    fn note_missing(&mut self) -> bool {
+        let first = !self.missing_logged;
+        self.missing_logged = true;
+        first
     }
 
     fn register_latest(&mut self, id: u64, generation: u64) {
@@ -225,24 +306,42 @@ impl<S: CredentialStore> State<S> {
     }
 
     pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
-        let Job { controller_id: id, generation, payload: key, urgent } = job;
-        if key.candidates().len() < 2 {
+        if job.payload.candidates().len() < 2 {
             return Submitted::default();
         }
-        let Some(creds) = self.credentials() else {
-            let log_missing = !self.missing_logged;
-            self.missing_logged = true;
-            self.register_latest(id, generation);
-            return Submitted {
-                delivery: Some(Delivery {
-                    controller_id: id,
-                    generation,
-                    status: STATUS_CREDENTIALS_MISSING,
-                    text: "Cloudflare認証情報なし".into(),
-                }),
-                log_missing,
-            };
-        };
+        match &self.creds {
+            CredState::Loaded(c) => {
+                let c = c.clone();
+                self.admit(now, job, c)
+            }
+            CredState::Missing | CredState::Unreadable => self.deliver_missing(job),
+            CredState::Unknown | CredState::Wanted | CredState::Loading => {
+                if matches!(self.creds, CredState::Unknown) {
+                    self.creds = CredState::Wanted;
+                }
+                self.register_latest(job.controller_id, job.generation);
+                self.awaiting.insert(job.controller_id, Awaiting { since: now, job });
+                Submitted::default()
+            }
+        }
+    }
+
+    fn deliver_missing(&mut self, job: Job) -> Submitted {
+        let log_missing = self.note_missing();
+        self.register_latest(job.controller_id, job.generation);
+        Submitted {
+            delivery: Some(Delivery {
+                controller_id: job.controller_id,
+                generation: job.generation,
+                status: STATUS_CREDENTIALS_MISSING,
+                text: "Cloudflare認証情報なし".into(),
+            }),
+            log_missing,
+        }
+    }
+
+    fn admit(&mut self, now: Instant, job: Job, creds: Credentials) -> Submitted {
+        let Job { controller_id: id, generation, payload: key, urgent } = job;
         if let Some((cached_key, index)) = &self.last_result {
             // key には context_dropped も含まれる。送る本文が同じでも理由が違えば外れるだけで、漏れは増えない (キャッシュ命中が減る側にしか倒れない)。
             if *cached_key == key {
@@ -303,6 +402,7 @@ impl<S: CredentialStore> State<S> {
     /// (世代の記録ごと消すので、組成が終わったコントローラの分も残らない)。
     pub fn cancel(&mut self, id: u64) {
         self.pending.remove(&id);
+        self.awaiting.remove(&id);
         self.latest.remove(&id);
         self.sent.remove(&id);
     }
@@ -310,6 +410,7 @@ impl<S: CredentialStore> State<S> {
     /// 全コントローラぶん `cancel` する (AI をオフにしたとき)。
     pub fn cancel_all(&mut self) {
         self.pending.clear();
+        self.awaiting.clear();
         self.latest.clear();
         self.sent.clear();
     }
@@ -334,18 +435,70 @@ impl<S: CredentialStore> State<S> {
 mod tests {
     use super::*;
     use crate::outbound::{self, Decision};
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
+    use std::cell::RefCell;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Loads(Arc<AtomicU32>);
+
+    impl Loads {
+        fn get(&self) -> u32 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
 
     struct Store {
-        creds: Option<Credentials>,
-        loads: Rc<Cell<u32>>,
+        result: Mutex<Result<Option<Credentials>, StoreError>>,
+        loads: Loads,
     }
 
     impl CredentialStore for Store {
-        fn load(&self) -> Option<Credentials> {
-            self.loads.set(self.loads.get() + 1);
-            self.creds.clone()
+        fn load(&self) -> Result<Option<Credentials>, StoreError> {
+            self.loads.0.fetch_add(1, Ordering::SeqCst);
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    /// `State` と fake の store。ワーカーがやる「読み出しを頼まれたら読んで結果を渡す」を `submit` の直後に同期で行う。
+    struct Rig {
+        state: State,
+        store: Store,
+    }
+
+    impl Deref for Rig {
+        type Target = State;
+        fn deref(&self) -> &State {
+            &self.state
+        }
+    }
+
+    impl DerefMut for Rig {
+        fn deref_mut(&mut self) -> &mut State {
+            &mut self.state
+        }
+    }
+
+    impl Rig {
+        /// 頼まれていれば store を読んで結果を渡す (ワーカーの `load_credentials` 相当)。
+        fn pump(&mut self) -> Loaded {
+            if self.state.take_load_request() {
+                self.state.credentials_loaded(self.store.load())
+            } else {
+                Loaded::default()
+            }
+        }
+
+        /// 提出し、読み出しがあればそれも済ませて、最初の結果を `delivery` に載せる。
+        fn submit(&mut self, now: Instant, job: Job) -> Submitted {
+            let mut out = self.state.submit(now, job);
+            let loaded = self.pump();
+            out.log_missing |= loaded.log_missing;
+            if out.delivery.is_none() {
+                out.delivery = loaded.deliveries.into_iter().next();
+            }
+            out
         }
     }
 
@@ -353,10 +506,14 @@ mod tests {
         Credentials { api_token: "tok".into(), account_id: "acct".into() }
     }
 
-    fn state(with_creds: bool) -> (State<Store>, Rc<Cell<u32>>) {
-        let loads = Rc::new(Cell::new(0));
-        let store = Store { creds: with_creds.then(creds), loads: loads.clone() };
-        (State::new(store), loads)
+    fn rig(result: Result<Option<Credentials>, StoreError>) -> (Rig, Loads) {
+        let loads = Loads::default();
+        let store = Store { result: Mutex::new(result), loads: loads.clone() };
+        (Rig { state: State::new(), store }, loads)
+    }
+
+    fn state(with_creds: bool) -> (Rig, Loads) {
+        rig(Ok(with_creds.then(creds)))
     }
 
     fn screened(context: &str, reading: &str, candidates: &[&str]) -> Screened {
@@ -450,9 +607,44 @@ mod tests {
         let (mut s, loads) = state(true);
         assert!(s.availability());
         assert_eq!(loads.get(), 0);
+        assert!(!s.take_load_request(), "頼まれていないものは読まない");
         s.submit(Instant::now(), job(1, 1, "あ", false));
         s.submit(Instant::now(), job(1, 2, "あい", false));
         assert_eq!(loads.get(), 1, "読み込みは 1 度きりで、結果を使い回す");
+    }
+
+    #[test]
+    fn a_request_arriving_before_the_load_waits_without_reading() {
+        let (mut s, loads) = state(true);
+        let t0 = Instant::now();
+        let first = s.state.submit(t0, job(1, 1, "あ", false));
+        assert_eq!(first, Submitted::default());
+        assert_eq!(loads.get(), 0, "submit は store を読まない");
+        assert!(s.next_deadline().is_none(), "読み出し待ちは送信待機に入らない");
+        assert!(s.state.submit(t0, job(1, 2, "あい", false)).delivery.is_none());
+        assert!(s.take_load_request());
+        assert!(!s.take_load_request(), "読み出しは 1 度しか頼まれない");
+        let loaded = s.state.credentials_loaded(s.store.load());
+        assert_eq!(loaded, Loaded::default());
+        let due = s.take_due(ms(t0, 250));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].generation, 2, "待っている間に来た新しい世代だけが残る");
+    }
+
+    #[test]
+    fn requests_cancelled_while_loading_are_dropped() {
+        let (mut s, _) = state(false);
+        let t0 = Instant::now();
+        s.state.submit(t0, job(1, 1, "あ", false));
+        s.state.submit(t0, job(2, 1, "い", false));
+        s.cancel(1);
+        assert!(s.take_load_request());
+        let loaded = s.state.credentials_loaded(s.store.load());
+        assert_eq!(loaded.deliveries.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![2]);
+        assert!(!s.is_latest(1, 1));
+        s.state.submit(t0, job(3, 1, "う", false));
+        s.cancel_all();
+        assert_eq!(s.pump(), Loaded::default());
     }
 
     #[test]
@@ -462,6 +654,7 @@ mod tests {
         assert_eq!(first.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
         assert!(first.log_missing);
         let second = s.submit(Instant::now(), job(1, 2, "あい", false));
+        assert_eq!(second.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
         assert!(!second.log_missing);
         assert_eq!(loads.get(), 1, "打鍵ごとに Keychain を読み直さない");
         assert!(s.next_deadline().is_none());
@@ -473,6 +666,46 @@ mod tests {
         s.submit(Instant::now(), job(1, 1, "あ", false));
         assert_eq!(loads.get(), 1);
         assert!(!s.availability());
+        assert_eq!(loads.get(), 1, "availability は読まない");
+        s.request_credentials();
+        s.pump();
+        assert_eq!(loads.get(), 2);
+        assert!(!s.availability());
+
+        let (mut s, loads) = state(true);
+        s.submit(Instant::now(), job(1, 1, "あ", false));
+        s.request_credentials();
+        assert!(!s.take_load_request(), "読み込み済みなら読み直さない");
+        assert_eq!(loads.get(), 1);
+    }
+
+    #[test]
+    fn credentials_registered_later_are_found_after_a_reload() {
+        let (mut s, _) = state(false);
+        s.submit(Instant::now(), job(1, 1, "あ", false));
+        assert!(!s.availability());
+        *s.store.result.lock().unwrap() = Ok(Some(creds()));
+        s.request_credentials();
+        assert!(s.availability(), "読み出し中は使えるとみなす");
+        s.pump();
+        let t0 = Instant::now();
+        assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
+        assert_eq!(s.take_due(t0).len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_store_is_unavailable_but_can_be_reread() {
+        let (mut s, loads) = rig(Err(StoreError));
+        let first = s.submit(Instant::now(), job(1, 1, "あ", false));
+        assert_eq!(first.delivery.as_ref().map(|d| d.status), Some(STATUS_CREDENTIALS_MISSING));
+        assert!(first.log_missing);
+        assert!(!s.submit(Instant::now(), job(1, 2, "あい", false)).log_missing);
+        assert_eq!(loads.get(), 1);
+        assert!(!s.availability());
+        *s.store.result.lock().unwrap() = Ok(Some(creds()));
+        s.request_credentials();
+        s.pump();
+        assert!(s.availability());
         assert_eq!(loads.get(), 2);
     }
 
