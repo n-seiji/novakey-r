@@ -114,12 +114,19 @@ mod tests {
     #[derive(Default)]
     struct Env {
         secure: bool,
+        live: std::cell::Cell<bool>,
         logs: RefCell<Vec<String>>,
     }
 
     impl Environment for Env {
         fn secure_input(&self) -> bool {
             self.secure
+        }
+        fn live_conversion(&self) -> bool {
+            self.live.get()
+        }
+        fn set_live_conversion(&self, enabled: bool) {
+            self.live.set(enabled);
         }
         fn rerank_allowed(&self) -> bool {
             true
