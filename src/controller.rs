@@ -370,7 +370,7 @@ mod tests {
 
     fn fixture() -> Fixture {
         let panel = FakePanel::default();
-        let controller = Controller::new(1, new_session(ConversionMode::Space, 0), panel.clone(), FakeEnv);
+        let controller = Controller::new(1, new_session(ConversionMode::Space, 0), panel.clone(), FakeEnv::default());
         (controller, FakeClient::default(), panel)
     }
 
