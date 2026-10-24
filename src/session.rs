@@ -799,43 +799,70 @@ mod tests {
         (session.marked_text(), committed)
     }
 
-    // 以下は現挙動の固定 (特性テスト)。期待値は --simulate で得た値で、正しい挙動ではない。
-    // 取り消し系は段 3-3 / 3-6 で直す予定。直したらこの期待値を新しい仕様に書き換える。
+    // 取り消しは英字入力 (Literal / Mixed) の局面を保つ。表示と確定は一致する。
 
     #[test]
-    fn 現挙動_変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
+    fn 変換を取り消したあとも英字が確定に残る() {
         let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<space><bs><bs>"), ("きょうT".to_string(), String::new()));
-        // 見た目は きょうT だが、確定は kyouT (変換なしで打った kyouT は きょうT を確定する)
-        assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
+        assert_eq!(drive(&mut s, "<enter>").1, "きょうT");
     }
 
     #[test]
-    fn 現挙動_字種変換を取り消したあとの英字が確定で落ちる_段3_3で直す予定() {
+    fn 字種変換を取り消したあとも英字が確定に残る() {
         let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "kyouTo<F7><esc><bs>"), ("きょうT".to_string(), String::new()));
-        assert_eq!(drive(&mut s, "<enter>").1, "kyouT");
+        assert_eq!(drive(&mut s, "<enter>").1, "きょうT");
     }
 
     #[test]
-    fn 現挙動_取り消し後に打った文字で履歴依存の確定になる_段3_3で直す予定() {
+    fn 取り消し後に打った文字も変換なしと同じ確定になる() {
         let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         assert_eq!(drive(&mut s, "iPhone<space><esc>s").0, "いPhones");
-        assert_eq!(drive(&mut s, "<enter>").1, "iPhones");
+        assert_eq!(drive(&mut s, "<enter>").1, "いPhones");
     }
 
     #[test]
-    fn 現挙動_取り消し後のbsと打鍵が英字を読み直す_段3_3で直す予定() {
+    fn 取り消し後のbsと打鍵は英字のまま続く() {
         let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
-        assert_eq!(drive(&mut s, "Tokyo<F7><esc><bs>a").0, "Tokyあ");
+        assert_eq!(drive(&mut s, "Tokyo<F7><esc><bs>a").0, "Tokya");
     }
 
     #[test]
-    fn 現挙動_取り消し後のspaceで英字が変換に入る_段3_3で直す予定() {
+    fn 取り消し後のspaceは変換せず英字を確定して空白を入れる() {
         let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
         let (shown, committed) = drive(&mut s, "Tokyo<F7><esc><space>");
-        assert_eq!((shown.as_str(), committed.as_str()), ("Tokyo", ""));
-        assert!(matches!(s.phase(), Phase::Converting { .. }));
+        assert_eq!((shown.as_str(), committed.as_str()), ("", "Tokyo "));
+        assert_eq!(s.phase(), Phase::Empty);
+    }
+
+    // 英語分割 (artifactni) は変換に入るときに英単語とかなへ分ける。取り消しは分ける前の打鍵中に戻る。
+
+    #[test]
+    fn 英語分割の変換を取り消して続きを打つと取り消さずに打った結果と同じ() {
+        let mut s = english_session();
+        let reverted = drive(&mut s, "artifactni<space><esc>tsuite<enter>");
+        let mut d = english_session();
+        let direct = drive(&mut d, "artifactnitsuite<enter>");
+        assert_eq!(reverted, direct);
+        assert_eq!(reverted.1, "artifactについて");
+    }
+
+    #[test]
+    fn 英語分割の変換を取り消してbsしても取り消さずに打った結果と同じ() {
+        let mut s = english_session();
+        let reverted = drive(&mut s, "artifactni<space><esc><bs><space>");
+        let mut d = english_session();
+        let direct = drive(&mut d, "artifactni<bs><space>");
+        assert_eq!(reverted, direct);
+        assert_eq!(s.phase(), d.phase());
+    }
+
+    #[test]
+    fn かなを消しきった後のbsと打鍵は英字のまま続く() {
+        let mut s = Session::new(Composer::new(NullEngine), ConversionMode::Space);
+        assert_eq!(drive(&mut s, "Tokyo<bs>a").0, "Tokya");
+        assert_eq!(s.phase(), Phase::Literal);
     }
 
     #[test]
