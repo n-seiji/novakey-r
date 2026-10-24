@@ -130,6 +130,12 @@ impl<E: CandidateEngine> Composer<E> {
         self
     }
 
+    /// 世代番号の開始値。
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
+
     pub fn set_live(&mut self, live: bool) {
         self.live = live;
     }

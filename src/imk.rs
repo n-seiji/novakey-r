@@ -154,7 +154,7 @@ declare_class!(
                 let this = this.set_ivars(Ivars {
                     controller: Controller::new(
                         controller_id,
-                        new_session(ConversionMode::Space),
+                        new_session(ConversionMode::Space, 0),
                         PlatformPanel,
                         PlatformEnv,
                     ),
@@ -215,6 +215,9 @@ declare_class!(
         #[method(candidateSelectionChanged:)]
         fn candidate_selection_changed(&self, candidate_string: Option<&AnyObject>) {
             self.guard_session(|| (), || {
+                if self.ivars().controller.is_syncing() {
+                    return;
+                }
                 let Some(text) = candidate_string.and_then(platform::candidate_text) else {
                     return;
                 };
