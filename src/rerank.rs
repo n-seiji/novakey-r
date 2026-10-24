@@ -23,6 +23,20 @@ pub const KEYCHAIN_ACCOUNT_ID: &str = "account-id";
 const RANK_INSTRUCTIONS: &str = "読みに対して最も自然なかな漢字変換候補を選べ";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEBOUNCE: Duration = Duration::from_millis(250);
+/// 同時に飛ばす送信の上限。古い送信が 3 秒詰まっても、新しい (Space の) 送信を待たせないための余地。
+pub const MAX_IN_FLIGHT: usize = 2;
+
+/// AI 並べ替えを今使えるか。`CredentialsRejected` / `Paused` は、エラーの分類を入れる段で使い始める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Availability {
+    Ready,
+    CredentialsMissing,
+    CredentialsRejected,
+    Paused,
+    /// 送信スレッドなどが落ちて、以後は何も送らない。
+    Disabled,
+}
 
 /// Cloudflare の認証情報。ログやエラーに出さないよう Debug は伏せる。
 #[derive(Clone, PartialEq, Eq)]
@@ -215,6 +229,10 @@ pub struct State {
     last_result: Option<(Screened, usize)>,
     request_count: u64,
     pending: HashMap<u64, Pending>,
+    /// 送信中の件数 (`take_due` で増やし、`release_slot` で減らす)。上限は `MAX_IN_FLIGHT`。
+    in_flight: usize,
+    /// 落ちたら立つ。以後は何も受け付けない。
+    disabled: bool,
 }
 
 impl State {
@@ -228,17 +246,54 @@ impl State {
             last_result: None,
             request_count: 0,
             pending: HashMap::new(),
+            in_flight: 0,
+            disabled: false,
         }
     }
 
-    /// 使えなさそうか。未読込・読み出し中は「使える」とみなす (送信時に分かる)。読まない。
-    pub fn availability(&self) -> bool {
-        !matches!(self.creds, CredState::Missing | CredState::Unreadable)
+    /// 今分かっている状態。未読込・読み出し中は使えるとみなす (送信時に分かる)。読まない。
+    pub fn availability(&self) -> Availability {
+        if self.disabled {
+            Availability::Disabled
+        } else if matches!(self.creds, CredState::Missing | CredState::Unreadable) {
+            Availability::CredentialsMissing
+        } else {
+            Availability::Ready
+        }
+    }
+
+    /// 使えない扱いにして、待機中の要求を捨てる。最初の 1 回だけ `true`。
+    pub fn disable(&mut self) -> bool {
+        let first = !self.disabled;
+        self.disabled = true;
+        self.cancel_all();
+        first
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    pub fn has_free_slot(&self) -> bool {
+        self.in_flight < MAX_IN_FLIGHT
+    }
+
+    /// 送信を終えた (または起こせなかった) 枠を返す。
+    pub fn release_slot(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
     }
 
     /// 認証情報の読み出しを頼む (トグル ON 時)。読み込み済みなら何もしない。
     /// 未登録・読めなかったときは読み直す。実際に読むのはワーカー。
     pub fn request_credentials(&mut self) {
+        if self.disabled {
+            return;
+        }
         if matches!(self.creds, CredState::Unknown | CredState::Missing | CredState::Unreadable) {
             self.creds = CredState::Wanted;
         }
@@ -306,7 +361,7 @@ impl State {
     }
 
     pub fn submit(&mut self, now: Instant, job: Job) -> Submitted {
-        if job.payload.candidates().len() < 2 {
+        if self.disabled || job.payload.candidates().len() < 2 {
             return Submitted::default();
         }
         match &self.creds {
@@ -368,14 +423,20 @@ impl State {
         self.pending.values().map(|p| p.due).min()
     }
 
-    /// 時刻が来た送信を取り出す。取り出した時点で「送信済み」として数える。
-    #[cfg(test)]
+    /// 時刻が来た送信を、空き枠の分だけ取り出す。取り出した時点で「送信済み」として数え、枠を埋める。
+    /// 残りは待機に残り、枠が返ったあとの呼び出しで取り出す。
     pub fn take_due(&mut self, now: Instant) -> Vec<InFlight> {
-        self.take_due_up_to(now, usize::MAX)
+        let free = MAX_IN_FLIGHT.saturating_sub(self.in_flight);
+        if free == 0 {
+            return Vec::new();
+        }
+        let out = self.take_due_up_to(now, free);
+        self.in_flight += out.len();
+        out
     }
 
-    /// 取り出す件数に上限をつけた版。残りは待機に残り、次の呼び出しで取り出す。
-    pub fn take_due_up_to(&mut self, now: Instant, max: usize) -> Vec<InFlight> {
+    /// 枠を数えずに取り出す。
+    fn take_due_up_to(&mut self, now: Instant, max: usize) -> Vec<InFlight> {
         let mut ids: Vec<u64> = self.pending.iter().filter(|(_, p)| p.due <= now).map(|(id, _)| *id).collect();
         ids.sort_unstable();
         ids.truncate(max);
@@ -439,6 +500,13 @@ mod tests {
     use std::ops::{Deref, DerefMut};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+
+    impl State {
+        /// 空き枠を無視して、時刻が来たものを全部取り出す。
+        fn take_all_due(&mut self, now: Instant) -> Vec<InFlight> {
+            self.take_due_up_to(now, usize::MAX)
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Loads(Arc<AtomicU32>);
@@ -605,7 +673,7 @@ mod tests {
     #[test]
     fn keychain_is_untouched_until_the_first_send() {
         let (mut s, loads) = state(true);
-        assert!(s.availability());
+        assert_eq!(s.availability(), Availability::Ready);
         assert_eq!(loads.get(), 0);
         assert!(!s.take_load_request(), "頼まれていないものは読まない");
         s.submit(Instant::now(), job(1, 1, "あ", false));
@@ -626,7 +694,7 @@ mod tests {
         assert!(!s.take_load_request(), "読み出しは 1 度しか頼まれない");
         let loaded = s.state.credentials_loaded(s.store.load());
         assert_eq!(loaded, Loaded::default());
-        let due = s.take_due(ms(t0, 250));
+        let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].generation, 2, "待っている間に来た新しい世代だけが残る");
     }
@@ -665,12 +733,12 @@ mod tests {
         let (mut s, loads) = state(false);
         s.submit(Instant::now(), job(1, 1, "あ", false));
         assert_eq!(loads.get(), 1);
-        assert!(!s.availability());
+        assert_eq!(s.availability(), Availability::CredentialsMissing);
         assert_eq!(loads.get(), 1, "availability は読まない");
         s.request_credentials();
         s.pump();
         assert_eq!(loads.get(), 2);
-        assert!(!s.availability());
+        assert_eq!(s.availability(), Availability::CredentialsMissing);
 
         let (mut s, loads) = state(true);
         s.submit(Instant::now(), job(1, 1, "あ", false));
@@ -683,14 +751,14 @@ mod tests {
     fn credentials_registered_later_are_found_after_a_reload() {
         let (mut s, _) = state(false);
         s.submit(Instant::now(), job(1, 1, "あ", false));
-        assert!(!s.availability());
+        assert_eq!(s.availability(), Availability::CredentialsMissing);
         *s.store.result.lock().unwrap() = Ok(Some(creds()));
         s.request_credentials();
-        assert!(s.availability(), "読み出し中は使えるとみなす");
+        assert_eq!(s.availability(), Availability::Ready, "読み出し中は使えるとみなす");
         s.pump();
         let t0 = Instant::now();
         assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
-        assert_eq!(s.take_due(t0).len(), 1);
+        assert_eq!(s.take_all_due(t0).len(), 1);
     }
 
     #[test]
@@ -701,11 +769,11 @@ mod tests {
         assert!(first.log_missing);
         assert!(!s.submit(Instant::now(), job(1, 2, "あい", false)).log_missing);
         assert_eq!(loads.get(), 1);
-        assert!(!s.availability());
+        assert_eq!(s.availability(), Availability::CredentialsMissing);
         *s.store.result.lock().unwrap() = Ok(Some(creds()));
         s.request_credentials();
         s.pump();
-        assert!(s.availability());
+        assert_eq!(s.availability(), Availability::Ready);
         assert_eq!(loads.get(), 2);
     }
 
@@ -725,11 +793,11 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         assert_eq!(s.next_deadline(), Some(ms(t0, 250)));
-        assert!(s.take_due(ms(t0, 249)).is_empty());
-        let due = s.take_due(ms(t0, 250));
+        assert!(s.take_all_due(ms(t0, 249)).is_empty());
+        let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].request_number, 1);
-        assert!(s.take_due(ms(t0, 1000)).is_empty(), "取り出した送信は残らない");
+        assert!(s.take_all_due(ms(t0, 1000)).is_empty(), "取り出した送信は残らない");
     }
 
     #[test]
@@ -737,7 +805,7 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", true));
-        assert_eq!(s.take_due(t0).len(), 1);
+        assert_eq!(s.take_all_due(t0).len(), 1);
     }
 
     #[test]
@@ -746,24 +814,44 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         s.submit(ms(t0, 100), job(1, 2, "あい", false));
-        assert!(s.take_due(ms(t0, 250)).is_empty(), "新しい世代のデバウンスを待つ");
-        let due = s.take_due(ms(t0, 350));
+        assert!(s.take_all_due(ms(t0, 250)).is_empty(), "新しい世代のデバウンスを待つ");
+        let due = s.take_all_due(ms(t0, 350));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].generation, 2);
         assert_eq!(due[0].request_number, 1, "捨てた世代は数えない");
     }
 
     #[test]
-    fn take_due_up_to_leaves_the_rest_waiting() {
+    fn take_due_hands_out_only_free_slots_and_the_rest_waits() {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         for id in 1..=3 {
             s.submit(t0, job(id, 1, "あ", true));
         }
-        assert_eq!(s.take_due_up_to(t0, 2).len(), 2);
-        let rest = s.take_due_up_to(t0, 2);
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].controller_id, 3);
+        assert_eq!(s.take_due(t0).len(), MAX_IN_FLIGHT);
+        assert!(!s.has_free_slot());
+        assert!(s.take_due(t0).is_empty(), "枠が埋まっている間は取り出さない");
+        assert!(s.next_deadline().is_some(), "3 件目は待機に残る");
+        s.release_slot();
+        let rest = s.take_due(t0);
+        assert_eq!(rest.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![3]);
+        assert!(!s.has_free_slot());
+    }
+
+    #[test]
+    fn a_disabled_scheduler_accepts_nothing_and_reports_disabled() {
+        let (mut s, loads) = state(true);
+        let t0 = Instant::now();
+        s.submit(t0, job(1, 1, "あ", false));
+        assert!(s.disable(), "最初の 1 回だけ true");
+        assert!(!s.disable());
+        assert_eq!(s.availability(), Availability::Disabled);
+        assert!(s.next_deadline().is_none(), "待機中の要求は捨てる");
+        assert_eq!(s.submit(t0, job(1, 2, "あい", true)), Submitted::default());
+        s.request_credentials();
+        assert!(!s.take_load_request());
+        assert!(s.next_deadline().is_none(), "ジョブを溜めない");
+        assert_eq!(loads.get(), 1);
     }
 
     #[test]
@@ -773,7 +861,7 @@ mod tests {
         s.submit(t0, job(1, 1, "あ", false));
         s.submit(t0, job(2, 1, "い", false));
         s.cancel(1);
-        let due = s.take_due(ms(t0, 250));
+        let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![2]);
         s.cancel(2);
         assert_eq!(s.complete(due.into_iter().next().unwrap(), Ok(1)), None);
@@ -786,7 +874,7 @@ mod tests {
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
         s.submit(t0, job(2, 1, "い", false));
-        let due = s.take_due(ms(t0, 250));
+        let due = s.take_all_due(ms(t0, 250));
         assert_eq!(due.iter().map(|d| d.controller_id).collect::<Vec<_>>(), vec![1, 2]);
     }
 
@@ -795,7 +883,7 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
-        let sent = s.take_due(ms(t0, 250)).remove(0);
+        let sent = s.take_all_due(ms(t0, 250)).remove(0);
         s.submit(ms(t0, 300), job(1, 2, "あい", false));
         assert_eq!(s.complete(sent, Ok(1)), None);
     }
@@ -805,11 +893,11 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
-        let sent = s.take_due(ms(t0, 250)).remove(0);
+        let sent = s.take_all_due(ms(t0, 250)).remove(0);
         let d = s.complete(sent, Ok(1)).unwrap();
         assert_eq!((d.status, d.text.as_str(), d.generation), (STATUS_OK, "1", 1));
         s.submit(ms(t0, 300), job(1, 2, "あい", false));
-        let sent = s.take_due(ms(t0, 600)).remove(0);
+        let sent = s.take_all_due(ms(t0, 600)).remove(0);
         let d = s.complete(sent, Err(FetchError::Transport)).unwrap();
         assert_eq!(d.status, STATUS_FAILED);
     }
@@ -819,7 +907,7 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
-        let sent = s.take_due(ms(t0, 250)).remove(0);
+        let sent = s.take_all_due(ms(t0, 250)).remove(0);
         s.complete(sent, Ok(1)).unwrap();
         let again = s.submit(ms(t0, 400), job(1, 2, "あ", false));
         let d = again.delivery.expect("キャッシュで即座に返る");
@@ -832,7 +920,7 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
-        let sent = s.take_due(ms(t0, 250)).remove(0);
+        let sent = s.take_all_due(ms(t0, 250)).remove(0);
         s.complete(sent, Err(FetchError::Status(500)));
         let again = s.submit(ms(t0, 400), job(1, 2, "あ", false));
         assert!(again.delivery.is_none());
@@ -845,7 +933,7 @@ mod tests {
         let t0 = Instant::now();
         for (generation, reading) in [(1, "あ"), (2, "い")] {
             s.submit(t0, job(1, generation, reading, true));
-            let sent = s.take_due(t0).remove(0);
+            let sent = s.take_all_due(t0).remove(0);
             s.complete(sent, Ok(0)).unwrap();
         }
         assert!(s.submit(t0, job(1, 3, "あ", true)).delivery.is_none());
@@ -856,7 +944,7 @@ mod tests {
         let (mut s, _) = state(true);
         let t0 = Instant::now();
         s.submit(t0, job(1, 1, "あ", false));
-        s.take_due(ms(t0, 250));
+        s.take_all_due(ms(t0, 250));
         let again = s.submit(ms(t0, 260), job(1, 1, "あ", true));
         assert_eq!(again, Submitted::default());
         assert!(s.next_deadline().is_none(), "二重送信しない");
@@ -868,7 +956,7 @@ mod tests {
         let t0 = Instant::now();
         for generation in 1..=3 {
             s.submit(t0, job(1, generation, &format!("あ{generation}"), true));
-            let sent = s.take_due(t0).remove(0);
+            let sent = s.take_all_due(t0).remove(0);
             assert_eq!(sent.request_number, generation);
         }
     }

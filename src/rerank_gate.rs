@@ -7,9 +7,52 @@ use std::cell::Cell;
 
 use crate::controller::{Environment, TextClient};
 use crate::outbound::{self, Decision, Screened};
+use crate::rerank::Availability;
 
 /// 直前文脈として読む最大長 (UTF-16 単位)。
 const CONTEXT_MAX_UTF16: usize = 200;
+
+/// AI 並べ替えを使えるか (main スレッド側の唯一の記録)。トグルと、送信側から分かった状態をまとめる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiStatus {
+    Off,
+    On(Availability),
+}
+
+impl AiStatus {
+    pub fn is_on(self) -> bool {
+        !matches!(self, AiStatus::Off)
+    }
+
+    /// 要求を送ってよいか。送れないときは送信側 (Keychain を読む経路) へ進まない。
+    pub fn allows_requests(self) -> bool {
+        self == AiStatus::On(Availability::Ready)
+    }
+
+    /// オフにした後に届いた結果は、取り消し前に配信が済んでいたものでも反映しない。
+    pub fn accepts_results(self) -> bool {
+        self.is_on()
+    }
+
+    /// 送信側から分かった状態を取り込む。オフのままなら何もしない。
+    pub fn observe(self, availability: Availability) -> Self {
+        match self {
+            AiStatus::Off => AiStatus::Off,
+            AiStatus::On(_) => AiStatus::On(availability),
+        }
+    }
+
+    /// メニューに出す警告。使えるとき・オフのときは出さない。
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            AiStatus::Off | AiStatus::On(Availability::Ready) => None,
+            AiStatus::On(Availability::CredentialsMissing) => Some("LLMリランキング無効(Cloudflare認証情報を確認)"),
+            AiStatus::On(Availability::CredentialsRejected) => Some("LLMリランキング無効(Cloudflare認証情報が拒否されました)"),
+            AiStatus::On(Availability::Paused) => Some("LLMリランキング一時停止中"),
+            AiStatus::On(Availability::Disabled) => Some("LLMリランキング停止(内部エラー。再起動で復帰)"),
+        }
+    }
+}
 
 pub enum GateOutcome {
     Send(Screened),
@@ -158,5 +201,30 @@ mod tests {
         assert_eq!(env.logs.borrow().len(), 1);
         gate.check(&env, Some("com.apple.Terminal"), Some(&client), "きょう", &candidates());
         assert_eq!(env.logs.borrow().len(), 2);
+    }
+
+    #[test]
+    fn オフのあいだは要求も結果も通さず状態も取り込まない() {
+        let off = AiStatus::Off;
+        assert!(!off.allows_requests() && !off.accepts_results());
+        assert_eq!(off.observe(Availability::Disabled), AiStatus::Off);
+        assert_eq!(off.warning(), None);
+    }
+
+    #[test]
+    fn 要求を送れるのはオンで使えるときだけ() {
+        for a in [Availability::CredentialsMissing, Availability::CredentialsRejected, Availability::Paused, Availability::Disabled] {
+            let status = AiStatus::On(Availability::Ready).observe(a);
+            assert!(!status.allows_requests(), "{a:?}");
+            assert!(status.accepts_results(), "止まっていても、すでに届いた結果は受ける: {a:?}");
+            assert!(status.warning().is_some(), "{a:?}");
+        }
+        assert!(AiStatus::On(Availability::Ready).allows_requests());
+        assert_eq!(AiStatus::On(Availability::Ready).warning(), None);
+    }
+
+    #[test]
+    fn 無効化された状態はメニューの警告に出る() {
+        assert!(AiStatus::On(Availability::Disabled).warning().is_some());
     }
 }
