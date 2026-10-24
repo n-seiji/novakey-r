@@ -11,9 +11,9 @@ use std::cell::{Cell, OnceCell, RefCell};
 use crate::composer::{Composer, Phase};
 use crate::input::Route;
 use crate::keymap::Key;
-use crate::kkc::{self, RustEngine};
+use crate::kkc::RustEngine;
 use crate::outbound::{self, Outbound, Snapshot};
-use crate::session::{ConversionMode, Effect, Outcome, RerankJob, Session};
+use crate::session::{ConversionMode, Effect, Gates, Outcome, RerankJob, Session};
 
 /// 直前文脈として読む最大長 (UTF-16 単位)。
 const CONTEXT_MAX_UTF16: usize = 200;
@@ -173,15 +173,15 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
     pub fn on_candidate_selected(&self, text: &str) {
         let Some(client) = self.client() else { return };
         self.env.trace("candidateSelected", &format!("phase={:?}", self.phase()));
-        self.sync_learning_flag(Some(&client));
-        let effects = self.session.borrow_mut().commit_selected(text);
+        // 確定だけで再変換は起きないので、AI 送信の可否 (Keychain を見る) は問い合わせない。
+        let gates = self.gates(Some(&client), false);
+        let effects = self.session.borrow_mut().commit_selected(&gates, text);
         self.run(effects, Some(&client));
     }
 
     pub fn on_commit_composition(&self, client: Option<C>) {
-        self.sync_rerank_flag();
-        self.sync_learning_flag(client.as_ref());
-        let effects = self.session.borrow_mut().commit_composition();
+        let gates = self.gates(client.as_ref(), true);
+        let effects = self.session.borrow_mut().commit_composition(&gates);
         self.run(effects, client.as_ref());
     }
 
@@ -228,16 +228,14 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         }
     }
 
-    /// 無効時は RequestRerank が作られず、Keychain に触れる経路へ進まない。
-    fn sync_rerank_flag(&self) {
-        let allowed = self.env.rerank_allowed();
-        self.session.borrow_mut().set_rerank(allowed);
-    }
-
-    /// 確定が起きうる処理の前に、学習してよい場面かを kkc に伝える。
-    fn sync_learning_flag(&self, client: Option<&C>) {
+    /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
+    /// `rerank` が false のときは AI 送信の可否 (Keychain を見る) を問い合わせず、不許可にする。
+    fn gates(&self, client: Option<&C>, rerank: bool) -> Gates {
         let bundle_id = self.bundle_id(client);
-        kkc::set_learning_allowed(outbound::learning_allowed(self.env.secure_input(), bundle_id));
+        Gates {
+            learning: outbound::learning_allowed(self.env.secure_input(), bundle_id),
+            rerank: rerank && self.env.rerank_allowed(),
+        }
     }
 
     /// クライアントの bundle id (学習判定と AI 送信判定で共通)。最初に取れたものを使い回す。
@@ -256,10 +254,9 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
 
     /// session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
-        self.sync_rerank_flag();
-        self.sync_learning_flag(Some(client));
+        let gates = self.gates(Some(client), true);
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
-        let outcome = self.session.borrow_mut().handle(key, text);
+        let outcome = self.session.borrow_mut().handle(&gates, key, text);
         let Outcome { handled, action, phase, effects } = outcome;
         self.run(effects, Some(client));
         match action {
@@ -363,6 +360,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
 mod tests {
     use super::*;
     use std::rc::Rc;
+    use crate::kkc::{learning::Learning, KkcCore};
 
     use crate::simulate::{FakeClient, FakeEnv, FakePanel};
 
@@ -477,6 +475,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecEnv {
         allowed: Rc<Cell<bool>>,
+        secure: Rc<Cell<bool>>,
         sent: Rc<RefCell<Vec<u64>>>,
         cancels: Rc<Cell<usize>>,
         logs: Rc<RefCell<Vec<String>>>,
@@ -484,7 +483,7 @@ mod tests {
 
     impl Environment for RecEnv {
         fn secure_input(&self) -> bool {
-            false
+            self.secure.get()
         }
         fn rerank_allowed(&self) -> bool {
             self.allowed.get()
@@ -548,6 +547,152 @@ mod tests {
 
     fn rec_press(c: &RecController, client: &RecClient, key: Key, text: &str) -> bool {
         c.on_key(Route::Keys(vec![(key, text.to_string())]), client.clone())
+    }
+
+    thread_local! {
+        static LEARNED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// 英語の記憶への書き込みを記録する session (本物の記憶ファイルには触れない)。
+    fn recording_controller(env: RecEnv) -> RecController {
+        let composer = Composer::new(RustEngine::new()).with_english_memory(|_| false, |w| {
+            LEARNED.with(|l| l.borrow_mut().push(w.to_string()));
+        });
+        Controller::new(8, Session::new(composer, ConversionMode::Space), HookPanel::default(), env)
+    }
+
+    /// 大文字 1 字を打って Enter で確定し、記憶に書かれた語を返す。
+    fn learned_after_commit(env: RecEnv, bundle: Option<&str>) -> Vec<String> {
+        LEARNED.with(|l| l.borrow_mut().clear());
+        let client = RecClient::default();
+        client.set_bundle(bundle);
+        let c = recording_controller(env);
+        assert!(rec_press(&c, &client, Key::Letter { upper: true }, "G"));
+        assert!(rec_press(&c, &client, Key::Enter, "\r"));
+        LEARNED.with(|l| l.borrow().clone())
+    }
+
+    #[test]
+    fn a_commit_is_learned_when_the_bundle_id_is_unknown() {
+        assert_eq!(learned_after_commit(RecEnv::default(), None), vec!["G".to_string()]);
+    }
+
+    #[test]
+    fn a_commit_is_learned_in_an_ordinary_app() {
+        assert_eq!(learned_after_commit(RecEnv::default(), Some("com.apple.TextEdit")).len(), 1);
+    }
+
+    #[test]
+    fn a_commit_is_not_learned_under_secure_input() {
+        let env = RecEnv::default();
+        env.secure.set(true);
+        assert!(learned_after_commit(env, Some("com.apple.TextEdit")).is_empty());
+    }
+
+    #[test]
+    fn a_commit_is_not_learned_in_a_password_manager() {
+        assert!(learned_after_commit(RecEnv::default(), Some("com.1password.1password")).is_empty());
+    }
+
+    #[test]
+    fn commit_composition_respects_the_learning_gate() {
+        LEARNED.with(|l| l.borrow_mut().clear());
+        let env = RecEnv::default();
+        env.secure.set(true);
+        let client = RecClient::default();
+        let c = recording_controller(env.clone());
+        rec_press(&c, &client, Key::Letter { upper: true }, "G");
+        c.on_commit_composition(Some(client.clone()));
+        assert!(LEARNED.with(|l| l.borrow().is_empty()), "commit-all under secure input");
+
+        env.secure.set(false);
+        rec_press(&c, &client, Key::Letter { upper: true }, "G");
+        c.on_commit_composition(Some(client.clone()));
+        assert_eq!(LEARNED.with(|l| l.borrow().len()), 1, "commit-all learns when allowed");
+    }
+
+    /// 英語の記憶と engine の学習の両方を観測できる controller (どちらも本物のファイルには触れない)。
+    fn observing_controller(env: RecEnv) -> (RecController, Rc<KkcCore>) {
+        LEARNED.with(|l| l.borrow_mut().clear());
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let composer = Composer::new(RustEngine::with_core(core.clone())).with_english_memory(|_| false, |w| {
+            LEARNED.with(|l| l.borrow_mut().push(w.to_string()));
+        });
+        (Controller::new(9, Session::new(composer, ConversionMode::Space), HookPanel::default(), env), core)
+    }
+
+    fn engine_learned(core: &KkcCore) -> bool {
+        !core.learning().borrow().is_empty()
+    }
+
+    /// "kanji" を打ち、候補ウィンドウを開く。
+    fn open_candidate_window(c: &RecController, client: &RecClient) {
+        rec_type(c, client, "kanji");
+        rec_press(c, client, Key::Space, " ");
+        rec_press(c, client, Key::Space, " ");
+        assert!(matches!(c.phase(), Phase::Converting { window: true, .. }));
+    }
+
+    fn candidate_click_learns(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        c.on_candidate_selected("幹事");
+        engine_learned(&core)
+    }
+
+    #[test]
+    fn a_candidate_click_is_learned_when_allowed() {
+        assert!(candidate_click_learns(false));
+    }
+
+    #[test]
+    fn a_candidate_click_is_not_learned_under_secure_input() {
+        assert!(!candidate_click_learns(true));
+    }
+
+    fn picking_by_digit_learns(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert_eq!(c.phase(), Phase::Empty);
+        engine_learned(&core)
+    }
+
+    #[test]
+    fn picking_a_candidate_by_digit_is_learned_when_allowed() {
+        assert!(picking_by_digit_learns(false));
+    }
+
+    #[test]
+    fn picking_a_candidate_by_digit_is_not_learned_under_secure_input() {
+        assert!(!picking_by_digit_learns(true));
+    }
+
+    fn english_commit_is_remembered(secure: bool) -> bool {
+        let env = RecEnv::default();
+        env.secure.set(secure);
+        let client = RecClient::default();
+        let (c, core) = observing_controller(env);
+        rec_type(&c, &client, "git");
+        rec_press(&c, &client, Key::Enter, "\r");
+        assert!(!engine_learned(&core));
+        LEARNED.with(|l| l.borrow().iter().any(|w| w == "git"))
+    }
+
+    #[test]
+    fn an_english_commit_is_remembered_when_allowed() {
+        assert!(english_commit_is_remembered(false));
+    }
+
+    #[test]
+    fn an_english_commit_is_not_remembered_under_secure_input() {
+        assert!(!english_commit_is_remembered(true));
     }
 
     #[test]
