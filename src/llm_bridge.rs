@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::outbound::{self, Decision, Screened};
 use crate::platform;
 use crate::rerank::{
-    self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport,
+    self, CredentialStore, Credentials, Delivery, HttpRequest, HttpResponse, InFlight, Job, State, StoreError, Transport, TransportFailure,
 };
 
 pub use crate::rerank::{Availability, STATUS_CREDENTIALS_MISSING, STATUS_OK};
@@ -75,8 +75,8 @@ impl UreqTransport {
 }
 
 impl Transport for UreqTransport {
-    fn post(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
-        // ureq のエラー文字列は URL (アカウント ID) を含みうるので、中身は捨てる。
+    fn post(&self, req: &HttpRequest) -> Result<HttpResponse, TransportFailure> {
+        // ureq のエラー文字列は URL (アカウント ID) を含みうるので、種類だけ取って中身は捨てる。
         let mut response = self
             .agent
             .post(&req.url)
@@ -86,12 +86,17 @@ impl Transport for UreqTransport {
             .header("Authorization", &format!("Bearer {}", req.bearer))
             .header("Content-Type", "application/json")
             .send(req.body.as_str())
-            .map_err(|_| "transport failed".to_string())?;
+            .map_err(|e| match e {
+                ureq::Error::Timeout(_) => TransportFailure::Timeout,
+                ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => TransportFailure::Connect,
+                ureq::Error::Tls(_) | ureq::Error::Rustls(_) => TransportFailure::Tls,
+                _ => TransportFailure::Read,
+            })?;
         let status = response.status().as_u16();
         if status != 200 {
             return Ok(HttpResponse { status, body: String::new() });
         }
-        let body = response.body_mut().read_to_string().map_err(|_| "read failed".to_string())?;
+        let body = response.body_mut().read_to_string().map_err(|_| TransportFailure::Read)?;
         Ok(HttpResponse { status, body })
     }
 }
@@ -265,10 +270,14 @@ impl<S: CredentialStore + Send + 'static, T: Transport + Send + Sync + 'static> 
             }
             rerank::fetch_choice(&self.transport, &sent.creds, &sent.key)
         };
-        let delivery = lock(&self.state).complete(sent, result);
-        if let Some(delivery) = delivery {
+        let completed = lock(&self.state).complete(self.clock.now(), sent, result);
+        if let Some(line) = completed.log {
+            (self.log)(&line);
+        }
+        if let Some(delivery) = completed.delivery {
             self.push_result(delivery);
         }
+        self.wake.notify_all();
     }
 
     fn push_result(&self, delivery: Delivery) {
@@ -335,7 +344,7 @@ pub fn prepare() {
 /// 今分かっている状態を返すだけで、Keychain には触れない (読み出し中・未読込は使えるとみなす)。
 pub fn availability() -> Availability {
     let Some(engine) = SHARED.get() else { return Availability::Ready };
-    lock(&engine.state).availability()
+    lock(&engine.state).availability(engine.clock.now())
 }
 
 /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済み・キャッシュ命中なら何もしない)。
@@ -407,10 +416,17 @@ mod tests {
         slow_started: mpsc::Sender<()>,
         release: Mutex<mpsc::Receiver<()>>,
         panic_on: Option<&'static str>,
+        /// `Some` の間は、本文に関わらずこの結果を返す。
+        script: Mutex<Option<Result<u16, TransportFailure>>>,
+        posts: std::sync::atomic::AtomicUsize,
     }
 
     impl Transport for Gate {
-        fn post(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        fn post(&self, req: &HttpRequest) -> Result<HttpResponse, TransportFailure> {
+            self.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(scripted) = *lock(&self.script) {
+                return scripted.map(|status| HttpResponse { status, body: String::new() });
+            }
             if let Some(word) = self.panic_on {
                 if req.body.contains(word) {
                     panic!("fake transport panic");
@@ -502,7 +518,7 @@ mod tests {
         };
         let engine = Arc::new(Engine::new(
             store,
-            Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on },
+            Gate { slow_started: slow_tx, release: Mutex::new(rel_rx), panic_on, script: Mutex::new(None), posts: Default::default() },
             Box::new(clock.clone()),
             Box::new(move || {
                 let _ = lock(&del_tx).send(());
@@ -555,7 +571,7 @@ mod tests {
         std::thread::spawn(move || {
             engine.submit(job(1, 2, "fast2"));
             engine.cancel(1);
-            let _ = lock(&engine.state).availability();
+            let _ = lock(&engine.state).availability(Instant::now());
             let _ = done_tx.send(());
         });
         done_rx.recv_timeout(WAIT).expect("読み出しが止まっていても、ロックで待たされない");
@@ -662,7 +678,7 @@ mod tests {
         let h = harness(Some("boom"));
         h.engine.submit(job(1, 1, "boom"));
         h.wait_until("無効化される", State::is_disabled);
-        assert_eq!(lock(&h.engine.state).availability(), Availability::Disabled);
+        assert_eq!(lock(&h.engine.state).availability(h.clock.now()), Availability::Disabled);
         h.engine.submit(job(1, 2, "fast"));
         h.engine.submit(job(1, 3, "fast"));
         assert!(h.engine.pop_result().is_none(), "無効化後は何も送らない");
@@ -670,5 +686,95 @@ mod tests {
         let logs = lock(&h.logs);
         assert_eq!(logs.iter().filter(|m| m.contains("disabled")).count(), 1, "{logs:?}");
         assert!(!logs.iter().any(|m| m.contains("boom")), "依頼内容はログに出さない");
+    }
+
+    impl Harness {
+        fn script(&self, result: Option<Result<u16, TransportFailure>>) {
+            *lock(&self.engine.transport.script) = result;
+        }
+
+        fn posts(&self) -> usize {
+            self.engine.transport.posts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_401_stops_sending_logs_once_and_resumes_after_the_toggle_is_cycled() {
+        let h = harness(None);
+        h.script(Some(Ok(401)));
+        h.engine.submit(job(1, 1, "fast"));
+        h.wait_until("認証情報が拒否される", |s| s.availability(Instant::now()) == Availability::CredentialsRejected);
+        h.wait_idle();
+        assert_eq!(h.posts(), 1);
+        assert!(h.engine.pop_result().is_none(), "拒否された要求の結果は配信しない");
+        h.engine.submit(job(1, 2, "fast2"));
+        h.engine.submit(job(1, 3, "fast3"));
+        h.engine.cancel(1);
+        assert_eq!(h.posts(), 1, "拒否されたあとは送らない");
+        assert!(lock(&h.engine.state).next_deadline().is_none());
+        assert_eq!(lock(&h.engine.store.threads).len(), 1, "勝手に読み直さない");
+        h.script(None);
+        h.engine.prepare();
+        h.wait_until("認証情報を読み直して再開できる", |s| s.availability(Instant::now()) == Availability::Ready);
+        h.engine.submit(job(1, 4, "fast4"));
+        h.delivered.recv_timeout(WAIT).expect("再開後は結果が届く");
+        assert_eq!(lock(&h.engine.store.threads).len(), 2);
+        let logs = lock(&h.logs);
+        let stopped: Vec<_> = logs.iter().filter(|m| m.contains("401")).collect();
+        assert_eq!(stopped.len(), 1, "{logs:?}");
+        assert!(!logs.iter().any(|m| m.contains("tok") || m.contains("acct") || m.contains("fast")), "{logs:?}");
+    }
+
+    #[test]
+    fn a_429_pauses_for_a_minute_of_the_injected_clock() {
+        let h = harness(None);
+        h.script(Some(Ok(429)));
+        h.engine.submit(job(1, 1, "fast"));
+        h.wait_until("一時停止になる", |s| s.availability(h.clock.now()) == Availability::Paused);
+        h.wait_idle();
+        h.script(None);
+        h.engine.submit(job(1, 2, "fast2"));
+        assert_eq!(h.posts(), 1, "止めている間は送らない");
+        assert!(h.engine.pop_result().is_none());
+        h.advance(Duration::from_secs(59));
+        assert_eq!(lock(&h.engine.state).availability(h.clock.now()), Availability::Paused);
+        h.advance(Duration::from_secs(1));
+        assert_eq!(lock(&h.engine.state).availability(h.clock.now()), Availability::Ready);
+        h.engine.submit(job(1, 3, "fast3"));
+        h.delivered.recv_timeout(WAIT).expect("60 秒たてば再開する");
+        assert_eq!(h.posts(), 2);
+        let logs = lock(&h.logs);
+        assert_eq!(logs.iter().filter(|m| m.contains("429")).count(), 1, "{logs:?}");
+    }
+
+    #[test]
+    fn a_timeout_fails_only_that_request() {
+        let h = harness(None);
+        h.script(Some(Err(TransportFailure::Timeout)));
+        h.engine.submit(job(1, 1, "fast"));
+        h.delivered.recv_timeout(WAIT).expect("失敗が届く");
+        assert_eq!(h.engine.pop_result().map(|d| d.status), Some(rerank::STATUS_FAILED));
+        h.script(None);
+        h.engine.submit(job(1, 2, "fast2"));
+        h.delivered.recv_timeout(WAIT).expect("次の要求は普通に送られる");
+        assert_eq!(h.engine.pop_result().map(|d| d.status), Some(rerank::STATUS_OK));
+        assert_eq!(h.posts(), 2, "再送しない");
+    }
+
+    #[test]
+    fn three_bad_responses_in_a_row_disable_and_log_once() {
+        let h = harness(None);
+        h.script(Some(Ok(404)));
+        for g in 1..=3 {
+            h.engine.submit(job(1, g, &format!("fast{g}")));
+            h.delivered.recv_timeout(WAIT).expect("失敗が届く");
+            h.wait_idle();
+            let _ = h.engine.pop_result();
+        }
+        assert_eq!(lock(&h.engine.state).availability(Instant::now()), Availability::Disabled);
+        h.engine.submit(job(1, 4, "fast4"));
+        assert_eq!(h.posts(), 3);
+        let logs = lock(&h.logs);
+        assert_eq!(logs.iter().filter(|m| m.contains("disabled")).count(), 1, "{logs:?}");
     }
 }

@@ -84,6 +84,8 @@ impl Environment for PlatformEnv {
     }
 
     fn rerank_allowed(&self) -> bool {
+        // 一時停止が明けた・認証情報の読み直しが済んだことを拾うため、毎回送信側の状態を取り込む (ロックだけで Keychain には触れない)。
+        set_ai_status(ai_status().observe(llm_bridge::availability()));
         ai_status().allows_requests()
     }
 
