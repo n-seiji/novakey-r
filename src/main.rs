@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 mod composer;
 mod config;
+mod controller;
 mod imk;
 mod imk_client;
 mod input;
