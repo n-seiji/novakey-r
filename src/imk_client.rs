@@ -2,11 +2,11 @@
 //! IMK のクライアント (IMKTextInput を実装するホストアプリ側オブジェクト) の安全なラッパー。
 use objc2::rc::Id;
 use objc2::runtime::AnyObject;
-use objc2::{msg_send, msg_send_id};
+use objc2::sel;
 use objc2_foundation::{NSNotFound, NSRange, NSString};
 
 use crate::controller::TextClient;
-use crate::platform::{lossy_string, utf16_units};
+use crate::platform::{catch_objc, lossy_string, send, utf16_units};
 
 /// retain 済みのクライアント参照。Id が生存を保証するので、メソッドは安全に呼べる。
 #[derive(Clone)]
@@ -18,25 +18,27 @@ impl TextClient for Client {
     fn insert(&self, text: &str) {
         let ns = NSString::from_str(text);
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
+        let action = sel!(insertText:replacementRange:);
         // SAFETY: IMKTextInput の insertText:replacementRange: は (NSString, NSRange) を取り、戻り値なし。
-        unsafe {
-            let _: () = msg_send![&*self.0, insertText: &*ns, replacementRange: replacement];
-        }
+        catch_objc(|s| unsafe {
+            send!(s, &*self.0, action; (&*ns => *const NSString, replacement => NSRange) -> ())
+        });
     }
 
     fn set_marked(&self, text: &str) {
         let ns = NSString::from_str(text);
         let selection = NSRange { location: ns.len_utf16(), length: 0 };
         let replacement = NSRange { location: NOT_FOUND, length: 0 };
+        let action = sel!(setMarkedText:selectionRange:replacementRange:);
         // SAFETY: IMKTextInput の setMarkedText:selectionRange:replacementRange: は (NSString, NSRange, NSRange) を取る。
-        unsafe {
-            let _: () = msg_send![
+        catch_objc(|s| unsafe {
+            send!(
+                s,
                 &*self.0,
-                setMarkedText: &*ns,
-                selectionRange: selection,
-                replacementRange: replacement
-            ];
-        }
+                action;
+                (&*ns => *const NSString, selection => NSRange, replacement => NSRange) -> ()
+            )
+        });
     }
 
     // マーク範囲 (なければ選択範囲) の直前のテキストを最大 max_utf16 UTF-16 単位返す。取れなければ空。
@@ -48,8 +50,11 @@ impl TextClient for Client {
     }
 
     fn bundle_id(&self) -> Option<String> {
+        let action = sel!(bundleIdentifier);
         // SAFETY: IMKTextInput の bundleIdentifier は NSString (nil 可) を返す。
-        let id: Option<Id<NSString>> = unsafe { msg_send_id![&*self.0, bundleIdentifier] };
+        let id = catch_objc(|s| unsafe { send!(s, &*self.0, action; () -> *mut AnyObject) })?;
+        // SAFETY: bundleIdentifier は NSString (nil 可) を返す。+0 の戻り値を retain して所有する。
+        let id: Option<Id<NSString>> = unsafe { Id::retain(id.cast()) };
         id.map(|s| lossy_string(&s))
     }
 }
@@ -63,9 +68,14 @@ impl Client {
     }
 
     fn anchor(&self) -> Option<usize> {
+        let (marked_range, selected_range) = (sel!(markedRange), sel!(selectedRange));
         // SAFETY: markedRange / selectedRange は引数なしで NSRange を返す。
-        let (marked, selected): (NSRange, NSRange) =
-            unsafe { (msg_send![&*self.0, markedRange], msg_send![&*self.0, selectedRange]) };
+        let (marked, selected) = catch_objc(|s| unsafe {
+            (
+                send!(s, &*self.0, marked_range; () -> NSRange),
+                send!(s, &*self.0, selected_range; () -> NSRange),
+            )
+        })?;
         [marked, selected]
             .into_iter()
             .map(|r| r.location)
@@ -73,14 +83,17 @@ impl Client {
     }
 
     fn substring(&self, range: NSRange) -> Option<String> {
-        // SAFETY: attributedSubstringFromRange: は NSRange を取り NSAttributedString (nil 可) を返し、`string` は NSString を返す。
-        unsafe {
-            let attributed: Option<Id<AnyObject>> =
-                msg_send_id![&*self.0, attributedSubstringFromRange: range];
-            let string: Option<Id<NSString>> = msg_send_id![&*attributed?, string];
-            let units = utf16_units(&*string?);
-            Some(String::from_utf16_lossy(trim_split_pairs(&units)))
-        }
+        // SAFETY: attributedSubstringFromRange: は NSRange を取り NSAttributedString (nil 可) を返し、`string` は NSString (nil 可) を返す。
+        // どちらも +0 の戻り値なので retain して所有する。変換は f の外で行う。
+        let (substring, to_string) = (sel!(attributedSubstringFromRange:), sel!(string));
+        let string = catch_objc(|s| unsafe {
+            let attributed = send!(s, &*self.0, substring; (range => NSRange) -> *mut AnyObject);
+            let attributed: Option<Id<AnyObject>> = Id::retain(attributed);
+            let string = send!(s, &**attributed.as_ref()?, to_string; () -> *mut AnyObject);
+            Id::retain(string.cast::<NSString>())
+        })??;
+        let units = utf16_units(&string);
+        Some(String::from_utf16_lossy(trim_split_pairs(&units)))
     }
 }
 
@@ -146,6 +159,9 @@ mod tests {
 
     use objc2::rc::{Allocated, Id};
     use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
+    use objc2::declare::ClassBuilder;
+    use objc2::runtime::{AnyClass, Sel};
+    use objc2::sel;
     use objc2_foundation::NSObject;
 
     /// 受け取った呼び出し。範囲は (location, length)。
@@ -364,5 +380,130 @@ mod tests {
         let (fake, client) = make_fake(FakeState { selected: (5, 0), ..FakeState::new() }.document("abc"));
         assert_eq!(client.preceding_text(200), "");
         assert_eq!(fake.ivars().requested.get(), Some((0, 5)));
+    }
+
+    use std::mem;
+
+    type InsertFn = extern "C-unwind" fn(*mut AnyObject, Sel, *const NSString, NSRange);
+    type SetMarkedFn = extern "C-unwind" fn(*mut AnyObject, Sel, *const NSString, NSRange, NSRange);
+    type BundleFn = extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject;
+    type RangeFn = extern "C-unwind" fn(*mut AnyObject, Sel) -> NSRange;
+
+    fn raise() -> ! {
+        // SAFETY: NSException のクラスメソッド exceptionWithName:reason:userInfo: は (NSString, NSString, nil 可) を取り NSException を返す。
+        let exception: Id<AnyObject> = unsafe {
+            msg_send_id![
+                objc2::class!(NSException),
+                exceptionWithName: &*NSString::from_str("NovakeyRTestException"),
+                reason: &*NSString::from_str("secret user text"),
+                userInfo: std::ptr::null::<AnyObject>()
+            ]
+        };
+        let throw = crate::platform::symbol(c"objc_exception_throw").expect("objc_exception_throw が引ける");
+        // SAFETY: objc_exception_throw(id) は戻らない。dlsym の番地を C-unwind の型で呼ぶので、巻き戻りが定義された動作になる
+        // (objc2::exception::throw は "C" 宣言で、そこから巻き戻るのは未定義動作)。呼び出し元は C-unwind の IMP。
+        unsafe {
+            let throw: unsafe extern "C-unwind" fn(*mut AnyObject) -> ! = mem::transmute(throw.as_ptr());
+            throw(Id::into_raw(exception).cast())
+        }
+    }
+
+    extern "C-unwind" fn raise_insert(_: *mut AnyObject, _: Sel, _: *const NSString, _: NSRange) {
+        raise()
+    }
+    extern "C-unwind" fn raise_set_marked(_: *mut AnyObject, _: Sel, _: *const NSString, _: NSRange, _: NSRange) {
+        raise()
+    }
+    extern "C-unwind" fn raise_bundle(_: *mut AnyObject, _: Sel) -> *mut AnyObject {
+        raise()
+    }
+    extern "C-unwind" fn raise_range(_: *mut AnyObject, _: Sel) -> NSRange {
+        raise()
+    }
+
+    /// 全メソッドが NSException を投げるクライアント。Rust で宣言したメソッドは extern "C" で巻き戻せず abort するので、
+    /// C-unwind の IMP を直接登録する。
+    fn raising() -> Client {
+        static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+        let class = CLASS.get_or_init(|| {
+            let mut builder = ClassBuilder::new("NovakeyRRaisingTextInput", NSObject::class())
+                .expect("クラス名が未登録");
+            // SAFETY: 各 IMP の型は IMKTextInput のメソッドの型 (引数と戻り値) に一致する。objc2 0.5 は C-unwind の IMP を
+            // feature 付きでしか受けないので "C" の型へ読み替えるが、関数自体は C-unwind でコンパイルされ巻き戻せる。
+            unsafe {
+                builder.add_method(
+                    sel!(insertText:replacementRange:),
+                    mem::transmute::<InsertFn, extern "C" fn(*mut AnyObject, Sel, *const NSString, NSRange)>(raise_insert),
+                );
+                builder.add_method(
+                    sel!(setMarkedText:selectionRange:replacementRange:),
+                    mem::transmute::<SetMarkedFn, extern "C" fn(*mut AnyObject, Sel, *const NSString, NSRange, NSRange)>(
+                        raise_set_marked,
+                    ),
+                );
+                builder.add_method(
+                    sel!(bundleIdentifier),
+                    mem::transmute::<BundleFn, extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject>(raise_bundle),
+                );
+                let range_fn = mem::transmute::<RangeFn, extern "C" fn(*mut AnyObject, Sel) -> NSRange>(raise_range);
+                builder.add_method(sel!(markedRange), range_fn);
+                builder.add_method(sel!(selectedRange), range_fn);
+            }
+            builder.register()
+        });
+        // SAFETY: 登録済みクラスの new は引数なしで新しいインスタンスを返す。
+        let object: Id<AnyObject> = unsafe { msg_send_id![*class, new] };
+        Client::new(&object)
+    }
+
+    /// attributedSubstringFromRange: が self を返し、その `string` が未実装セレクタ (forwarding が例外を投げる) のクライアント。
+    /// attributed を保持したまま例外が巻き戻る形で、msg_send! 経由だと release で abort した。
+    fn self_returning() -> Client {
+        extern "C" fn attributed(this: *mut AnyObject, _: Sel, _: NSRange) -> *mut AnyObject {
+            this
+        }
+        extern "C" fn range(_: *mut AnyObject, _: Sel) -> NSRange {
+            NSRange { location: 5, length: 0 }
+        }
+        static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+        let class = CLASS.get_or_init(|| {
+            let mut builder = ClassBuilder::new("NovakeyRSelfReturningTextInput", NSObject::class())
+                .expect("クラス名が未登録");
+            // SAFETY: IMP の型は各メソッドの型 (引数と戻り値) に一致する。
+            unsafe {
+                builder.add_method(sel!(attributedSubstringFromRange:), attributed as extern "C" fn(_, _, _) -> _);
+                builder.add_method(sel!(markedRange), range as extern "C" fn(_, _) -> _);
+                builder.add_method(sel!(selectedRange), range as extern "C" fn(_, _) -> _);
+            }
+            builder.register()
+        });
+        // SAFETY: 登録済みクラスの new は引数なしで新しいインスタンスを返す。
+        let object: Id<AnyObject> = unsafe { msg_send_id![*class, new] };
+        Client::new(&object)
+    }
+
+    #[test]
+    fn preceding_text_is_empty_when_string_raises_while_the_attributed_string_is_held() {
+        assert_eq!(self_returning().preceding_text(200), "");
+    }
+
+    #[test]
+    fn insert_survives_a_host_exception() {
+        raising().insert("強い");
+    }
+
+    #[test]
+    fn set_marked_survives_a_host_exception() {
+        raising().set_marked("きょう");
+    }
+
+    #[test]
+    fn bundle_id_is_none_when_the_host_raises() {
+        assert_eq!(raising().bundle_id(), None);
+    }
+
+    #[test]
+    fn preceding_text_is_empty_when_the_host_raises() {
+        assert_eq!(raising().preceding_text(200), "");
     }
 }
