@@ -3,106 +3,104 @@
   <img src="docs/assets/wordmark-light.svg" alt="Shizuku" width="320">
 </picture>
 
-**English** · [日本語](README.ja.md)
+**英語も日本語も、モードを切り替えずに打てる macOS の日本語入力。**
 
-**A Japanese input method for macOS that lets you type English without switching modes.**
-
-Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you type stays there.
+かな漢字変換はすべて Rust で書かれ、手元の Mac の中だけで動きます。打った文字は外に送りません。
 
 <table>
   <tr>
     <td align="center" valign="top" width="33%">
-      <img src="docs/assets/tile-convert.svg" width="200" alt="あしたははれです becomes 明日は晴れです with Space and is committed with Enter"><br>
-      <b>Convert</b><br>
-      <sub>Space to convert, Enter to commit.</sub>
+      <img src="docs/assets/tile-convert.svg" width="200" alt="あしたははれです が Space で 明日は晴れです になり、Enter で確定する"><br>
+      <b>変換</b><br>
+      <sub>Space で変換、Enter で確定。</sub>
     </td>
     <td align="center" valign="top" width="33%">
-      <img src="docs/assets/tile-english.svg" width="200" alt="ぎ turns into git, and git merge is typed with a plain space"><br>
-      <b>English as you type it</b><br>
-      <sub>English words stay English. Space is a space.</sub>
+      <img src="docs/assets/tile-english.svg" width="200" alt="ぎ が git になり、Space を挟んで git merge と打てる"><br>
+      <b>英語はそのまま</b><br>
+      <sub>英単語は英字で。Space は空白。</sub>
     </td>
     <td align="center" valign="top" width="33%">
-      <img src="docs/assets/tile-mixed.svg" width="200" alt="wo after artifact becomes を and converts to artifactを使う"><br>
-      <b>Mixed</b><br>
-      <sub>Type artifactを使う in one go.</sub>
+      <img src="docs/assets/tile-mixed.svg" width="200" alt="artifact のあとの wo が を になり、artifactを使う に変換される"><br>
+      <b>英語まじり</b><br>
+      <sub>artifactを使う も、続けて打てる。</sub>
     </td>
   </tr>
 </table>
 
-- **Conversion.** Space converts, and pressing it again moves to the next candidate. Number keys pick one. Enter commits exactly what is shown. The romaji table is the same as Google Japanese Input (Mozc).
-- **English.** English words that cannot become kana stay in English letters (enter, merge). Space in the middle of English inserts a space. A word you have committed as English shows up in English from then on (git).
-- **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
-- **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
-- **Re-ranking.** A small Japanese language model (rinna japanese-gpt2-xsmall) runs on your Mac and re-orders the full-sentence candidates so the natural one comes first. There is no network access. It adds about 140 MB of memory (peak about 181 MB instead of 41 MB, measured with `/usr/bin/time -l` on a long headless input), takes about 8 ms per decision at the median, and needs the model files (see below); without them the engine's own order is used.
-- **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
+- **変換。** Space で変換し、もう一度押すと次の候補です。数字キーで選び、Enter で表示しているとおりに確定します。ローマ字の表は Google 日本語入力 (Mozc) と同じです。
+- **英語。** かなにならない英単語は英字のまま表示します (enter, merge)。英語の途中の Space は空白として入ります。一度英語で確定した語は、次から打った時点で英字になります (git)。
+- **候補。** カタカナ語の英単語 (デスクトップ → desktop) と絵文字 (ねこ → 🐈) も候補に出ます。
+- **学習。** 選んだ候補を覚えて、次から先に出します。パスワード欄とパスワード管理アプリでは覚えません。
+- **並べ替え。** 小さな日本語言語モデル (rinna japanese-gpt2-xsmall) を Mac の中で動かし、文全体の候補を自然な順に並べ替えます。通信はしません。メモリは約 140 MB 増え (長い入力を headless で流し `/usr/bin/time -l` で測った最大値が 41 MB から約 181 MB)、1 回の判定は中央値で約 8 ms です。モデルファイルが必要です (下記)。無いときは変換エンジン本来の順のままです。
+- **ライブ変換 (任意)。** 打ちながら変換結果を表示します。入力メニューから切り替えます。
 
-## Install
+## インストール
 
-Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
+動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-Download `Shizuku-<version>.pkg` from Releases and open it. The installer puts Shizuku in `~/Library/Input Methods` (only for you, so it does not ask for a password). The package is signed with Developer ID and notarized by Apple.
+Releases から `Shizuku-<version>.pkg` をダウンロードして開きます。インストーラが Shizuku を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
 
-The first time, add Shizuku in System Settings > Keyboard > Input Sources. If it is not listed yet, log out and back in first.
+初回は、システム設定 > キーボード > 入力ソース で Shizuku を追加してください。まだ一覧に出ないときは、先にログインし直します。
 
-### Update
+### 更新
 
-Open the newer `.pkg`. It installs over the old version, and Shizuku stays in Input Sources. Do not delete the old app first: deleting it drops Shizuku from Input Sources, and you would have to add it again.
+新しい `.pkg` を開きます。古い版の上に入るので、Shizuku は入力ソースに残ります。先に古いアプリを削除しないでください。削除すると入力ソースから Shizuku が外れ、追加し直すことになります。
 
-### Uninstall
+### アンインストール
 
-1. Remove Shizuku from Input Sources.
-2. Delete `~/Library/Input Methods/Shizuku.app`.
-3. Remove the install receipt: `pkgutil --forget dev.n-seiji.inputmethod.Shizuku.pkg --volume ~` (the receipt is in your home, so plain `pkgutil --forget` without `--volume ~` does not find it).
-4. To also erase what Shizuku learned and its settings, delete `~/Library/Application Support/Shizuku`, `~/Library/Logs/Shizuku` and `~/Library/Preferences/dev.n-seiji.inputmethod.Shizuku.plist`.
+1. 入力ソースから Shizuku を外します。
+2. `~/Library/Input Methods/Shizuku.app` を削除します。
+3. インストールの記録を消します: `pkgutil --forget dev.n-seiji.inputmethod.Shizuku.pkg --volume ~` (記録はホームにあるので、`--volume ~` を付けない `pkgutil --forget` では見つかりません)。
+4. 学習した内容と設定も消すときは、`~/Library/Application Support/Shizuku`、`~/Library/Logs/Shizuku`、`~/Library/Preferences/dev.n-seiji.inputmethod.Shizuku.plist` を削除します。
 
-### Build from source
+### ソースからビルド
 
-Needs [mise](https://mise.jdx.dev/) and Rust. Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
+[mise](https://mise.jdx.dev/) と Rust が必要です。並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
 
 ```sh
 mise run judge-model
 mise run install
 ```
 
-This installs `~/Library/Input Methods/Shizuku.app`. Log out and back in, then add Shizuku in System Settings > Keyboard > Input Sources.
+`~/Library/Input Methods/Shizuku.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で Shizuku を追加してください。
 
-### Dependencies
+### 依存パッケージ
 
-Dependency versions published less than 7 days ago are not used. `mise run release-age` (`scripts/check-release-age.sh`) fails if `Cargo.lock` pins a crates.io version younger than that (`MIN_AGE_DAYS` overrides it); CI runs it on every push and pull request. The judge model script sets uv's `exclude-newer = "7 days"` and `mise.toml` sets `minimum_release_age = "7d"`. For an emergency exception, add a line `name version # reason` to `tools/release-age-allow.txt` and remove it once the version is old enough.
+公開から 7 日未満のバージョンは使いません。`mise run release-age` (`scripts/check-release-age.sh`) は、`Cargo.lock` に crates.io の 7 日未満のバージョンがあると失敗します (`MIN_AGE_DAYS` で変更可)。CI でも push と pull request ごとに実行します。審判モデルのスクリプトは uv の `exclude-newer = "7 days"`、`mise.toml` は `minimum_release_age = "7d"` を設定しています。緊急で例外が要るときは `tools/release-age-allow.txt` に `name version # 理由` の行を足し、期間が過ぎたら消してください。
 
-## No network at runtime
+## 実行時にネットワークは使いません
 
-Shizuku opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.
+Shizuku はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。
 
-## Keys
+## キー
 
-| Key | What it does |
+| キー | 動作 |
 |---|---|
-| Space | Convert / next candidate. A plain space in the middle of English |
-| Shift+Space | Previous candidate. Converts in the middle of English |
-| ↑ ↓ | Move through candidates |
-| 1–9 | Pick a candidate and commit |
-| Enter | Commit exactly what is shown |
-| Esc / Backspace | Cancel the conversion |
-| Ctrl+J / K / L / ; / : | Hiragana / katakana / full-width alphanumeric / half-width katakana / half-width alphanumeric |
-| F6–F10 | Same as above |
+| Space | 変換 / 次の候補。英語の途中では空白 |
+| Shift+Space | 前の候補。英語の途中では変換 |
+| ↑ ↓ | 候補を移動 |
+| 1〜9 | 候補を選んで確定 |
+| Enter | 表示しているとおりに確定 |
+| Esc / Backspace | 変換を取り消す |
+| Ctrl+J / K / L / ; / : | ひらがな / カタカナ / 全角英数 / 半角カナ / 半角英数 |
+| F6〜F10 | 同上 |
 
-## Where data lives
+## データの置き場所
 
-Learning is stored in `~/Library/Application Support/Shizuku/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it. The key-event trace is off by default, and it never records what you type.
+学習は `~/Library/Application Support/Shizuku/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
 
-## Credits
+## クレジット
 
-- Kana-kanji conversion (`src/kkc/`) is a Rust port of [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) (MIT, © 2023 Miwa / Ensan).
-- The conversion dictionary (`dictionary/`) is data from [azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage) (Apache-2.0).
-- The romaji table (`src/romaji_table.tsv`) is [Mozc](https://github.com/google/mozc)'s `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.).
-- English words for loanwords (`resources/loanwords.tsv`) are built from [EDRDG](https://www.edrdg.org/)'s JMdict (CC BY-SA 4.0).
-- Emoji (`resources/emoji.tsv`) are built from Unicode emoji data and CLDR Japanese annotations (Unicode License v3) via [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage).
-- Re-ranking uses [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.), converted by `tools/gen_judge_model.py` and not included in this repository.
-- The wordmark is outlined from [Quicksand](https://github.com/andrew-paglinawan/QuicksandFamily) (SIL Open Font License 1.1).
+- かな漢字変換 (`src/kkc/`) は [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) (MIT, © 2023 Miwa / Ensan) を Rust に移植したものです。
+- 変換辞書 (`dictionary/`) は [azooKey_dictionary_storage](https://github.com/ensan-hcl/azooKey_dictionary_storage) (Apache-2.0) のデータです。
+- ローマ字の表 (`src/romaji_table.tsv`) は [Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.) です。
+- カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
+- 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
+- 並べ替えは [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.) を使います。`tools/gen_judge_model.py` で変換して使い、このリポジトリには含みません。
+- ロゴの文字は [Quicksand](https://github.com/andrew-paglinawan/QuicksandFamily) (SIL Open Font License 1.1) をアウトライン化したものです。
 
-Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
+ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。
 
-## License
+## ライセンス
 
-GPL-3.0-or-later. See [`LICENSE`](LICENSE). Third-party notices are in [`NOTICE`](NOTICE), and the licenses of the Rust crates are in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
+GPL-3.0-or-later です。[`LICENSE`](LICENSE) を参照してください。サードパーティの表示は [`NOTICE`](NOTICE)、Rust クレートのライセンスは [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) にあります。
