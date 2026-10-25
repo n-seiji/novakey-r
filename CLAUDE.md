@@ -14,7 +14,7 @@ Tasks are defined in `mise.toml`.
 - `mise run app` - Build the release binary and package `output/NovakeyR.app` (copies `Info.plist`, `resources/` including `resources/judge/` if present, `dictionary/`, `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES`)
 - `mise run judge-model` - Download rinna/japanese-gpt2-xsmall (MIT, pinned revision) from Hugging Face and write `resources/judge/model_q8_0.gguf` + `tokenizer.json` with `tools/gen_judge_model.py` (uv script; set `HF_HUB_OFFLINE=1` to use only the local HF cache). The files are 41MB, gitignored and never committed. Run it before `mise run app`; without them the app still works on the engine's order and logs `judge: not configured` once
 - `cargo build --release` - Build the Rust binary only (must stay free of warnings)
-- `mise run install` / `mise run uninstall` - Copy to / remove from `~/Library/Input Methods`
+- `mise run install` / `mise run uninstall` - Copy to / remove from `~/Library/Input Methods` (install replaces the bundle's contents in place with `rsync --delete`, because macOS drops an input source whose bundle directory is deleted; the Homebrew cask does the same with `stage_only` + `postflight_steps`: probe that the bundle is writable, copy without `--delete`, prune with `--delete`, then `codesign --verify --strict`)
 - `mise run logs` - Stream the IME's NSLog output
 - `mise run reset-memory` - Delete the learning data
 
