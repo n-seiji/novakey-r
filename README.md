@@ -33,7 +33,7 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 - **English.** English words that cannot become kana stay in English letters (enter, merge). Space in the middle of English inserts a space. A word you have committed as English shows up in English from then on (git).
 - **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
 - **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
-- **Re-ranking.** A small Japanese language model (rinna japanese-gpt2-xsmall) runs on your Mac and re-orders the full-sentence candidates so the natural one comes first. There is no network access. It adds about 175-190 MB of memory while loaded, and needs the model files (see below); without them the engine's own order is used.
+- **Re-ranking.** A small Japanese language model (rinna japanese-gpt2-xsmall) runs on your Mac and re-orders the full-sentence candidates so the natural one comes first. There is no network access. It adds about 140 MB of memory (peak about 181 MB instead of 41 MB, measured with `/usr/bin/time -l` on a long headless input), takes about 8 ms per decision at the median, and needs the model files (see below); without them the engine's own order is used.
 - **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
 
 ## Install
