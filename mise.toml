@@ -1,11 +1,12 @@
 [tools]
 rust = "1.99.1"
-uv = "latest"
+uv = "0.13.1"
+actionlint = "1.7.12"
 "cargo:cargo-about" = { version = "0.9.2", features = "cli" }
 
 [tasks.build]
 description = "Build the release binary"
-run = "cargo build --release"
+run = "cargo build --release --locked"
 
 [tasks.test]
 description = "Run unit tests"
@@ -75,8 +76,8 @@ description = "Regenerate THIRD_PARTY_LICENSES (Rust crate licenses) with cargo-
 run = "cargo about generate about.hbs -o THIRD_PARTY_LICENSES"
 
 [tasks.judge-model]
-description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く。mise run app が .app に入れる"
-run = "uv run --script tools/gen_judge_model.py"
+description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く (tools/judge.sha256 で検証、依存は tools/gen_judge_model.py.lock で固定)。mise run app が .app に入れる"
+run = "uv run --locked --script tools/gen_judge_model.py"
 
 [tasks.judge-bench]
 env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary", NOVAKEY_JUDGE_DIR = "{{config_root}}/resources/judge" }

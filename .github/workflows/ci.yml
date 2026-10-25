@@ -1,0 +1,37 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Only rust and uv: a plain `mise install` would also compile cargo-about from source.
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          install_args: rust uv
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/uv
+          key: judge-model-${{ runner.os }}-${{ hashFiles('tools/gen_judge_model.py', 'tools/gen_judge_model.py.lock', 'tools/judge.sha256') }}
+      - run: scripts/check-no-network.sh
+      - run: mise run build
+      - run: scripts/check-no-network.sh --binary
+      - run: cargo test --release
+      - run: mise run scenarios
+      - run: mise run scenarios-learning
+      - run: mise run wysiwyg
+      - run: mise run main-queue
+      - run: mise run characterization
+      - run: scripts/check-kkc.sh
+      - run: mise run judge-model
+      - run: mise run app
+      - run: scripts/check-version.sh
