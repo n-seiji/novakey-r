@@ -32,7 +32,7 @@ jobs:
           RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED }}
         run: |
           set -eu
-          # Releases are off until a maintainer sets the RELEASE_ENABLED repository variable (see README, Releasing).
+          # Releases are off until a maintainer sets the RELEASE_ENABLED repository variable (see docs/releasing.md).
           if [ "$RELEASE_ENABLED" != true ]; then
             echo "release disabled (set the RELEASE_ENABLED repository variable to true)"
             echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
