@@ -391,7 +391,7 @@ mod tests {
             eprintln!("skip: no tokenizer.json in resources/judge");
             return;
         };
-        let golden = include_str!("../tools/golden/tokenizer_ids.jsonl");
+        let golden = include_str!("../tools/tokenizer_ids.jsonl");
         let mut n = 0;
         for line in golden.lines() {
             let (input, want): (String, Vec<u32>) = serde_json::from_str(line).unwrap();
