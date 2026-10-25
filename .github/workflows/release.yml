@@ -66,6 +66,8 @@ jobs:
     needs: check
     if: needs.check.outputs.release == 'true'
     runs-on: macos-26
+    # Holds the signing and notarization secrets; only main can deploy to it (scripts/setup-release-env.sh).
+    environment: signing
     permissions:
       contents: write
     env:
@@ -104,7 +106,7 @@ jobs:
           # A release is always signed and notarized; there is no ad-hoc fallback.
           if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ] || [ -z "$KEY_ID" ] \
             || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8_BASE64" ]; then
-            echo "release needs DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8_BASE64" >&2
+            echo "release needs DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8_BASE64 as secrets of the signing environment (gh secret set NAME --env signing)" >&2
             exit 1
           fi
       - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
