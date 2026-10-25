@@ -125,6 +125,7 @@ Shizuku はネットワーク接続を開きません。`scripts/check-no-networ
 - カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
 - 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
 - 並べ替えは [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.) を使います。`tools/gen_judge_model.py` で変換して使い、このリポジトリには含みません。
+- ロゴの文字は [Quicksand](https://github.com/andrew-paglinawan/QuicksandFamily) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。
 

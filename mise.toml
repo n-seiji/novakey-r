@@ -79,6 +79,10 @@ cp LICENSE NOTICE THIRD_PARTY_LICENSES output/Shizuku.app/Contents/Resources/
 description = "Regenerate THIRD_PARTY_LICENSES (Rust crate licenses) with cargo-about"
 run = "cargo about generate about.hbs -o THIRD_PARTY_LICENSES"
 
+[tasks.logo]
+description = "ロゴ一式 (docs/assets/mark.svg, wordmark-*.svg, resources/app.icns, resources/logo.tiff) を tools/gen_logo.py で作り直す。Quicksand は固定コミットから取って sha256 を確かめる (依存は tools/gen_logo.py.lock で固定)"
+run = "uv run --locked --script tools/gen_logo.py"
+
 [tasks.judge-model]
 description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く (tools/judge.sha256 で検証、依存は tools/gen_judge_model.py.lock で固定)。mise run app が .app に入れる"
 run = "uv run --locked --script tools/gen_judge_model.py"
