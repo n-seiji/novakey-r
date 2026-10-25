@@ -1,0 +1,4 @@
+# Emergency exceptions to scripts/check-release-age.sh (7-day minimum release age).
+# Format: name version # reason
+# Example: serde 1.0.999 # security fix for RUSTSEC-XXXX-YYYY, reviewed by <name> on <date>
+# Remove the line once the version is older than the minimum age.

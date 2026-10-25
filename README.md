@@ -62,6 +62,10 @@ mise run install
 
 This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
 
+### Dependencies
+
+Dependency versions published less than 7 days ago are not used. `mise run release-age` (`scripts/check-release-age.sh`) fails if `Cargo.lock` pins a crates.io version younger than that (`MIN_AGE_DAYS` overrides it); CI runs it on every push and pull request. The judge model script sets uv's `exclude-newer = "7 days"` and `mise.toml` sets `minimum_release_age = "7d"`. For an emergency exception, add a line `name version # reason` to `tools/release-age-allow.txt` and remove it once the version is old enough.
+
 ## No network at runtime
 
 NovakeyR opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.

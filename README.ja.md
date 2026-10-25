@@ -62,6 +62,10 @@ mise run install
 
 `~/Library/Input Methods/NovakeyR.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
 
+### 依存パッケージ
+
+公開から 7 日未満のバージョンは使いません。`mise run release-age` (`scripts/check-release-age.sh`) は、`Cargo.lock` に crates.io の 7 日未満のバージョンがあると失敗します (`MIN_AGE_DAYS` で変更可)。CI でも push と pull request ごとに実行します。審判モデルのスクリプトは uv の `exclude-newer = "7 days"`、`mise.toml` は `minimum_release_age = "7d"` を設定しています。緊急で例外が要るときは `tools/release-age-allow.txt` に `name version # 理由` の行を足し、期間が過ぎたら消してください。
+
 ## 実行時にネットワークは使いません
 
 NovakeyR はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。

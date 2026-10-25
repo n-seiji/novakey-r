@@ -10,6 +10,10 @@
 #   "tokenizers",
 #   "transformers",
 # ]
+#
+# [tool.uv]
+# # Supply-chain guard: refuse package versions published less than 7 days ago.
+# exclude-newer = "7 days"
 # ///
 """Build the on-device judge model files in resources/judge/ (they are not in git).
 

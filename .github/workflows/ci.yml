@@ -26,6 +26,9 @@ jobs:
             ~/.cache/uv
           key: judge-model-${{ runner.os }}-${{ hashFiles('tools/gen_judge_model.py', 'tools/gen_judge_model.py.lock', 'tools/judge.sha256') }}
       - run: scripts/check-no-network.sh
+      # Only here, not in release.yml: a dependency aging past 7 days must not decide whether an
+      # already-reviewed release can be rebuilt. Bumps are gated at PR time.
+      - run: scripts/check-release-age.sh
       - run: mise run build
         env:
           RUSTFLAGS: -Dwarnings
