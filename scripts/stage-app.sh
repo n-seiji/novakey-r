@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Copy output/NovakeyR.app to dist/NovakeyR.app and check the bundle is complete:
+# Copy output/Shizuku.app to dist/Shizuku.app and check the bundle is complete:
 # the judge model files (verified against tools/judge.sha256), the licenses and the dictionary.
 # Usage: scripts/stage-app.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-SRC=output/NovakeyR.app
-DST=dist/NovakeyR.app
+SRC=output/Shizuku.app
+DST=dist/Shizuku.app
 
 fail() {
   echo "stage-app: $*" >&2

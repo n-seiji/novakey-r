@@ -1,4 +1,4 @@
-//! 辞書リーダーの検証。`novakey_r --kkc-check` とテストから使う。
+//! 辞書リーダーの検証。`shizuku --kkc-check` とテストから使う。
 //!
 //! 1. containment: fresh golden の「data が 1 要素で ruby が読みの prefix」の候補が `prefix_entries` に含まれる
 //! 2. self-consistency: 全 loudstxt3 の全スロットをデコードし、その ruby をトライでたどると同じノードに着く

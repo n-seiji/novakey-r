@@ -371,13 +371,13 @@ impl Sim {
 }
 
 pub(crate) fn setup_env() {
-    // 既定は学習 off。`NOVAKEY_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。NOVAKEY_MEMORY_DIR で変えられる)。
+    // 既定は学習 off。`SHIZUKU_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。SHIZUKU_MEMORY_DIR で変えられる)。
     // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
-    let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
-    let memory_dir = match std::env::var_os("NOVAKEY_MEMORY_DIR") {
+    let learning = std::env::var("SHIZUKU_SIM_LEARNING").is_ok_and(|v| v == "1");
+    let memory_dir = match std::env::var_os("SHIZUKU_MEMORY_DIR") {
         Some(dir) if learning && !dir.is_empty() => PathBuf::from(dir),
         _ => {
-            let dir = std::env::temp_dir().join(format!("novakey-r-sim-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("shizuku-sim-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             dir
         }
@@ -388,16 +388,16 @@ pub(crate) fn setup_env() {
     crate::config::init(crate::config::Config {
         memory_dir: Some(memory_dir),
         learning_enabled: learning,
-        loanwords_path: Some(repo_table("NOVAKEY_LOANWORDS", "loanwords.tsv")),
-        dev_words_path: Some(repo_table("NOVAKEY_DEV_WORDS", "dev_words.txt")),
-        emoji_path: Some(repo_table("NOVAKEY_EMOJI", "emoji.tsv")),
-        // シミュレータは NOVAKEY_JUDGE_DIR を指定したときだけ審判を読む。
-        judge_dir: std::env::var_os("NOVAKEY_JUDGE_DIR").map(PathBuf::from),
+        loanwords_path: Some(repo_table("SHIZUKU_LOANWORDS", "loanwords.tsv")),
+        dev_words_path: Some(repo_table("SHIZUKU_DEV_WORDS", "dev_words.txt")),
+        emoji_path: Some(repo_table("SHIZUKU_EMOJI", "emoji.tsv")),
+        // シミュレータは SHIZUKU_JUDGE_DIR を指定したときだけ審判を読む。
+        judge_dir: std::env::var_os("SHIZUKU_JUDGE_DIR").map(PathBuf::from),
     });
 }
 
 thread_local! {
-    /// 打鍵ごとの処理時間 (ms) と、審判が走ったか。`NOVAKEY_SIM_TIMING=1` の要約用。
+    /// 打鍵ごとの処理時間 (ms) と、審判が走ったか。`SHIZUKU_SIM_TIMING=1` の要約用。
     static TIMINGS: std::cell::RefCell<Vec<(f64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// 審判だけの時間 (ms)。
     static JUDGE_MS: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -582,7 +582,7 @@ pub fn simulate_file(path: &str, check_preedit: bool) {
         let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
         println!("{verdict} {keys}  =>  {shown}{want}");
     }
-    if std::env::var_os("NOVAKEY_SIM_TIMING").is_some() {
+    if std::env::var_os("SHIZUKU_SIM_TIMING").is_some() {
         print_timing_summary();
     }
     if failures > 0 {

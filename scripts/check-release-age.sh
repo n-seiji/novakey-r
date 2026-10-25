@@ -15,7 +15,7 @@ MIN_AGE_DAYS=${MIN_AGE_DAYS:-7}
 ALLOW=${ALLOW:-tools/release-age-allow.txt}
 CACHE=${CACHE:-target/release-age-cache.tsv}
 DELAY=${DELAY:-1}
-UA='novakey-r-release-age-check (github.com/n-seiji/novakey-r)'
+UA='shizuku-release-age-check (github.com/n-seiji/shizuku-ime)'
 REGISTRY='registry+https://github.com/rust-lang/crates.io-index'
 
 fail() {

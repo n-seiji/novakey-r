@@ -3,11 +3,11 @@
 #   signing  holds the signing and notarization secrets for the build job (no reviewers)
 #   release  gates the publish job (one required reviewer)
 # Safe to re-run. Reviewer defaults to n-seiji (or $REVIEWER); the repository defaults to
-# n-seiji/novakey-r (or $REPO).
+# n-seiji/shizuku-ime (or $REPO).
 # Usage: scripts/setup-release-env.sh [reviewer-login]
 set -euo pipefail
 reviewer="${1:-${REVIEWER:-n-seiji}}"
-repo="${REPO:-n-seiji/novakey-r}"
+repo="${REPO:-n-seiji/shizuku-ime}"
 
 id="$(gh api "users/$reviewer" -q .id)"
 [ -n "$id" ] || { echo "setup-release-env: no GitHub user $reviewer" >&2; exit 1; }

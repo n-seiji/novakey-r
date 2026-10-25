@@ -385,7 +385,7 @@ mod tests {
     /// tokenizer.json は git に入らないので、無ければ飛ばす (あるのに読めなければ失敗)。
     #[test]
     fn 本物の語彙で_tokenizers_crate_と同じ_id_列になる() {
-        let dir = std::env::var_os("NOVAKEY_JUDGE_DIR")
+        let dir = std::env::var_os("SHIZUKU_JUDGE_DIR")
             .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/judge"), Into::into);
         let path = dir.join("tokenizer.json");
         if !path.exists() {

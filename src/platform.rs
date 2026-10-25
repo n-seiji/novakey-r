@@ -568,7 +568,7 @@ pub fn set_defaults_bool(key: &str, value: bool) {
 pub fn build_menu(items: &[(&str, Sel)]) -> Id<AnyObject> {
     let empty = NSString::from_str("");
     // SAFETY: NSMenu/NSMenuItem の標準的な生成と addItem:。各セレクタの引数型は宣言と一致し、
-    // アクションは NovakeyRInputController が実装する。
+    // アクションは ShizukuInputController が実装する。
     unsafe {
         let menu: Id<AnyObject> = msg_send_id![class!(NSMenu), new];
         for (title, action) in items {
@@ -641,11 +641,11 @@ mod tests {
         // SAFETY: NSObject の new と NSException の exceptionWithName:reason:userInfo: は引数の型が一致する。
         let object: Id<AnyObject> = unsafe { msg_send_id![class!(NSObject), new] };
         assert_eq!(super::exception_name(&object), None);
-        let name = NSString::from_str("NovakeyTestException");
+        let name = NSString::from_str("ShizukuTestException");
         let exception: Id<AnyObject> = unsafe {
             msg_send_id![class!(NSException), exceptionWithName: &*name, reason: std::ptr::null::<AnyObject>(), userInfo: std::ptr::null::<AnyObject>()]
         };
-        assert_eq!(super::exception_name(&exception).as_deref(), Some("NovakeyTestException"));
+        assert_eq!(super::exception_name(&exception).as_deref(), Some("ShizukuTestException"));
     }
 
     #[test]

@@ -5,23 +5,23 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>ja</string>
 	<key>CFBundleDisplayName</key>
-	<string>NovakeyR</string>
+	<string>Shizuku</string>
 	<key>CFBundleExecutable</key>
-	<string>novakey_r</string>
+	<string>shizuku</string>
 	<key>CFBundleIconFile</key>
 	<string>app.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.n-seiji.inputmethod.NovakeyR</string>
+	<string>dev.n-seiji.inputmethod.Shizuku</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>NovakeyR</string>
+	<string>Shizuku</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>InputMethodConnectionName</key>
-	<string>dev.n-seiji.inputmethod.NovakeyR_Connection</string>
+	<string>dev.n-seiji.inputmethod.Shizuku_Connection</string>
 	<key>InputMethodServerControllerClass</key>
-	<string>NovakeyRInputController</string>
+	<string>ShizukuInputController</string>
 	<key>LSBackgroundOnly</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>

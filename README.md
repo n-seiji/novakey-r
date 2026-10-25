@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wordmark-dark.svg">
-  <img src="docs/assets/wordmark-light.svg" alt="NovakeyR" width="320">
+  <img src="docs/assets/wordmark-light.svg" alt="Shizuku" width="320">
 </picture>
 
 **English** · [日本語](README.ja.md)
@@ -40,24 +40,20 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 
 Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
 
-Download `NovakeyR-<version>.pkg` from Releases and open it. The installer puts NovakeyR in `~/Library/Input Methods` (only for you, so it does not ask for a password). The package is signed with Developer ID and notarized by Apple.
+Download `Shizuku-<version>.pkg` from Releases and open it. The installer puts Shizuku in `~/Library/Input Methods` (only for you, so it does not ask for a password). The package is signed with Developer ID and notarized by Apple.
 
-The first time, add NovakeyR in System Settings > Keyboard > Input Sources. If it is not listed yet, log out and back in first.
+The first time, add Shizuku in System Settings > Keyboard > Input Sources. If it is not listed yet, log out and back in first.
 
 ### Update
 
-Open the newer `.pkg`. It installs over the old version, and NovakeyR stays in Input Sources. Do not delete the old app first: deleting it drops NovakeyR from Input Sources, and you would have to add it again.
+Open the newer `.pkg`. It installs over the old version, and Shizuku stays in Input Sources. Do not delete the old app first: deleting it drops Shizuku from Input Sources, and you would have to add it again.
 
 ### Uninstall
 
-1. Remove NovakeyR from Input Sources.
-2. Delete `~/Library/Input Methods/NovakeyR.app`.
-3. Remove the install receipt: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (the receipt is in your home, so plain `pkgutil --forget` without `--volume ~` does not find it).
-4. To also erase what NovakeyR learned and its settings, delete `~/Library/Application Support/NovakeyR`, `~/Library/Logs/NovakeyR` and `~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist`.
-
-### Moving from the Homebrew cask
-
-NovakeyR 0.1.2 and earlier were also on Homebrew (`n-seiji/tap/novakey-r`). If you installed it that way, run `brew uninstall --cask novakey-r` (without `--zap`, so what NovakeyR learned stays), then install the `.pkg` and add NovakeyR to Input Sources again. This is needed once: uninstalling deletes the app, and otherwise Homebrew would keep managing the app the `.pkg` replaced.
+1. Remove Shizuku from Input Sources.
+2. Delete `~/Library/Input Methods/Shizuku.app`.
+3. Remove the install receipt: `pkgutil --forget dev.n-seiji.inputmethod.Shizuku.pkg --volume ~` (the receipt is in your home, so plain `pkgutil --forget` without `--volume ~` does not find it).
+4. To also erase what Shizuku learned and its settings, delete `~/Library/Application Support/Shizuku`, `~/Library/Logs/Shizuku` and `~/Library/Preferences/dev.n-seiji.inputmethod.Shizuku.plist`.
 
 ### Build from source
 
@@ -68,7 +64,7 @@ mise run judge-model
 mise run install
 ```
 
-This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
+This installs `~/Library/Input Methods/Shizuku.app`. Log out and back in, then add Shizuku in System Settings > Keyboard > Input Sources.
 
 ### Dependencies
 
@@ -76,7 +72,7 @@ Dependency versions published less than 7 days ago are not used. `mise run relea
 
 ## No network at runtime
 
-NovakeyR opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.
+Shizuku opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.
 
 ## Keys
 
@@ -93,7 +89,7 @@ NovakeyR opens no network connections. `scripts/check-no-network.sh` checks the 
 
 ## Where data lives
 
-Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it. The key-event trace is off by default, and it never records what you type.
+Learning is stored in `~/Library/Application Support/Shizuku/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it. The key-event trace is off by default, and it never records what you type.
 
 ## Releasing
 
@@ -114,10 +110,10 @@ For maintainers. Releases are built, signed and notarized by `.github/workflows/
    3. Set the repository variable that turns releases on: `gh variable set RELEASE_ENABLED --body true`. Until it is `true`, the workflow only reports "release disabled" and builds nothing, so merging to main is safe.
 
    The secrets are scoped to the `signing` environment, which only jobs running on main can use, so workflows on other branches cannot read them. Use a dedicated App Store Connect API key for this repository, with the Developer role, for notarization.
-2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs, notarizes and staples it, and zips it. It then builds `NovakeyR-<version>.pkg` from the stapled app (`scripts/build-pkg.sh`), signs the package with the Developer ID Installer identity, notarizes and staples the package, and checks it with `spctl --assess --type install`. Finally it creates a draft release with the `.pkg`, the `.app.zip` (secondary) and their `.sha256` files.
+2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs, notarizes and staples it, and zips it. It then builds `Shizuku-<version>.pkg` from the stapled app (`scripts/build-pkg.sh`), signs the package with the Developer ID Installer identity, notarizes and staples the package, and checks it with `spctl --assess --type install`. Finally it creates a draft release with the `.pkg`, the `.app.zip` (secondary) and their `.sha256` files.
 3. Test the draft before approving it:
    - Download the `.pkg` from the draft **in Safari**, so it gets the quarantine attribute. Open it, check that the installer does not ask for a password, log out and back in, add the input source and type.
-   - Open the same `.pkg` again over the installed one and check that NovakeyR is still in Input Sources.
+   - Open the same `.pkg` again over the installed one and check that Shizuku is still in Input Sources.
    - If Gatekeeper blocks the package or the IME, do not approve.
 4. Approve the `release` environment. The publish job checks the draft against the build's checksums, attests the `.pkg` and the zip and publishes the release.
 
@@ -129,7 +125,6 @@ For maintainers. Releases are built, signed and notarized by `.github/workflows/
 - English words for loanwords (`resources/loanwords.tsv`) are built from [EDRDG](https://www.edrdg.org/)'s JMdict (CC BY-SA 4.0).
 - Emoji (`resources/emoji.tsv`) are built from Unicode emoji data and CLDR Japanese annotations (Unicode License v3) via [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage).
 - Re-ranking uses [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.), converted by `tools/gen_judge_model.py` and not included in this repository.
-- The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
 
 Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
 

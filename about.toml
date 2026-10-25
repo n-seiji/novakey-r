@@ -3,6 +3,6 @@ targets = ["aarch64-apple-darwin"]
 ignore-dev-dependencies = true
 ignore-build-dependencies = true
 
-# NovakeyR itself is GPL-3.0-or-later; it is not a third-party crate.
+# Shizuku itself is GPL-3.0-or-later; it is not a third-party crate.
 [private]
 ignore = true

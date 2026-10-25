@@ -1,4 +1,4 @@
-NovakeyR third-party notices
+Shizuku third-party notices
 ============================
 
 AzooKeyKanaKanjiConverter
@@ -51,7 +51,7 @@ bundles them. The MIT License text is the one above, with:
 tokenizers, spm_precompiled and darts-clone (judge tokenizer)
 -------------------------------------------------------------
 The judge's tokenizer (src/tokenizer.rs) is a Rust port of the behaviour of
-these crates, which NovakeyR no longer links:
+these crates, which Shizuku no longer links:
 
 - tokenizers 0.21.4 (https://github.com/huggingface/tokenizers): the
   added-token split, Strip / Replace normalizers, Metaspace pre-tokenizer and
@@ -200,6 +200,6 @@ Copyright © Unicode, Inc. All rights reserved.
 
 Rust crates
 -----------
-The licenses of every Rust crate linked into NovakeyR (rayon, regex and
+The licenses of every Rust crate linked into Shizuku (rayon, regex and
 the rest of the dependency tree) are in the file
 THIRD_PARTY_LICENSES, shipped next to this file.

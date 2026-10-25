@@ -7,18 +7,18 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// 学習データの親ディレクトリ (`NOVAKEY_MEMORY_DIR`、無ければ `~/Library/Application Support/NovakeyR`)。
+    /// 学習データの親ディレクトリ (`SHIZUKU_MEMORY_DIR`、無ければ `~/Library/Application Support/Shizuku`)。
     /// HOME も無ければ `None` で、学習は読み書きしない。
     pub memory_dir: Option<PathBuf>,
-    /// 学習・英語の記憶を使うか (`NOVAKEY_DISABLE_LEARNING=1` で false)。
+    /// 学習・英語の記憶を使うか (`SHIZUKU_DISABLE_LEARNING=1` で false)。
     pub learning_enabled: bool,
-    /// カタカナ語 -> 英語の表 (`NOVAKEY_LOANWORDS`、無ければアプリバンドルの Resources)。
+    /// カタカナ語 -> 英語の表 (`SHIZUKU_LOANWORDS`、無ければアプリバンドルの Resources)。
     pub loanwords_path: Option<PathBuf>,
-    /// 開発用語の英単語の一覧 (`NOVAKEY_DEV_WORDS`、無ければアプリバンドルの Resources)。
+    /// 開発用語の英単語の一覧 (`SHIZUKU_DEV_WORDS`、無ければアプリバンドルの Resources)。
     pub dev_words_path: Option<PathBuf>,
-    /// 読み -> 絵文字の表 (`NOVAKEY_EMOJI`、無ければアプリバンドルの Resources)。
+    /// 読み -> 絵文字の表 (`SHIZUKU_EMOJI`、無ければアプリバンドルの Resources)。
     pub emoji_path: Option<PathBuf>,
-    /// ライブ変換の審判モデルの置き場所 (`NOVAKEY_JUDGE_DIR`、無ければアプリバンドルの Resources/judge)。
+    /// ライブ変換の審判モデルの置き場所 (`SHIZUKU_JUDGE_DIR`、無ければアプリバンドルの Resources/judge)。
     pub judge_dir: Option<PathBuf>,
 }
 
@@ -29,22 +29,22 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let memory_dir = match std::env::var("NOVAKEY_MEMORY_DIR") {
+        let memory_dir = match std::env::var("SHIZUKU_MEMORY_DIR") {
             Ok(d) if !d.is_empty() => Some(PathBuf::from(d)),
-            _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/NovakeyR")),
+            _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Shizuku")),
         };
         Self {
             memory_dir,
-            learning_enabled: !std::env::var("NOVAKEY_DISABLE_LEARNING").is_ok_and(|v| v == "1"),
-            loanwords_path: std::env::var_os("NOVAKEY_LOANWORDS").map(PathBuf::from).or_else(|| bundled("loanwords.tsv")),
-            dev_words_path: std::env::var_os("NOVAKEY_DEV_WORDS").map(PathBuf::from).or_else(|| bundled("dev_words.txt")),
-            emoji_path: std::env::var_os("NOVAKEY_EMOJI").map(PathBuf::from).or_else(|| bundled("emoji.tsv")),
-            judge_dir: std::env::var_os("NOVAKEY_JUDGE_DIR").map(PathBuf::from).or_else(|| bundled("judge")),
+            learning_enabled: !std::env::var("SHIZUKU_DISABLE_LEARNING").is_ok_and(|v| v == "1"),
+            loanwords_path: std::env::var_os("SHIZUKU_LOANWORDS").map(PathBuf::from).or_else(|| bundled("loanwords.tsv")),
+            dev_words_path: std::env::var_os("SHIZUKU_DEV_WORDS").map(PathBuf::from).or_else(|| bundled("dev_words.txt")),
+            emoji_path: std::env::var_os("SHIZUKU_EMOJI").map(PathBuf::from).or_else(|| bundled("emoji.tsv")),
+            judge_dir: std::env::var_os("SHIZUKU_JUDGE_DIR").map(PathBuf::from).or_else(|| bundled("judge")),
         }
     }
 }
 
-/// Contents/MacOS/novakey_r から見た Contents/Resources/<name>
+/// Contents/MacOS/shizuku から見た Contents/Resources/<name>
 fn bundled(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(exe.parent()?.parent()?.join("Resources").join(name))

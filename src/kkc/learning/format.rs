@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::store::{Entries, MemEntry, Text};
 
+/// File format ID, not a product name: it must stay byte for byte so that learning data
+/// written before the rename to Shizuku still loads.
 pub const HEADER: &str = "# novakey-r learning v1";
 pub const FILE_NAME: &str = "learning.tsv";
 
@@ -167,4 +169,14 @@ fn parse_line(line: &str) -> Option<(Text, MemEntry)> {
         last_updated: f[7].parse().ok()?,
     };
     Some((ruby.into(), m))
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::HEADER;
+
+    #[test]
+    fn header_is_the_format_id_and_never_follows_the_product_name() {
+        assert_eq!(HEADER, "# novakey-r learning v1");
+    }
 }

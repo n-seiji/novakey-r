@@ -100,7 +100,7 @@ mod tests {
         unsafe impl ClassType for FakeTextInput {
             type Super = NSObject;
             type Mutability = mutability::InteriorMutable;
-            const NAME: &'static str = "NovakeyRFakeTextInput";
+            const NAME: &'static str = "ShizukuFakeTextInput";
         }
 
         impl DeclaredClass for FakeTextInput {
@@ -188,7 +188,7 @@ mod tests {
         let exception: Id<AnyObject> = unsafe {
             msg_send_id![
                 objc2::class!(NSException),
-                exceptionWithName: &*NSString::from_str("NovakeyRTestException"),
+                exceptionWithName: &*NSString::from_str("ShizukuTestException"),
                 reason: &*NSString::from_str("secret user text"),
                 userInfo: std::ptr::null::<AnyObject>()
             ]
@@ -217,7 +217,7 @@ mod tests {
     fn raising() -> Client {
         static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
         let class = CLASS.get_or_init(|| {
-            let mut builder = ClassBuilder::new("NovakeyRRaisingTextInput", NSObject::class())
+            let mut builder = ClassBuilder::new("ShizukuRaisingTextInput", NSObject::class())
                 .expect("クラス名が未登録");
             // SAFETY: 各 IMP の型は IMKTextInput のメソッドの型 (引数と戻り値) に一致する。objc2 0.5 は C-unwind の IMP を
             // feature 付きでしか受けないので "C" の型へ読み替えるが、関数自体は C-unwind でコンパイルされ巻き戻せる。
