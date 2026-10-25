@@ -329,7 +329,7 @@ pub fn is_secure_input_enabled() -> bool {
 
 /// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。
 /// 送信が例外を投げたら空にする。
-pub fn utf16_units(string: &NSString) -> Vec<u16> {
+fn utf16_units(string: &NSString) -> Vec<u16> {
     utf16_units_with(string, true)
 }
 
@@ -431,15 +431,6 @@ pub fn run_application(connection_name: &str) {
             let _: () = msg_send![&*app, run];
         }
     });
-}
-
-/// 現スレッドのメイン run loop を回す (スモークテスト用)。
-pub fn run_main_run_loop() {
-    // SAFETY: mainRunLoop は NSRunLoop を返し、run は引数なしで呼べる。
-    unsafe {
-        let run_loop: Id<AnyObject> = msg_send_id![class!(NSRunLoop), mainRunLoop];
-        let _: () = msg_send![&*run_loop, run];
-    }
 }
 
 fn connect_imkserver(name: &NSString, bundle_id: Option<&NSString>) {
@@ -554,8 +545,8 @@ pub fn set_defaults_bool(key: &str, value: bool) {
     }
 }
 
-/// 入力メソッドのメニュー。items は (タイトル, アクション)。warning があれば無効状態の注意項目を追加する。
-pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject> {
+/// 入力メソッドのメニュー。items は (タイトル, アクション)。
+pub fn build_menu(items: &[(&str, Sel)]) -> Id<AnyObject> {
     let empty = NSString::from_str("");
     // SAFETY: NSMenu/NSMenuItem の標準的な生成と addItem:。各セレクタの引数型は宣言と一致し、
     // アクションは NovakeyRInputController が実装する。
@@ -571,13 +562,6 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
                 keyEquivalent: &*empty
             ];
             let _: () = msg_send![&*menu, addItem: &*item];
-        }
-        if let Some(warning) = warning {
-            let warn = NSString::from_str(warning);
-            let warn_item: Id<AnyObject> = msg_send_id![class!(NSMenuItem), new];
-            let _: () = msg_send![&*warn_item, setTitle: &*warn];
-            let _: () = msg_send![&*warn_item, setEnabled: Bool::NO];
-            let _: () = msg_send![&*menu, addItem: &*warn_item];
         }
         menu
     }

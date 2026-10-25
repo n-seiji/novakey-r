@@ -9,7 +9,6 @@ mod input;
 mod judge;
 mod keymap;
 mod kkc;
-mod llm_bridge;
 mod emoji;
 mod english_memory;
 mod english_split;
@@ -17,9 +16,6 @@ mod loanword;
 mod outbound;
 mod platform;
 mod private_fs;
-mod registry;
-mod rerank;
-mod rerank_gate;
 mod romaji_converter;
 mod session;
 mod simulate;
@@ -62,16 +58,10 @@ fn main() {
         platform::check_main_queue();
     }
 
-    if args.iter().any(|a| a == "--test-llm") {
-        llm_bridge::smoke_test();
-        return;
-    }
-
     config::init(config::Config::from_env());
     platform::begin_activity();
     judge::preload();
     platform::install_panic_hook();
     imk::register_controller();
-    imk::init_llm_dispatch();
     imk::run();
 }

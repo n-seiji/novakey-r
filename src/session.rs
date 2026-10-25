@@ -9,15 +9,6 @@ use std::sync::LazyLock;
 use crate::composer::{CandidateEngine, Committed, Composer, Phase};
 use crate::deps::{EnglishMemory, Lexicon};
 use crate::keymap::{self, Action, Key};
-use crate::rerank::Choice;
-
-/// リランキング要求の中身。送信は Effect の実行側が決める。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RerankJob {
-    pub generation: u64,
-    pub hiragana: String,
-    pub candidates: Vec<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -26,10 +17,6 @@ pub enum Effect {
     /// 候補ウィンドウを出し、選択中の行 (0 起点) をハイライトする。
     ShowCandidates { selected: usize },
     HideCandidates,
-    /// urgent は Space 押下時用。デバウンスを待たずに送る。
-    RequestRerank { urgent: bool, job: RerankJob },
-    /// 組成が終わった。待機中・送信中の要求を捨てる。
-    CancelRerank,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,8 +43,6 @@ pub enum ConversionMode {
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
     pub learning: bool,
-    /// AI 並べ替えの要求を出してよい。
-    pub rerank: bool,
 }
 
 pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
@@ -65,8 +50,6 @@ pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     memory: M,
     /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
     playful: fn(&str) -> Option<String>,
-    /// RequestRerank を出してから、まだ CancelRerank を出していない。
-    rerank_outstanding: bool,
 }
 
 impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
@@ -76,7 +59,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             composer,
             memory,
             playful: playful_convert,
-            rerank_outstanding: false,
         }
     }
 
@@ -90,10 +72,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         } else {
             ConversionMode::Space
         }
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.composer.current_generation()
     }
 
     pub fn set_playful(&mut self, playful: fn(&str) -> Option<String>) {
@@ -127,14 +105,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         }
     }
 
-    /// AI の並べ替え結果を反映する。世代が古いなどで反映されなければ空。
-    pub fn apply_rerank(&mut self, generation: u64, choice: &Choice) -> Vec<Effect> {
-        match self.composer.apply_rerank(generation, choice) {
-            Some(_) => vec![Effect::SetMarked(self.marked_text())],
-            None => Vec::new(),
-        }
-    }
-
     /// 下線付きで見せる文字列。
     pub fn marked_text(&self) -> String {
         self.composer.preedit()
@@ -154,7 +124,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
-        let before = phase;
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
         let key = match text.chars().collect::<Vec<_>>()[..] {
             [ch] if !ch.is_ascii_alphabetic() && self.composer.accepts_romaji(ch) => {
@@ -162,9 +131,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             }
             _ => key,
         };
-        if let Some(handled) = self.prepare(gates, key, &mut fx) {
-            self.resume_rerank(gates, before, &mut fx);
-            self.finish(&mut fx);
+        if let Some(handled) = self.prepare(key, &mut fx) {
             return Outcome { handled, action: None, phase, effects: fx };
         }
         let phase = self.phase();
@@ -173,12 +140,9 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             self.commit_and_insert(gates, "", &mut fx);
             let restarted = self.handle(gates, key, text);
             fx.extend(restarted.effects);
-            self.finish(&mut fx);
             return Outcome { handled: restarted.handled, action: Some(action), phase, effects: fx };
         }
         let handled = self.perform(gates, action, text, &mut fx);
-        self.resume_rerank(gates, before, &mut fx);
-        self.finish(&mut fx);
         Outcome { handled, action: Some(action), phase, effects: fx }
     }
 
@@ -187,19 +151,17 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         self.composer.select_candidate_text(text);
         let mut fx = Vec::new();
         self.commit_and_insert(gates, "", &mut fx);
-        self.finish(&mut fx);
         fx
     }
 
     /// 入力ソースの切り替えなどによる確定 (commitComposition:)。
     pub fn commit_composition(&mut self, gates: &Gates) -> Vec<Effect> {
         let mut fx = Vec::new();
-        self.flush_romaji(gates, true, &mut fx);
+        self.composer.flush_romaji();
         if !self.composer.is_empty() {
             fx.push(Effect::Insert(self.commit(gates)));
         }
         fx.push(Effect::HideCandidates);
-        self.finish(&mut fx);
         fx
     }
 
@@ -221,61 +183,8 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         text
     }
 
-    /// 組成が空になった、または英語を打っている状態になっていて、AI 要求を出したままなら、その取り消しを 1 度だけ出す。
-    fn finish(&mut self, fx: &mut Vec<Effect>) {
-        let idle = (self.composer.is_empty() && !self.composer.has_romaji()) || self.composer.phase() == Phase::Dangling;
-        if self.rerank_outstanding && idle {
-            self.rerank_outstanding = false;
-            fx.push(Effect::CancelRerank);
-        }
-    }
-
-    fn rerank_job(&self) -> Option<RerankJob> {
-        let composer = &self.composer;
-        (composer.phase() == Phase::Composing
-            && !composer.is_symbol()
-            && composer.candidates().len() >= 2)
-            .then(|| RerankJob {
-                generation: composer.current_generation(),
-                hiragana: composer.display_hiragana().to_string(),
-                candidates: composer.candidates().iter().map(|c| c.text.clone()).collect(),
-            })
-    }
-
-    fn request_rerank(&mut self, gates: &Gates, urgent: bool, fx: &mut Vec<Effect>) {
-        if !gates.rerank {
-            return;
-        }
-        if let Some(job) = self.rerank_job() {
-            self.rerank_outstanding = true;
-            fx.push(Effect::RequestRerank { urgent, job });
-        }
-    }
-
-    /// 英語の判定が外れてかなの組成に戻った打鍵は、かなが増えなくても (未確定ローマ字の BS など) AI 要求を出し直す。
-    fn resume_rerank(&mut self, gates: &Gates, before: Phase, fx: &mut Vec<Effect>) {
-        let requested = fx.iter().any(|e| matches!(e, Effect::RequestRerank { .. }));
-        if before == Phase::Dangling && self.phase() == Phase::Composing && !requested {
-            self.request_rerank(gates, false, fx);
-        }
-    }
-
     fn refresh_marked(&self, fx: &mut Vec<Effect>) {
         fx.push(Effect::SetMarked(self.marked_text()));
-    }
-
-    /// 未変換のローマ字を確定かなとして composer へ流す。
-    fn flush_romaji(&mut self, gates: &Gates, rerank: bool, fx: &mut Vec<Effect>) {
-        let ranks = self.composer.flush_romaji();
-        if ranks && rerank {
-            self.request_rerank(gates, false, fx);
-        }
-    }
-
-    fn after_typed(&mut self, gates: &Gates, produced_kana: bool, fx: &mut Vec<Effect>) {
-        if produced_kana {
-            self.request_rerank(gates, false, fx);
-        }
     }
 
     /// 現在の表示内容を確定して挿入する。suffix は確定直後に続けて入れる文字列。
@@ -303,7 +212,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     }
 
     /// 動作表に引く前の、ローマ字バッファ側の後始末。ここで処理が済んだら Some。
-    fn prepare(&mut self, gates: &Gates, key: Key, fx: &mut Vec<Effect>) -> Option<bool> {
+    fn prepare(&mut self, key: Key, fx: &mut Vec<Effect>) -> Option<bool> {
         let flushes = matches!(
             key,
             Key::Space
@@ -319,7 +228,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 | Key::Translit(_)
         );
         if flushes {
-            self.flush_romaji(gates, !matches!(key, Key::Translit(_)), fx);
+            self.composer.flush_romaji();
         }
         let has_romaji = self.composer.has_romaji();
         match key {
@@ -351,8 +260,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 .map(|converted| fx.push(Effect::Insert(converted)))
                 .is_some(),
             Action::TypeRomaji => {
-                let produced = self.composer.type_romaji(text);
-                self.after_typed(gates, produced, fx);
+                self.composer.type_romaji(text);
                 self.show_typing(fx)
             }
             Action::StartLiteral | Action::TypeLiteral => {
@@ -360,16 +268,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 self.show_typing(fx)
             }
             Action::TypeText => {
-                let produced = self.composer.type_text(text);
-                self.after_typed(gates, produced, fx);
+                self.composer.type_text(text);
                 self.show_typing(fx)
             }
             Action::Convert => {
-                let needs_rerank =
-                    self.composer.phase() != Phase::Dangling && !self.composer.has_pending_rerank();
-                if needs_rerank {
-                    self.request_rerank(gates, true, fx);
-                }
                 self.composer.begin_conversion();
                 self.refresh_marked(fx);
                 true
@@ -420,7 +322,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             Action::DeleteBack => {
                 let deleted = self.composer.backspace();
                 if deleted {
-                    self.request_rerank(gates, false, fx);
                     self.show_typing(fx);
                 }
                 deleted
@@ -466,8 +367,7 @@ mod tests {
     use crate::deps::{FakeLexicon, FakeMemory};
     use crate::keymap::classify;
 
-    const ALLOW: Gates = Gates { learning: true, rerank: false };
-    const RERANK: Gates = Gates { learning: true, rerank: true };
+    const ALLOW: Gates = Gates { learning: true };
 
     struct NullEngine;
     impl CandidateEngine for NullEngine {
@@ -713,32 +613,6 @@ mod tests {
     }
 
     #[test]
-    fn 確定したらai要求の取り消しを1度だけ出す() {
-        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        let typing = effects_with(&RERANK, &mut session, "kyou");
-        assert!(typing.iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
-        assert!(!typing.contains(&Effect::CancelRerank), "組成中は取り消さない");
-        let commit = effects_with(&RERANK, &mut session, "\r");
-        assert_eq!(commit.iter().filter(|e| **e == Effect::CancelRerank).count(), 1);
-        let again = effects_with(&RERANK, &mut session, "\r");
-        assert!(!again.contains(&Effect::CancelRerank), "取り消しは 1 度だけ");
-    }
-
-    #[test]
-    fn escで組成を捨てても取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        effects_with(&RERANK, &mut session, "kyou");
-        assert!(effects_with(&RERANK, &mut session, "\u{1b}").contains(&Effect::CancelRerank));
-    }
-
-    #[test]
-    fn commit_compositionでも取り消しを出す() {
-        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        effects_with(&RERANK, &mut session, "kyou");
-        assert!(session.commit_composition(&RERANK).contains(&Effect::CancelRerank));
-    }
-
-    #[test]
     fn 作った時のモードを返し_set_liveで組成中の表示が作り直される() {
         let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Live);
         assert_eq!(session.mode(), ConversionMode::Live);
@@ -766,20 +640,6 @@ mod tests {
         effects_of(&mut session, "kyou ");
         assert!(session.select_highlight("無い").is_empty());
         assert_eq!(session.select_highlight("x"), vec![Effect::SetMarked("x".to_string())]);
-    }
-
-    #[test]
-    fn 世代が違うapply_rerankは何も出さない() {
-        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        effects_of(&mut session, "kyou");
-        assert!(session.apply_rerank(u64::MAX, &Choice { index: 1, text: "京".into() }).is_empty());
-    }
-
-    #[test]
-    fn aiが無効なら取り消しも出さない() {
-        let mut session = Session::new(Composer::new(TwoEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        effects_of(&mut session, "kyou");
-        assert!(!effects_of(&mut session, "\r").contains(&Effect::CancelRerank));
     }
 
     /// `<space>` `<bs>` `<esc>` `<enter>` `<F7>` を含む打鍵列を流し、(最後の表示, 確定した文字列) を返す。
@@ -890,29 +750,6 @@ mod tests {
         assert_eq!(drive(&mut english_session(), "mergeX<enter>").1, "mergeX");
     }
 
-    #[test]
-    fn 英語の判定が外れたら打鍵がかなを増やさなくてもai要求を再開する() {
-        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
-        let memory = lexicon.memory();
-        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
-        effects_with(&RERANK, &mut session, "enter");
-        assert_eq!(session.marked_text(), "enter");
-        let back = effects_with(&RERANK, &mut session, "\u{7f}");
-        assert!(back.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{back:?}");
-    }
-
-    #[test]
-    fn 英語を打っている間はai並べ替えを要求しない() {
-        let lexicon = FakeLexicon::default().with_english_word(|w| w == "enter");
-        let memory = lexicon.memory();
-        let mut session = Session::new(Composer::new(TwoEngine, lexicon), memory, ConversionMode::Space);
-        assert!(effects_with(&RERANK, &mut session, "ente").iter().any(|e| matches!(e, Effect::RequestRerank { .. })));
-        let english = effects_with(&RERANK, &mut session, "rsaX");
-        assert!(!english.iter().any(|e| matches!(e, Effect::RequestRerank { .. })), "{english:?}");
-        assert_eq!(english.iter().filter(|e| **e == Effect::CancelRerank).count(), 1, "英語になった時点で出していた要求を取り消す");
-        assert_eq!(session.marked_text(), "entersaX");
-    }
-
     #[derive(Clone, Default)]
     struct RecordingEngine {
         selects: std::rc::Rc<std::cell::RefCell<Vec<(u64, usize)>>>,
@@ -953,7 +790,7 @@ mod tests {
 
     #[test]
     fn 学習が許されなければengineの保留を取り消して学習しない() {
-        let denied = Gates { learning: false, rerank: false };
+        let denied = Gates { learning: false };
         let (engine, memory) = commit_with(&denied, "kyou ");
         assert!(engine.selects.borrow().is_empty());
         assert_eq!(engine.cancels.get(), 1);
@@ -970,7 +807,7 @@ mod tests {
     #[test]
     fn 英字で確定した語は学習が許されるときだけ覚える() {
         assert_eq!(commit_with(&ALLOW, "G").1.learned(), ["G"]);
-        let denied = Gates { learning: false, rerank: false };
+        let denied = Gates { learning: false };
         assert!(commit_with(&denied, "G").1.learned().is_empty());
     }
 }

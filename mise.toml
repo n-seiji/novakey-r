@@ -10,11 +10,6 @@ run = "cargo build --release"
 description = "Run unit tests"
 run = "cargo test"
 
-[tasks.test-llm]
-description = "LLM候補リランキングのスモークテスト"
-run = "cargo run --release -- --test-llm"
-
-
 [tasks.simulate]
 env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"

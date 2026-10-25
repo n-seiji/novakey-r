@@ -34,7 +34,6 @@
 - **候補。** カタカナ語の英単語 (デスクトップ → desktop) と絵文字 (ねこ → 🐈) も候補に出ます。
 - **学習。** 選んだ候補を覚えて、次から先に出します。パスワード欄とパスワード管理アプリでは覚えません。
 - **ライブ変換 (任意)。** 打ちながら変換結果を表示します。入力メニューから切り替えます。
-- **AI 並べ替え (任意)。** Cloudflare Workers AI で候補を並べ替えられます。既定はオフです。
 
 ## インストール
 
@@ -58,21 +57,6 @@ mise run install
 | Esc / Backspace | 変換を取り消す |
 | Ctrl+J / K / L / ; / : | ひらがな / カタカナ / 全角英数 / 半角カナ / 半角英数 |
 | F6〜F10 | 同上 |
-
-## AI 並べ替え (任意)
-
-候補の並べ替えに Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) を使えます。入力メニューの「AI並べ替え」で有効にし、API トークンとアカウント ID を Keychain に登録してください。
-
-```sh
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
-```
-
-有効にすると、候補・読み・直前の文 (最大 100 文字) を送ります。次の場合は送りません (`src/outbound.rs`)。
-
-- パスワード欄などのセキュア入力中。
-- パスワード管理アプリとターミナル (1Password, Bitwarden, キーチェーンアクセス, Terminal, iTerm2, Ghostty など)。
-- 直前の文に API キー、秘密鍵、メールアドレス、長い数字列などが含まれるときは、直前の文だけ送りません。
 
 ## データの置き場所
 

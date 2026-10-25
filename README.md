@@ -34,7 +34,6 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 - **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
 - **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
 - **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
-- **AI reranking (optional).** Cloudflare Workers AI can reorder candidates. Off by default.
 
 ## Install
 
@@ -58,21 +57,6 @@ This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then 
 | Esc / Backspace | Cancel the conversion |
 | Ctrl+J / K / L / ; / : | Hiragana / katakana / full-width alphanumeric / half-width katakana / half-width alphanumeric |
 | F6–F10 | Same as above |
-
-## AI reranking (optional)
-
-NovakeyR can use Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) to reorder candidates. Turn on "AI並べ替え" in the input menu, then store your API token and account ID in the Keychain.
-
-```sh
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
-```
-
-When it is on, NovakeyR sends the candidates, the reading, and up to 100 characters of preceding text. It sends nothing in these cases (`src/outbound.rs`):
-
-- Secure input, such as password fields.
-- Password managers and terminals (1Password, Bitwarden, Keychain Access, Terminal, iTerm2, Ghostty, and others).
-- When the preceding text contains an API key, a private key, an email address, a long number, and the like, the preceding text is left out.
 
 ## Where data lives
 
