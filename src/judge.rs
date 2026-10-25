@@ -7,16 +7,17 @@
 //! モデルは最初に使うときに 1 度だけ読む。読めなければ 1 度だけログして engine の順のまま。
 //! 入力文字列はログにもトレースにも出さない。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use candle_core::quantized::{gguf_file, GgmlDType};
-use candle_core::Device;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
+
+use crate::gguf;
 
 const NL: usize = 6;
 const NH: usize = 8;
@@ -49,11 +50,13 @@ const VOCAB_SMALL_CHUNK: usize = 512;
 const PAR_ATTN_ROWS: usize = 24;
 /// 木に残すノード数の上限 (1 ノード約 26KB)。
 const MAX_NODES: usize = 640;
+/// モデルファイルからテンソルのデータを読むときの 1 回の読み込みの大きさ (バイト)。
+const READ_CHUNK: usize = 1 << 20;
 
-/// エラーは固定文字列だけ (candle / tokenizers のエラー文はログに出さない)。
+/// エラーは固定文字列だけ (tokenizers のエラー文はログに出さない)。
 type R<T> = Result<T, &'static str>;
 
-/// 元のエラー (candle / tokenizers / io) は捨てて、場所を表す固定文字列にする。
+/// 元のエラー (tokenizers / io) は捨てて、場所を表す固定文字列にする。
 fn fail<E>(msg: &'static str) -> impl Fn(E) -> &'static str {
     move |_| msg
 }
@@ -90,27 +93,33 @@ struct QMat {
 }
 
 impl QMat {
-    fn from_gguf(q: &candle_core::quantized::QTensor) -> R<Self> {
-        let (rows, cols) = q.shape().dims2().map_err(fail("tensor is not a matrix"))?;
+    /// テンソル `name` を塊ごとに読みながら、尺度と量子化値に分けて持つ (ファイルのデータ全体は持たない)。
+    fn from_gguf<S: Read + Seek>(g: &mut gguf::Gguf<S>, name: &str) -> R<Self> {
+        let t = g.tensor(name)?;
+        let &[rows, cols] = t.dims.as_slice() else {
+            return Err("tensor is not a matrix");
+        };
         if cols % 32 != 0 {
             return Err("cols not a multiple of 32");
         }
-        let data = q.data().map_err(fail("cannot read tensor data"))?;
         let nb = rows.checked_mul(cols).ok_or("tensor too large")? / 32;
-        if q.dtype() != GgmlDType::Q8_0 {
+        if t.dtype != gguf::Dtype::Q8_0 {
             return Err("unsupported tensor dtype");
         }
-        let bsz = 34;
-        if nb.checked_mul(bsz) != Some(data.len()) {
+        let bsz = gguf::Q8_0_BLOCK_BYTES;
+        if nb.checked_mul(bsz) != Some(t.len) {
             return Err("unexpected tensor size");
         }
         let qlen = bsz - 2;
         let mut scales = Vec::with_capacity(nb);
         let mut qs = Vec::with_capacity(nb * qlen);
-        for blk in data.chunks_exact(bsz) {
-            scales.push(f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
-            qs.extend_from_slice(&blk[2..]);
-        }
+        g.read(&t, READ_CHUNK, |data| {
+            for blk in data.chunks_exact(bsz) {
+                scales.push(f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+                qs.extend_from_slice(&blk[2..]);
+            }
+            Ok(())
+        })?;
         Ok(Self { rows, cols, qs, scales })
     }
 
@@ -405,23 +414,25 @@ struct Model {
 
 impl Model {
     fn load(path: &Path) -> R<Self> {
-        let dev = Device::Cpu;
-        let mut file = std::fs::File::open(path).map_err(fail("cannot open model file"))?;
-        let content = gguf_file::Content::read(&mut file).map_err(fail("cannot parse model file"))?;
-        let file = std::cell::RefCell::new(file);
-        let get = |k: &str| content.tensor(&mut *file.borrow_mut(), k, &dev).map_err(fail("missing or unreadable tensor"));
+        let file = RefCell::new(gguf::Gguf::open(path)?);
         let get_v = |k: &str| -> R<Vec<f32>> {
-            get(k)?
-                .dequantize(&dev)
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>())
-                .map_err(fail("unreadable vector tensor"))
+            let mut g = file.borrow_mut();
+            let t = g.tensor(k)?;
+            if t.dtype != gguf::Dtype::F32 {
+                return Err("unreadable vector tensor");
+            }
+            let mut v = Vec::with_capacity(t.len / 4);
+            g.read(&t, READ_CHUNK, |data| {
+                v.extend(data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                Ok(())
+            })?;
+            Ok(v)
         };
         let ln = |p: &str, n: &str| -> R<Ln> {
             Ok(Ln { w: get_v(&format!("{p}.{n}.weight"))?, b: get_v(&format!("{p}.{n}.bias"))? })
         };
         let lin = |p: &str, n: &str| -> R<Linear> {
-            let w = QMat::from_gguf(&get(&format!("{p}.{n}.weight"))?)?;
+            let w = QMat::from_gguf(&mut file.borrow_mut(), &format!("{p}.{n}.weight"))?;
             Ok(Linear { w, b: get_v(&format!("{p}.{n}.bias"))? })
         };
         let mut blocks = Vec::with_capacity(NL);
@@ -436,7 +447,7 @@ impl Model {
                 out: lin(&p, "mlp.c_proj")?,
             });
         }
-        let wte = QMat::from_gguf(&get("transformer.wte.weight")?)?;
+        let wte = QMat::from_gguf(&mut file.borrow_mut(), "transformer.wte.weight")?;
         let wpe = get_v("transformer.wpe.weight")?;
         let work = Work { scratch: vec![0f32; SCRATCH_ELEMS], cache: Cache::new() };
         let model = Self { wte, wpe, blocks, lnf: ln("transformer", "ln_f")?, work: Mutex::new(work) };
