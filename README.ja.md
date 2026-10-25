@@ -40,9 +40,7 @@
 
 動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-近日公開: 最初の署名付きリリースを準備中です。
-
-公開後は次のどちらかで入れます。
+次のどちらかで入れます (v0.1.0 から)。
 
 - Homebrew: `brew install --cask n-seiji/tap/novakey-r`
 - または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
@@ -84,6 +82,19 @@ NovakeyR はネットワーク接続を開きません。ソースと、リン�
 ## データの置き場所
 
 学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
+
+## リリース手順
+
+メンテナ向けです。リリースは `.github/workflows/release.yml` がビルド・署名・公証まで行います。`release` 環境を承認するまでは何も公開されません。
+
+1. 初回のみ: リポジトリのシークレット `DEVELOPER_ID_P12_BASE64`、`DEVELOPER_ID_P12_PASSWORD`、`ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_P8_BASE64` を登録し、`scripts/setup-release-env.sh` で `release` 環境 (承認者 1 人、main のみ) を作ります。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行い、`NovakeyR-<version>.app.zip` とその `.sha256` を載せた下書きリリースを作ります。
+3. 承認する前に下書きを試します。
+   - 下書きの zip を **Safari で** ダウンロードします (quarantine 属性を付けるため)。Finder で展開し、`NovakeyR.app` を `~/Library/Input Methods` に移し、ログインし直して入力ソースを追加し、実際に打ちます。
+   - Homebrew でも同じことをします。下書きの URL は公開されていないので、`packaging/homebrew/novakey-r.rb` をコピーして `url "file:///<ダウンロードした zip のパス>"` とその zip の sha256 に書き換え、ローカルの tap (`brew tap-new --no-git <you>/local` の `Casks/`) に置きます。Homebrew は tap にある cask しか入れないためです。`brew install --cask <you>/local/novakey-r` で入れ、`xattr -p com.apple.quarantine ~/Library/Input\ Methods/NovakeyR.app` の結果を確かめます。
+   - Gatekeeper が IME を止めるなら、承認しません。
+4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、zip の attestation を作ってリリースを公開します。
+5. `scripts/bump-cask.sh <version> <tap>/Casks/novakey-r.rb` を実行し (チェックサムと attestation を検証します)、tap を push します。
 
 ## クレジット
 

@@ -10,6 +10,9 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
+    env:
+      # Otherwise the first `mise run` also installs cargo-about (built from source) and actionlint.
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Only rust and uv: a plain `mise install` would also compile cargo-about from source.
