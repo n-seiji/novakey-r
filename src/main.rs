@@ -3,6 +3,7 @@ mod composer;
 mod config;
 mod controller;
 mod deps;
+mod gguf;
 mod imk;
 mod imk_client;
 mod input;
@@ -20,6 +21,7 @@ mod romaji_converter;
 mod session;
 mod simulate;
 mod symbols;
+mod tokenizer;
 mod trace;
 mod translit;
 
