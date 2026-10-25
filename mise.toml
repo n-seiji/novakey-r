@@ -10,11 +10,6 @@ run = "cargo build --release"
 description = "Run unit tests"
 run = "cargo test"
 
-[tasks.test-llm]
-description = "LLM候補リランキングのスモークテスト"
-run = "cargo run --release -- --test-llm"
-
-
 [tasks.simulate]
 env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
 description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
@@ -70,6 +65,16 @@ cp -R resources/. output/NovakeyR.app/Contents/Resources/
 cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
 cp NOTICE output/NovakeyR.app/Contents/Resources/NOTICE
 """
+
+[tasks.judge-model]
+description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く。mise run app が .app に入れる"
+run = "uv run --script tools/gen_judge_model.py"
+
+[tasks.judge-bench]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary", NOVAKEY_JUDGE_DIR = "{{config_root}}/resources/judge" }
+description = "審判の精度と時間を測る (mise run judge-bench -- testset.tsv。1 行 = 読み<TAB>正解(|区切り))"
+depends = ["build"]
+run = "./target/release/novakey_r --judge-bench"
 
 [tasks.clean]
 description = "Remove the generated app bundle"

@@ -6,9 +6,9 @@ mod deps;
 mod imk;
 mod imk_client;
 mod input;
+mod judge;
 mod keymap;
 mod kkc;
-mod llm_bridge;
 mod emoji;
 mod english_memory;
 mod english_split;
@@ -16,9 +16,6 @@ mod loanword;
 mod outbound;
 mod platform;
 mod private_fs;
-mod registry;
-mod rerank;
-mod rerank_gate;
 mod romaji_converter;
 mod session;
 mod simulate;
@@ -40,6 +37,10 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
         std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
     }
+    if let Some(i) = args.iter().position(|a| a == "--judge-bench") {
+        simulate::setup_env();
+        std::process::exit(judge::bench_cli(args.get(i + 1).map_or("", String::as_str)));
+    }
     if let Some(i) = args.iter().position(|a| a == "--simulate") {
         simulate::simulate(args.get(i + 1).map_or("", String::as_str), args.iter().any(|a| a == "--check-preedit"));
         return;
@@ -53,14 +54,10 @@ fn main() {
         platform::check_main_queue();
     }
 
-    if args.iter().any(|a| a == "--test-llm") {
-        llm_bridge::smoke_test();
-        return;
-    }
-
-    config::init(config::Config::from_env());
+    // preload の背景スレッドが panic しても payload (ユーザー文字列を含みうる) を stderr に出さないよう、先に hook を入れる。
     platform::install_panic_hook();
+    config::init(config::Config::from_env());
+    judge::preload();
     imk::register_controller();
-    imk::init_llm_dispatch();
     imk::run();
 }

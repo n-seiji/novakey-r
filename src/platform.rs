@@ -329,7 +329,7 @@ pub fn is_secure_input_enabled() -> bool {
 
 /// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。
 /// 送信が例外を投げたら空にする。
-pub fn utf16_units(string: &NSString) -> Vec<u16> {
+fn utf16_units(string: &NSString) -> Vec<u16> {
     utf16_units_with(string, true)
 }
 
@@ -431,15 +431,6 @@ pub fn run_application(connection_name: &str) {
             let _: () = msg_send![&*app, run];
         }
     });
-}
-
-/// 現スレッドのメイン run loop を回す (スモークテスト用)。
-pub fn run_main_run_loop() {
-    // SAFETY: mainRunLoop は NSRunLoop を返し、run は引数なしで呼べる。
-    unsafe {
-        let run_loop: Id<AnyObject> = msg_send_id![class!(NSRunLoop), mainRunLoop];
-        let _: () = msg_send![&*run_loop, run];
-    }
 }
 
 fn connect_imkserver(name: &NSString, bundle_id: Option<&NSString>) {
@@ -554,8 +545,8 @@ pub fn set_defaults_bool(key: &str, value: bool) {
     }
 }
 
-/// 入力メソッドのメニュー。items は (タイトル, アクション)。warning があれば無効状態の注意項目を追加する。
-pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject> {
+/// 入力メソッドのメニュー。items は (タイトル, アクション)。
+pub fn build_menu(items: &[(&str, Sel)]) -> Id<AnyObject> {
     let empty = NSString::from_str("");
     // SAFETY: NSMenu/NSMenuItem の標準的な生成と addItem:。各セレクタの引数型は宣言と一致し、
     // アクションは NovakeyRInputController が実装する。
@@ -571,13 +562,6 @@ pub fn build_menu(items: &[(&str, Sel)], warning: Option<&str>) -> Id<AnyObject>
                 keyEquivalent: &*empty
             ];
             let _: () = msg_send![&*menu, addItem: &*item];
-        }
-        if let Some(warning) = warning {
-            let warn = NSString::from_str(warning);
-            let warn_item: Id<AnyObject> = msg_send_id![class!(NSMenuItem), new];
-            let _: () = msg_send![&*warn_item, setTitle: &*warn];
-            let _: () = msg_send![&*warn_item, setEnabled: Bool::NO];
-            let _: () = msg_send![&*menu, addItem: &*warn_item];
         }
         menu
     }
@@ -718,5 +702,182 @@ mod tests {
     fn key_up_is_not_converted() {
         let ev = synth_event(NS_EVENT_TYPE_KEY_UP, 0, "a", "a", 0);
         assert!(key_event(&ev).is_none());
+    }
+}
+
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos: u32, rel_prio: i32) -> i32;
+}
+
+/// QOS_CLASS_USER_INTERACTIVE
+const QOS_USER_INTERACTIVE: u32 = 0x21;
+
+/// 現スレッドを USER_INTERACTIVE にする (失敗は無視)。
+pub fn set_qos_user_interactive() {
+    // SAFETY: 現スレッドだけに作用し、ポインタは取らない。
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_USER_INTERACTIVE, 0);
+    }
+}
+
+/// 入力中だけ App Nap とタイマーの間引きを止める活動。`begin` / `end` は何度呼んでも 1 つしか持たない (冪等)。
+/// 落とす (Drop) と終わるので、コントローラごと解放されても漏れない。
+#[derive(Default)]
+pub struct Activity(std::cell::RefCell<Option<Id<AnyObject>>>);
+
+impl Activity {
+    pub fn begin(&self) {
+        let mut slot = self.0.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical (idle sleep は止めない)
+        const OPTIONS: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
+        // SAFETY: processInfo は NSProcessInfo のシングルトン。beginActivityWithOptions:reason: は NSUInteger と NSString を取り
+        // 保持された NSObject (活動のトークン) を返す。トークンは end で endActivity: に渡すまで保持する。
+        let token = unsafe {
+            let info: Id<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
+            let reason = NSString::from_str("input method composition");
+            let token: Id<AnyObject> = msg_send_id![&*info, beginActivityWithOptions: OPTIONS, reason: &*reason];
+            token
+        };
+        *slot = Some(token);
+    }
+
+    pub fn end(&self) {
+        let Some(token) = self.0.borrow_mut().take() else { return };
+        // SAFETY: token は beginActivityWithOptions:reason: が返したもの。endActivity: は 1 度だけ呼ぶ (take 済み)。
+        unsafe {
+            let info: Id<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
+            let _: () = msg_send![&*info, endActivity: &*token];
+        }
+    }
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32, trans_a: i32, trans_b: i32, m: i32, n: i32, k: i32, alpha: f32, a: *const f32, lda: i32,
+        b: *const f32, ldb: i32, beta: f32, c: *mut f32, ldc: i32,
+    );
+}
+
+/// `C[m, n] = A[m, k] * B[n, k]^T` (全て行優先、f32、Accelerate の sgemm)。`lda` / `ldb` / `ldc` は各行の幅。
+/// 範囲外を読み書きしないよう、スライスの長さを確かめてから呼ぶ。
+pub fn sgemm_abt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: usize, c: &mut [f32], ldc: usize) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(lda >= k && ldb >= k && ldc >= n, "sgemm: bad leading dimension");
+    let fits = |rows: usize, ld: usize, width: usize, len: usize| {
+        (rows - 1).checked_mul(ld).and_then(|v| v.checked_add(width)).is_some_and(|need| need <= len)
+    };
+    assert!(fits(m, lda, k, a.len()), "sgemm: A too short");
+    assert!(fits(n, ldb, k, b.len()), "sgemm: B too short");
+    assert!(fits(m, ldc, n, c.len()), "sgemm: C too short");
+    assert!([m, n, k, lda, ldb, ldc].iter().all(|&v| i32::try_from(v).is_ok()), "sgemm: dimension too large");
+    // SAFETY: 上の assert で A / B / C のどの要素も範囲内。C は &mut なので A / B と重ならない。
+    unsafe {
+        cblas_sgemm(
+            101, 111, 112, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), lda as i32, b.as_ptr(), ldb as i32, 0.0,
+            c.as_mut_ptr(), ldc as i32,
+        );
+    }
+}
+
+/// q8_0 の重み `nrows` 行 (1 行 `bpr` ブロック x 32 要素の i8 と、ブロックごとの尺度) と、
+/// q8_0 の入力 `m` 行との内積を `out[r * m + i]` に書く。NEON の sdot (dotprod) で i8 x i8 を 16 要素ずつ積む。
+/// `w` は i8 を u8 で持ったもの。長さが合わないときは呼べないよう assert する。
+pub fn q8_dot_rows(w: &[u8], wd: &[f32], x: &[i8], xd: &[f32], bpr: usize, m: usize, out: &mut [f32]) {
+    if bpr == 0 || m == 0 {
+        return;
+    }
+    let nrows = wd.len() / bpr;
+    let sizes = (|| {
+        let wb = nrows.checked_mul(bpr)?;
+        let xb = m.checked_mul(bpr)?;
+        Some((wb, wb.checked_mul(32)?, xb, xb.checked_mul(32)?, nrows.checked_mul(m)?))
+    })();
+    let Some((wblocks, wbytes, xblocks, xbytes, nout)) = sizes else { panic!("q8_dot_rows: size overflow") };
+    assert!(wd.len() == wblocks && w.len() == wbytes, "q8_dot_rows: bad weight size");
+    assert!(x.len() == xbytes && xd.len() == xblocks, "q8_dot_rows: bad input size");
+    assert!(out.len() == nout, "q8_dot_rows: bad output size");
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            // SAFETY: 上の assert で w / wd / x / xd / out のどの添字も範囲内。dotprod は実行時に確かめた。
+            unsafe { q8_dot_rows_neon(w, wd, x, xd, bpr, m, out) };
+            return;
+        }
+    }
+    for r in 0..nrows {
+        for i in 0..m {
+            let mut acc = 0f32;
+            for b in 0..bpr {
+                let wb = &w[(r * bpr + b) * 32..][..32];
+                let xb = &x[(i * bpr + b) * 32..][..32];
+                let s: i32 = wb.iter().zip(xb).map(|(&a, &c)| i32::from(a as i8) * i32::from(c)).sum();
+                acc += wd[r * bpr + b] * xd[i * bpr + b] * s as f32;
+            }
+            out[r * m + i] = acc;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_dot_rows_neon(w: &[u8], wd: &[f32], x: &[i8], xd: &[f32], bpr: usize, m: usize, out: &mut [f32]) {
+    for r in 0..wd.len() / bpr {
+        let mut i0 = 0;
+        while i0 < m {
+            // 重みの 1 行を読むあいだに入力を最大 4 行まとめて積む (重みのロードを使い回す)。
+            let g = match m - i0 {
+                1 => 1,
+                2 | 3 => 2,
+                _ => 4,
+            };
+            // SAFETY: 呼び出し元 (q8_dot_rows) が各スライスの長さを確かめている。
+            unsafe {
+                match g {
+                    1 => q8_dot_group::<1>(w, wd, x, xd, bpr, m, r, i0, out),
+                    2 => q8_dot_group::<2>(w, wd, x, xd, bpr, m, r, i0, out),
+                    _ => q8_dot_group::<4>(w, wd, x, xd, bpr, m, r, i0, out),
+                }
+            }
+            i0 += g;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn q8_dot_group<const G: usize>(
+    w: &[u8], wd: &[f32], x: &[i8], xd: &[f32], bpr: usize, m: usize, r: usize, i0: usize, out: &mut [f32],
+) {
+    use std::arch::aarch64::{vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vld1q_s8, vmlaq_n_f32};
+    // SAFETY: 添字は r < nrows, i0 + G <= m, b < bpr の範囲で、呼び出し元の assert した長さに収まる。
+    unsafe {
+        let wp = w.as_ptr().cast::<i8>().add(r * bpr * 32);
+        let mut acc = [vdupq_n_f32(0.0); G];
+        for b in 0..bpr {
+            let w0 = vld1q_s8(wp.add(b * 32));
+            let w1 = vld1q_s8(wp.add(b * 32 + 16));
+            let dw = *wd.as_ptr().add(r * bpr + b);
+            for (j, a) in acc.iter_mut().enumerate() {
+                let xp = x.as_ptr().add(((i0 + j) * bpr + b) * 32);
+                let s = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(xp)), w1, vld1q_s8(xp.add(16)));
+                *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), dw * *xd.as_ptr().add((i0 + j) * bpr + b));
+            }
+        }
+        for (j, a) in acc.iter().enumerate() {
+            out[r * m + i0 + j] = vaddvq_f32(*a);
+        }
     }
 }

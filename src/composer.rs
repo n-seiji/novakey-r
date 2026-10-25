@@ -6,7 +6,6 @@
 
 use crate::deps::Lexicon;
 use crate::english_split;
-use crate::rerank::Choice;
 use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::symbols;
 use crate::translit::{self, Form};
@@ -91,7 +90,7 @@ pub enum Phase {
 enum Typing {
     Empty,
     Kana,
-    /// 英語を打っていると判定した間。打鍵ごとに判定し直し、engine の変換と AI 並べ替えの要求は止める。
+    /// 英語を打っていると判定した間。打鍵ごとに判定し直し、engine の変換は止める。
     English,
     Literal,
     Mixed,
@@ -110,8 +109,6 @@ enum Settle {
 struct ReadingCands {
     generation: u64,
     list: Vec<Candidate>,
-    /// 非 live の入力中に届いた LLM の結果。最初の変換で反映する。
-    held_rerank: Option<usize>,
 }
 
 /// 候補を選んでいる間の状態。list は空でない。
@@ -200,17 +197,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             typing: Typing::Empty,
             english_shown: false,
             split_origin: None,
-            reading: ReadingCands { generation: 0, list: Vec::new(), held_rerank: None },
+            reading: ReadingCands { generation: 0, list: Vec::new() },
             stage: Stage::Editing,
             live: false,
             lexicon,
         }
-    }
-
-    /// 世代番号の開始値。
-    pub fn with_generation(mut self, generation: u64) -> Self {
-        self.reading.generation = generation;
-        self
     }
 
     pub fn set_live(&mut self, live: bool) {
@@ -240,10 +231,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.hiragana.is_empty()
     }
 
-    pub fn current_generation(&self) -> u64 {
-        self.reading.generation
-    }
-
     /// いま見えている候補列。選択中と、選択中だった列を持ち越している取り消し・字種変換の間は飾り付き。
     pub fn candidates(&self) -> &[Candidate] {
         match &self.stage {
@@ -251,10 +238,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Stage::Reverted { kept: Some(list) } | Stage::Transliterated { kept: Some(list), .. } => list,
             _ => &self.reading.list,
         }
-    }
-
-    pub fn display_hiragana(&self) -> &str {
-        &self.hiragana
     }
 
     /// 打鍵したままの ASCII 文字列(かなに変換済みの分と未変換の分)。
@@ -340,7 +323,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn reset_candidates(&mut self) {
         self.reading.generation += 1;
         self.reading.list.clear();
-        self.reading.held_rerank = None;
         if let Stage::Reverted { kept } | Stage::Transliterated { kept, .. } = &mut self.stage {
             *kept = None;
         }
@@ -391,20 +373,17 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
     }
 
-    /// 組成全体が記号 1 つだけか。LLM の並べ替えや学習の対象にしない。
+    /// 組成全体が記号 1 つだけか。学習の対象にしない。
     pub fn is_symbol(&self) -> bool {
         self.symbol_variants().is_some()
     }
 
     /// 未確定のローマ字を確定かなとして取り込む。Dangling なら局面を Dangling にする。
-    /// かなが増えたとき (Flush::Kana) だけ true。
-    pub fn flush_romaji(&mut self) -> bool {
+    pub fn flush_romaji(&mut self) {
         let english = self.is_typing_english();
         let keys = self.romaji.buffer().to_string();
         let flush = self.romaji.flush();
-        let ranks = matches!(flush, Flush::Kana(_));
         self.absorb_flush(english, keys, flush);
-        ranks
     }
 
     /// english は、未確定のローマ字を残した状態で英語と見なせていたか。
@@ -439,7 +418,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     }
 
     /// 打鍵のあと、英語を打っているかの判定を状態に反映する。
-    /// 英語になった時点で読みの候補は捨てる (世代が進むので、届く前の AI 並べ替えの結果も使われない)。
+    /// 英語になった時点で読みの候補は捨てる。
     fn track_english(&mut self) {
         if !self.is_kana_editing() {
             return;
@@ -529,8 +508,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         })
     }
 
-    /// 小文字 1 文字ぶんの打鍵をローマ字として受ける。かなが増えたら true。
-    pub fn type_romaji(&mut self, text: &str) -> bool {
+    /// 小文字 1 文字ぶんの打鍵をローマ字として受ける。
+    pub fn type_romaji(&mut self, text: &str) {
         self.split_origin = None;
         let mut pending = self.romaji.buffer().to_string();
         pending.push_str(text);
@@ -540,23 +519,21 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             .collect();
         if kana.is_empty() {
             self.track_english();
-            return false;
+            return;
         }
         // 確定した単位の打鍵は、ローマ字に残った未確定の打鍵 (`tt` の 2 つ目の t など) を除いたもの。
         let keys = pending.strip_suffix(self.romaji.buffer()).unwrap_or(&pending).to_string();
         self.push_kana(keys, &kana);
-        true
     }
 
     /// 数字・記号をそのままの打鍵として追加する (既定の和文表記があればそれをかなとして使う)。
-    pub fn type_text(&mut self, text: &str) -> bool {
+    pub fn type_text(&mut self, text: &str) {
         debug_assert!(self.romaji.buffer().is_empty(), "romaji is flushed before text keys");
         let kana = symbols::default_form(text).unwrap_or(text);
         if kana.is_empty() {
-            return false;
+            return;
         }
         self.push_kana(text.to_string(), kana);
-        true
     }
 
     fn push_kana(&mut self, keys: String, kana: &str) {
@@ -702,9 +679,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.reading.list = self.convert_reading();
         }
         let mut list = kept.unwrap_or_else(|| self.reading.list.clone());
-        if let Some(index) = self.reading.held_rerank.take() {
-            Self::promote(&mut list, index);
-        }
         if phase == Phase::Mixed && !list.iter().any(|c| c.text == self.hiragana) {
             // 表示中のかな混じりを第 1 候補にし、raw はその直後に並べる。
             list.push(Candidate {
@@ -831,70 +805,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 学習の実行 (engine.select / cancel) のために Session が使う。
     pub fn engine_mut(&mut self) -> &mut E {
         &mut self.engine
-    }
-
-    /// LLM が選んだ候補 `choice` を先頭へ昇格する。`choice.index` は要求時の候補列(raw なし)での位置で、
-    /// その位置の文字列が `choice.text` と違えば (同じ世代でも並びが変わっていれば) 反映しない。
-    /// live なら即反映して新しい表示を返す。非 live では保留し、最初の変換時に反映する。
-    /// 変換済みでも、まだ送りも選択もしていない(先頭選択でウィンドウなし)間は反映する。
-    pub fn apply_rerank(&mut self, generation: u64, choice: &Choice) -> Option<String> {
-        let display_index = choice.index;
-        if generation != self.reading.generation || display_index == 0 {
-            return None;
-        }
-        match &self.stage {
-            Stage::Editing
-                if self.typing == Typing::Kana
-                    && self.reading.list.get(display_index).is_some_and(|c| c.text == choice.text) =>
-            {
-                if self.live {
-                    Self::promote(&mut self.reading.list, display_index);
-                    Some(self.display().to_string())
-                } else {
-                    self.reading.held_rerank = Some(display_index);
-                    None
-                }
-            }
-            Stage::Selecting(Selection { cursor: 0, window: false, .. }) => {
-                self.promote_converting(display_index, &choice.text)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn has_pending_rerank(&self) -> bool {
-        self.reading.held_rerank.is_some()
-    }
-
-    /// 変換済み候補列から raw・英単語・絵文字(engine 以外)を一旦外して display_index 番目を先頭へ昇格し、
-    /// raw・英単語は第 1 候補の直後へ、絵文字は元の位置規則どおりに戻す。
-    fn promote_converting(&mut self, display_index: usize, text: &str) -> Option<String> {
-        let Stage::Selecting(selection) = &mut self.stage else {
-            return None;
-        };
-        let (mut list, extras): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut selection.list)
-            .into_iter()
-            .partition(|c| c.engine_rank().is_some());
-        let (emoji, extras): (Vec<Candidate>, Vec<Candidate>) = extras
-            .into_iter()
-            .partition(|c| c.source == Source::Emoji);
-        let promoted = list.get(display_index).is_some_and(|c| c.text == text);
-        if promoted {
-            Self::promote(&mut list, display_index);
-        }
-        // 外す前の並びは復元できないので、第 1 候補の直後へ戻す。
-        let position = list.len().min(1);
-        list.splice(position..position, extras);
-        Self::place_emoji(&mut list, emoji);
-        selection.list = list;
-        promoted.then(|| self.display().to_string())
-    }
-
-    fn promote(list: &mut Vec<Candidate>, display_index: usize) {
-        if display_index < list.len() {
-            let chosen = list.remove(display_index);
-            list.insert(0, chosen);
-        }
     }
 
     /// 組成全体がカタカナ語として引ける場合、英単語を第 1 候補の直後に入れる (raw はその後ろ)。
@@ -1053,11 +963,6 @@ mod tests {
         c.push_input("k", "", "");
         c.push_input("yo", "きょ", "");
         c.push_input("u", "う", "");
-    }
-
-    /// `type_kyou` で要求する候補列 (今日・京・教) の index 番目を選んだ結果。範囲外は text が空。
-    fn ch(index: usize) -> Choice {
-        Choice { index, text: ["今日", "京", "教"].get(index).copied().unwrap_or("").to_string() }
     }
 
     fn texts(c: &Composer<MockEngine, FakeLexicon>) -> Vec<&str> {
@@ -1343,7 +1248,7 @@ mod tests {
     fn 選択中の候補をcommitしその元indexで学習する() {
         let (mut c, log) = composer();
         type_kyou(&mut c);
-        let generation = c.current_generation();
+        let generation = c.reading.generation;
         c.begin_conversion();
         assert_eq!(commit_learning(&mut c), "今日");
         assert_eq!(*log.selects.borrow(), vec![(generation, 0)]);
@@ -1409,169 +1314,6 @@ mod tests {
         assert_eq!(c.raw(), "H");
         assert!(c.backspace());
         assert_eq!(c.phase(), Phase::Empty);
-    }
-
-    #[test]
-    fn 非liveのリランキングは保留され最初の変換で反映される() {
-        let (mut c, log) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
-        assert_eq!(c.display(), "きょう");
-        assert_eq!(texts(&c), vec!["今日", "京", "教"]);
-        c.begin_conversion();
-        assert_eq!(c.display(), "京");
-        assert_eq!(texts(&c), vec!["京", "kyou", "今日", "教"]);
-        assert_eq!(commit_learning(&mut c), "京");
-        assert_eq!(log.selects.borrow().last().unwrap().1, 1);
-    }
-
-    #[test]
-    fn 保留中のリランキングは後の結果で上書きされる() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.apply_rerank(generation, &ch(1));
-        c.apply_rerank(generation, &ch(2));
-        c.begin_conversion();
-        assert_eq!(c.display(), "教");
-    }
-
-    #[test]
-    fn 保留中のリランキングは入力が進むと破棄される() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.apply_rerank(generation, &ch(1));
-        c.push_input("ha", "は", "");
-        c.begin_conversion();
-        assert_eq!(c.display(), "きょうはK1");
-    }
-
-    #[test]
-    fn 変換直後で未操作ならリランキング結果を先頭へ反映しrawは直後に残す() {
-        let (mut c, log) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.begin_conversion();
-        assert_eq!(c.apply_rerank(generation, &ch(2)), Some("教".to_string()));
-        assert_eq!(texts(&c), vec!["教", "kyou", "今日", "京"]);
-        assert_eq!(
-            c.phase(),
-            Phase::Converting {
-                selected: 0,
-                window: false
-            }
-        );
-        assert_eq!(commit_learning(&mut c), "教");
-        assert_eq!(log.selects.borrow().last().unwrap().1, 2);
-    }
-
-    #[test]
-    fn 送りの後はリランキングで並べ替えない() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.begin_conversion();
-        c.advance();
-        assert_eq!(c.apply_rerank(generation, &ch(2)), None);
-        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
-    }
-
-    #[test]
-    fn 候補ウィンドウ表示中や候補選択後はリランキングで並べ替えない() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.begin_conversion();
-        assert!(c.select_candidate(2));
-        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
-        assert_eq!(texts(&c), vec!["今日", "kyou", "京", "教"]);
-        assert_eq!(c.display(), "京");
-    }
-
-    #[test]
-    fn 変換直後でも旧世代や範囲外のリランキングは無効() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let old = c.current_generation();
-        c.push_input("ha", "は", "");
-        c.begin_conversion();
-        assert_eq!(c.apply_rerank(old, &ch(1)), None);
-
-        let (mut c2, _) = composer();
-        type_kyou(&mut c2);
-        let gen2 = c2.current_generation();
-        c2.begin_conversion();
-        assert_eq!(c2.apply_rerank(gen2, &ch(99)), None);
-        assert_eq!(c2.apply_rerank(gen2, &ch(0)), None);
-        assert_eq!(texts(&c2), vec!["今日", "kyou", "京", "教"]);
-    }
-
-    #[test]
-    fn liveのリランキングは即座に表示順を変えengine順位で学習する() {
-        let (mut c, log) = composer();
-        c.set_live(true);
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        assert_eq!(c.apply_rerank(generation, &ch(1)), Some("京".to_string()));
-        assert_eq!(c.display(), "京");
-        assert_eq!(c.candidates()[0].engine_rank(), Some(EngineRank(1)));
-        assert_eq!(c.candidates()[1].text, "今日");
-        assert_eq!(commit_learning(&mut c), "京");
-        assert_eq!(log.selects.borrow().last().unwrap().1, 1);
-    }
-
-    #[test]
-    fn 同じ世代でも候補の文字列が違えばリランキングは適用しない() {
-        let wrong = Choice { index: 1, text: "教".into() };
-
-        let (mut live, _) = composer();
-        live.set_live(true);
-        type_kyou(&mut live);
-        let generation = live.current_generation();
-        assert_eq!(live.apply_rerank(generation, &wrong), None);
-        assert_eq!(texts(&live), vec!["今日", "京", "教"]);
-
-        let (mut held, _) = composer();
-        type_kyou(&mut held);
-        let generation = held.current_generation();
-        assert_eq!(held.apply_rerank(generation, &wrong), None);
-        assert!(!held.has_pending_rerank());
-
-        let (mut converted, _) = composer();
-        type_kyou(&mut converted);
-        let generation = converted.current_generation();
-        converted.begin_conversion();
-        assert_eq!(converted.apply_rerank(generation, &wrong), None);
-        assert_eq!(texts(&converted), vec!["今日", "kyou", "京", "教"]);
-    }
-
-    #[test]
-    fn リランキングは旧世代_範囲外_先頭指定で無効() {
-        let (mut c, _) = composer();
-        type_kyou(&mut c);
-        let old = c.current_generation();
-        c.push_input("ha", "は", "");
-        assert_eq!(c.apply_rerank(old, &ch(1)), None);
-
-        let (mut c2, _) = composer();
-        type_kyou(&mut c2);
-        let gen2 = c2.current_generation();
-        assert_eq!(c2.apply_rerank(gen2, &ch(99)), None);
-        assert_eq!(c2.apply_rerank(gen2, &ch(0)), None);
-        c2.begin_conversion();
-        assert_eq!(c2.display(), "今日");
-    }
-
-    #[test]
-    fn revert後のリランキングは無効() {
-        let (mut c, _) = composer();
-        c.set_live(true);
-        type_kyou(&mut c);
-        let generation = c.current_generation();
-        c.revert();
-        assert_eq!(c.apply_rerank(generation, &ch(1)), None);
     }
 
     use crate::keymap::{action_for, Action, Key};
@@ -1708,7 +1450,7 @@ mod tests {
         type_symbol(&mut c, "[");
         type_word(&mut c, &mut conv, "kagi");
         type_symbol(&mut c, "]");
-        assert_eq!(c.display_hiragana(), "「かぎ」");
+        assert_eq!(c.hiragana, "「かぎ」");
         assert!(!c.is_symbol());
         assert_eq!(c.raw(), "[kagi]");
         assert_eq!(log.converts.borrow().last().map(|(_, h)| h.as_str()), Some("「かぎ」"));
@@ -1724,7 +1466,7 @@ mod tests {
         type_symbol(&mut c, "(");
         type_word(&mut c, &mut conv, "a");
         c.push_flush(conv.flush());
-        assert_eq!(c.display_hiragana(), "（あ");
+        assert_eq!(c.hiragana, "（あ");
         assert_eq!(commit_learning(&mut c), "（あ");
     }
 
@@ -1734,7 +1476,7 @@ mod tests {
         type_symbol(&mut c, "[");
         type_symbol(&mut c, "]");
         assert!(!c.is_symbol());
-        assert_eq!(c.display_hiragana(), "「」");
+        assert_eq!(c.hiragana, "「」");
         assert!(c.begin_conversion());
         assert_eq!(texts(&c)[0], "「」K1");
     }
@@ -2052,18 +1794,6 @@ mod tests {
         assert_eq!(texts(&c), vec!["エンター", "enter"]);
     }
 
-    #[test]
-    fn リランキング後も英単語とrawは第1候補の直後に並ぶ() {
-        let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ"]);
-        c.push_input("desukutoppu", "ですくとっぷ", "");
-        c.begin_conversion();
-        assert_eq!(c.apply_rerank(c.current_generation(), &Choice { index: 1, text: "デス区トップ".into() }).as_deref(), Some("デス区トップ"));
-        assert_eq!(
-            texts(&c),
-            vec!["デス区トップ", "desktop", "desukutoppu", "デスクトップ"]
-        );
-    }
-
     fn emojis(reading: &str) -> Vec<String> {
         match reading {
             "ねこ" => ["😺", "😸", "😹", "😻", "😼", "🐱", "🐈"].map(String::from).to_vec(),
@@ -2161,16 +1891,6 @@ mod tests {
         c.begin_conversion();
         assert_eq!(texts(&c).iter().filter(|t| **t == "🍻").count(), 1);
         assert!(texts(&c).contains(&"X1"));
-    }
-
-    #[test]
-    fn リランキング後も絵文字はエンジン候補の後ろに並ぶ() {
-        let mut c = emoji_composer("いぬ", &["犬", "戌", "乾", "伊奴"]);
-        c.push_input("inu", "いぬ", "");
-        c.begin_conversion();
-        assert_eq!(texts(&c), vec!["犬", "inu", "戌", "乾", "🐶", "伊奴"]);
-        assert_eq!(c.apply_rerank(c.current_generation(), &Choice { index: 1, text: "戌".into() }).as_deref(), Some("戌"));
-        assert_eq!(texts(&c), vec!["戌", "inu", "犬", "乾", "🐶", "伊奴"]);
     }
 
     fn typed_romaji(keys: &str) -> Composer<MockEngine, FakeLexicon> {

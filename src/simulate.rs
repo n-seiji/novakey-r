@@ -1,17 +1,14 @@
 #![forbid(unsafe_code)]
 
 // simulate.rs - `--simulate '<keys>'`: 実際の打鍵経路 (input::route → Controller) を headless で動かす。
-// 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れず、AI リランキングも使わない。
+// 変換は本物の azooKey、英単語は本物の loanwords.tsv と emoji.tsv。Cocoa には触れない。
 //
 // キー表記: 通常の文字はそのまま。<space> <S-space> <enter> <esc> <bs> <tab> <up> <down> <left> <right>
 // <C-k> (Ctrl+文字) <F6>..<F10> <lt> (`<`) <gt> (`>`)。
 //
 // IMK 側のイベント (番号は candidates 表示と同じ 1 起点):
 // <pick:N> 候補パネルで N 番目をクリック / <highlight:N> パネルのハイライトを N 番目へ /
-// <live> <space-mode> 変換モードをライブ変換 / スペース変換へ / <commit-all> 入力ソース切替などで組成を確定 /
-// <ai-on> AI 並べ替えを有効にした体にする (最初に置く。送信は記録するだけでネットワークは呼ばない) /
-// <rerank:N> 直近の AI 要求に「候補 N を選んだ」結果が届く (1 は先頭なので何も起きない) / <rerank-old:N> 最初の AI 要求に対して同じことをする
-// (要求が無ければ何もしない。世代が古ければ composer が捨てる)。
+// <live> <space-mode> 変換モードをライブ変換 / スペース変換へ / <commit-all> 入力ソース切替などで組成を確定。
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -20,8 +17,6 @@ use std::rc::Rc;
 use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
-use crate::outbound::Screened;
-use crate::rerank::Choice;
 use crate::session::ConversionMode;
 use crate::translit::Form;
 
@@ -89,8 +84,6 @@ enum Step {
     Live,
     SpaceMode,
     CommitAll,
-    AiOn,
-    Rerank { n: usize, oldest: bool },
 }
 
 fn token_step(name: &str) -> Result<Step, String> {
@@ -100,13 +93,10 @@ fn token_step(name: &str) -> Result<Step, String> {
     let step = match name.split_once(':') {
         Some(("pick", arg)) => Step::Pick(number(arg)?),
         Some(("highlight", arg)) => Step::Highlight(number(arg)?),
-        Some(("rerank", arg)) => Step::Rerank { n: number(arg)?, oldest: false },
-        Some(("rerank-old", arg)) => Step::Rerank { n: number(arg)?, oldest: true },
         _ => match name {
             "live" => Step::Live,
             "space-mode" => Step::SpaceMode,
             "commit-all" => Step::CommitAll,
-            "ai-on" => Step::AiOn,
             _ => Step::Key(token_event(name)?),
         },
     };
@@ -153,10 +143,6 @@ impl TextClient for FakeClient {
 
     fn set_marked(&self, text: &str) {
         self.0.borrow_mut().marked = text.to_string();
-    }
-
-    fn preceding_text(&self, _max_utf16: usize) -> String {
-        String::new()
     }
 
     fn bundle_id(&self) -> Option<String> {
@@ -233,22 +219,23 @@ impl FakePanel {
     }
 }
 
-/// 環境の代わり。セキュア入力はなく、ログ・トレースは捨てる。AI は `<ai-on>` まで無効で、
-/// 有効でも送信は世代番号を記録するだけ (ネットワークは呼ばない)。
+/// 環境の代わり。セキュア入力はなく、ログ・トレースは捨てる。
 #[derive(Clone, Default)]
 pub(crate) struct FakeEnv(Rc<RefCell<EnvState>>);
 
 #[derive(Default)]
 pub(crate) struct EnvState {
-    pub rerank: bool,
     /// ライブ変換の全体設定。ユーザー defaults の代わり (既定は Space = false)。
     pub live: bool,
-    /// 送られて、まだ取り消されていない AI 要求の世代 (古い順)。
-    pub sent: Vec<u64>,
-    /// `sent` と同じ順の、送られた候補列。
-    pub sent_candidates: Vec<Vec<String>>,
-    /// `sent` と同じ順の、送られた payload の (文脈, 文脈を空にした理由の名前)。取り消しでは消さない。
-    pub payloads: Vec<(String, Option<&'static str>)>,
+    /// `set_composing` に渡された値の履歴。
+    pub composing: Vec<bool>,
+}
+
+impl FakeEnv {
+    #[cfg(test)]
+    pub(crate) fn last_composing(&self) -> Option<bool> {
+        self.0.borrow().composing.last().copied()
+    }
 }
 
 impl Environment for FakeEnv {
@@ -264,26 +251,13 @@ impl Environment for FakeEnv {
         self.0.borrow_mut().live = enabled;
     }
 
-    fn rerank_allowed(&self) -> bool {
-        self.0.borrow().rerank
+    fn set_composing(&self, composing: bool) {
+        self.0.borrow_mut().composing.push(composing);
     }
 
     fn log(&self, _line: &str) {}
 
     fn trace(&self, _entry: &str, _fields: &str) {}
-
-    fn send_rerank(&self, _controller_id: u64, generation: u64, payload: &Screened, _urgent: bool) {
-        let mut state = self.0.borrow_mut();
-        state.sent.push(generation);
-        state.sent_candidates.push(payload.candidates().to_vec());
-        state.payloads.push((payload.context().to_string(), payload.context_dropped().map(|r| r.name())));
-    }
-
-    fn cancel_rerank(&self, _controller_id: u64) {
-        let mut state = self.0.borrow_mut();
-        state.sent.clear();
-        state.sent_candidates.clear();
-    }
 }
 
 pub(crate) type SimController = Controller<FakeClient, FakePanel, FakeEnv>;
@@ -293,7 +267,6 @@ struct Sim {
     controller: SimController,
     client: FakeClient,
     panel: FakePanel,
-    env: FakeEnv,
     /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
     stale: Vec<String>,
     /// 表示 (preedit) と、Enter で確定される文字列 (commit_preview) が食い違った打鍵 (ラベル)。
@@ -303,16 +276,14 @@ struct Sim {
 
 impl Sim {
     fn new() -> Self {
-        let mut session = new_session(ConversionMode::Space, 0);
+        let mut session = new_session(ConversionMode::Space);
         // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
         session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
         let panel = FakePanel::default();
-        let env = FakeEnv::default();
         Self {
-            controller: Controller::new(0, session, panel.clone(), env.clone()),
+            controller: Controller::new(0, session, panel.clone(), FakeEnv::default()),
             client: FakeClient::default(),
             panel,
-            env,
             stale: Vec::new(),
             wysiwyg_broken: Vec::new(),
         }
@@ -340,7 +311,7 @@ impl Sim {
         }
     }
 
-    /// 1 起点の番号 n の候補の文字列。無ければエラー (rerank も同じ 1 起点)。
+    /// 1 起点の番号 n の候補の文字列。無ければエラー。
     fn candidate_at(&self, label: &str, n: usize) -> Result<String, String> {
         self.controller.candidate_texts().get(n - 1).cloned().ok_or_else(|| format!("{label}: no candidate {n}"))
     }
@@ -367,24 +338,6 @@ impl Sim {
                 }
             }
             Step::CommitAll => self.controller.on_commit_composition(Some(self.client.clone())),
-            Step::AiOn => {
-                self.env.0.borrow_mut().rerank = true;
-                // 送信元アプリが分からないと outbound が送らないので、許可される側のアプリに見せる。
-                self.client.0.borrow_mut().bundle = Some("com.apple.TextEdit".to_string());
-            }
-            Step::Rerank { n, oldest } => {
-                let (generation, candidates) = {
-                    let state = self.env.0.borrow();
-                    let at = if *oldest { 0 } else { state.sent.len().wrapping_sub(1) };
-                    (state.sent.get(at).copied(), state.sent_candidates.get(at).cloned().unwrap_or_default())
-                };
-                if let Some(generation) = generation {
-                    let index = *n - 1;
-                    // 範囲外の番号は、本物の経路では届かないが、適用されないことを確かめるために通す。
-                    let text = candidates.get(index).cloned().unwrap_or_default();
-                    self.controller.on_rerank_result(generation, &Choice { index, text });
-                }
-            }
         }
         Ok(())
     }
@@ -417,7 +370,7 @@ impl Sim {
     }
 }
 
-fn setup_env() {
+pub(crate) fn setup_env() {
     // 既定は学習 off。`NOVAKEY_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。NOVAKEY_MEMORY_DIR で変えられる)。
     // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
     let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
@@ -438,7 +391,60 @@ fn setup_env() {
         loanwords_path: Some(repo_table("NOVAKEY_LOANWORDS", "loanwords.tsv")),
         dev_words_path: Some(repo_table("NOVAKEY_DEV_WORDS", "dev_words.txt")),
         emoji_path: Some(repo_table("NOVAKEY_EMOJI", "emoji.tsv")),
+        // シミュレータは NOVAKEY_JUDGE_DIR を指定したときだけ審判を読む。
+        judge_dir: std::env::var_os("NOVAKEY_JUDGE_DIR").map(PathBuf::from),
     });
+}
+
+thread_local! {
+    /// 打鍵ごとの処理時間 (ms) と、審判が走ったか。`NOVAKEY_SIM_TIMING=1` の要約用。
+    static TIMINGS: std::cell::RefCell<Vec<(f64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 審判だけの時間 (ms)。
+    static JUDGE_MS: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn print_timing_summary() {
+    let mut all: Vec<f64> = Vec::new();
+    let mut judged: Vec<f64> = Vec::new();
+    TIMINGS.with(|t| {
+        for &(ms, j) in t.borrow().iter() {
+            all.push(ms);
+            if j {
+                judged.push(ms);
+            }
+        }
+    });
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0)
+    };
+    let rss = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+        / 1024.0;
+    let mut jm = JUDGE_MS.with(|j| j.borrow().clone());
+    println!(
+        "judge: n={} median {:.1} ms p90 {:.1} ms max {:.1} ms",
+        jm.len(),
+        pct(&mut jm, 0.5),
+        pct(&mut jm, 0.9),
+        pct(&mut jm, 1.0)
+    );
+    println!(
+        "timing: keys={} median {:.1} ms p95 {:.1} ms max {:.1} ms | keys with judge={} median {:.1} ms p95 {:.1} ms max {:.1} ms | rss {:.0} MB",
+        all.len(),
+        pct(&mut all, 0.5),
+        pct(&mut all, 0.95),
+        pct(&mut all, 1.0),
+        judged.len(),
+        pct(&mut judged, 0.5),
+        pct(&mut judged, 0.95),
+        pct(&mut judged, 1.0),
+        rss
+    );
 }
 
 /// 1 シナリオを最後まで流す。最後に確定した文字列と、未確定のまま残った文字列を返す。
@@ -454,7 +460,15 @@ struct Run {
 fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
     let mut sim = Sim::new();
     for (label, step) in parse_keys(keys)? {
+        let started = std::time::Instant::now();
         sim.apply(&label, &step)?;
+        let judge_ms = crate::judge::take_last_ms();
+        if let Some(ms) = judge_ms {
+            JUDGE_MS.with(|j| j.borrow_mut().push(ms));
+        }
+        if matches!(step, Step::Key(_)) {
+            TIMINGS.with(|t| t.borrow_mut().push((started.elapsed().as_secs_f64() * 1e3, judge_ms.is_some())));
+        }
         if sim.client.marked() != sim.controller.marked_text() {
             sim.stale.push(label.clone());
         }
@@ -469,6 +483,9 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
                 sim.client.marked(),
                 sim.client.committed()
             );
+            if let Some(ms) = judge_ms {
+                println!("{:>9}  judge {ms:.1} ms", "");
+            }
             let cands = sim.candidates_line();
             if !cands.is_empty() {
                 println!("{:>9}  {cands}", "");
@@ -562,6 +579,9 @@ pub fn simulate_file(path: &str, check_preedit: bool) {
         let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
         println!("{verdict} {keys}  =>  {shown}{want}");
     }
+    if std::env::var_os("NOVAKEY_SIM_TIMING").is_some() {
+        print_timing_summary();
+    }
     if failures > 0 {
         eprintln!("{failures} scenario(s) failed");
         std::process::exit(1);
@@ -583,7 +603,7 @@ mod tests {
 
     #[test]
     fn imk_イベントのトークンを解釈する() {
-        let steps: Vec<_> = parse_keys("<pick:2><highlight:3><live><space-mode><commit-all><ai-on><rerank:1><rerank-old:2>")
+        let steps: Vec<_> = parse_keys("<pick:2><highlight:3><live><space-mode><commit-all>")
             .unwrap()
             .into_iter()
             .map(|(_, s)| s)
@@ -596,9 +616,6 @@ mod tests {
                 Step::Live,
                 Step::SpaceMode,
                 Step::CommitAll,
-                Step::AiOn,
-                Step::Rerank { n: 1, oldest: false },
-                Step::Rerank { n: 2, oldest: true },
             ]
         );
     }

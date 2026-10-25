@@ -33,14 +33,17 @@
 - **英語。** かなにならない英単語は英字のまま表示します (enter, merge)。英語の途中の Space は空白として入ります。一度英語で確定した語は、次から打った時点で英字になります (git)。
 - **候補。** カタカナ語の英単語 (デスクトップ → desktop) と絵文字 (ねこ → 🐈) も候補に出ます。
 - **学習。** 選んだ候補を覚えて、次から先に出します。パスワード欄とパスワード管理アプリでは覚えません。
+- **並べ替え。** 小さな日本語言語モデル (rinna japanese-gpt2-xsmall) を Mac の中で動かし、文全体の候補を自然な順に並べ替えます。通信はしません。メモリは約 140 MB 増え (長い入力を headless で流し `/usr/bin/time -l` で測った最大値が 41 MB から約 181 MB)、1 回の判定は中央値で約 8 ms です。モデルファイルが必要です (下記)。無いときは変換エンジン本来の順のままです。
 - **ライブ変換 (任意)。** 打ちながら変換結果を表示します。入力メニューから切り替えます。
-- **AI 並べ替え (任意)。** Cloudflare Workers AI で候補を並べ替えられます。既定はオフです。
 
 ## インストール
 
 macOS 26 以降、[mise](https://mise.jdx.dev/) と Rust が必要です。
 
+並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
+
 ```sh
+mise run judge-model
 mise run install
 ```
 
@@ -59,21 +62,6 @@ mise run install
 | Ctrl+J / K / L / ; / : | ひらがな / カタカナ / 全角英数 / 半角カナ / 半角英数 |
 | F6〜F10 | 同上 |
 
-## AI 並べ替え (任意)
-
-候補の並べ替えに Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) を使えます。入力メニューの「AI並べ替え」で有効にし、API トークンとアカウント ID を Keychain に登録してください。
-
-```sh
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
-```
-
-有効にすると、候補・読み・直前の文 (最大 100 文字) を送ります。次の場合は送りません (`src/outbound.rs`)。
-
-- パスワード欄などのセキュア入力中。
-- パスワード管理アプリとターミナル (1Password, Bitwarden, キーチェーンアクセス, Terminal, iTerm2, Ghostty など)。
-- 直前の文に API キー、秘密鍵、メールアドレス、長い数字列などが含まれるときは、直前の文だけ送りません。
-
 ## データの置き場所
 
 学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。
@@ -85,6 +73,7 @@ security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a 
 - ローマ字の表 (`src/romaji_table.tsv`) は [Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.) です。
 - カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
 - 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
+- 並べ替えは [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.) を使います。`tools/gen_judge_model.py` で変換して使い、このリポジトリには含みません。
 - ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。

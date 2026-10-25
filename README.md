@@ -33,14 +33,17 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 - **English.** English words that cannot become kana stay in English letters (enter, merge). Space in the middle of English inserts a space. A word you have committed as English shows up in English from then on (git).
 - **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
 - **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
+- **Re-ranking.** A small Japanese language model (rinna japanese-gpt2-xsmall) runs on your Mac and re-orders the full-sentence candidates so the natural one comes first. There is no network access. It adds about 140 MB of memory (peak about 181 MB instead of 41 MB, measured with `/usr/bin/time -l` on a long headless input), takes about 8 ms per decision at the median, and needs the model files (see below); without them the engine's own order is used.
 - **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
-- **AI reranking (optional).** Cloudflare Workers AI can reorder candidates. Off by default.
 
 ## Install
 
 Requires macOS 26 or later, [mise](https://mise.jdx.dev/), and Rust.
 
+Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
+
 ```sh
+mise run judge-model
 mise run install
 ```
 
@@ -59,21 +62,6 @@ This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then 
 | Ctrl+J / K / L / ; / : | Hiragana / katakana / full-width alphanumeric / half-width katakana / half-width alphanumeric |
 | F6–F10 | Same as above |
 
-## AI reranking (optional)
-
-NovakeyR can use Cloudflare Workers AI (`@cf/cloudflare/clef-flash`) to reorder candidates. Turn on "AI並べ替え" in the input menu, then store your API token and account ID in the Keychain.
-
-```sh
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a api-token -w
-security add-generic-password -U -s me.sijis.inputmethod.NovakeyR.cloudflare -a account-id -w
-```
-
-When it is on, NovakeyR sends the candidates, the reading, and up to 100 characters of preceding text. It sends nothing in these cases (`src/outbound.rs`):
-
-- Secure input, such as password fields.
-- Password managers and terminals (1Password, Bitwarden, Keychain Access, Terminal, iTerm2, Ghostty, and others).
-- When the preceding text contains an API key, a private key, an email address, a long number, and the like, the preceding text is left out.
-
 ## Where data lives
 
 Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it.
@@ -85,6 +73,7 @@ Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`
 - The romaji table (`src/romaji_table.tsv`) is [Mozc](https://github.com/google/mozc)'s `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.).
 - English words for loanwords (`resources/loanwords.tsv`) are built from [EDRDG](https://www.edrdg.org/)'s JMdict (CC BY-SA 4.0).
 - Emoji (`resources/emoji.tsv`) are built from Unicode emoji data and CLDR Japanese annotations (Unicode License v3) via [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage).
+- Re-ranking uses [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.), converted by `tools/gen_judge_model.py` and not included in this repository.
 - The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
 
 Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).

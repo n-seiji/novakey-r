@@ -13,17 +13,13 @@ use crate::deps::{EnglishMemory, Lexicon, ProdLexicon, ProdMemory};
 use crate::input::Route;
 use crate::keymap::Key;
 use crate::kkc::RustEngine;
-use crate::outbound::{self, Screened};
-use crate::rerank::Choice;
-use crate::rerank_gate::{GateOutcome, RerankGate};
-use crate::session::{ConversionMode, Effect, Gates, Outcome, RerankJob, Session};
+use crate::outbound;
+use crate::session::{ConversionMode, Effect, Gates, Outcome, Session};
 
 /// ホストアプリのテキスト入力。
 pub trait TextClient {
     fn insert(&self, text: &str);
     fn set_marked(&self, text: &str);
-    /// マーク範囲 (なければ選択範囲) の直前のテキスト。取れなければ空。
-    fn preceding_text(&self, max_utf16: usize) -> String;
     fn bundle_id(&self) -> Option<String>;
 }
 
@@ -41,22 +37,16 @@ pub trait Environment {
     /// ライブ変換が有効か。アプリ全体で 1 つの設定 (全コントローラが共有し、再起動後も残る)。
     fn live_conversion(&self) -> bool;
     fn set_live_conversion(&self, enabled: bool);
-    /// AI 並べ替えが有効で、認証情報も揃っているか。
-    fn rerank_allowed(&self) -> bool;
+    /// 入力中 (Phase が Empty 以外) かどうか。変わりうる操作のあとに、現在の値で呼ぶ (何度呼んでもよい)。
+    /// 本番は App Nap を止める活動の開始 / 終了に使う。
+    fn set_composing(&self, _composing: bool) {}
     fn log(&self, line: &str);
     /// 名前と数値だけを渡すこと。
     fn trace(&self, entry: &str, fields: &str);
-    fn send_rerank(&self, controller_id: u64, generation: u64, payload: &Screened, urgent: bool);
-    fn cancel_rerank(&self, controller_id: u64);
 }
 
-/// `generation` は AI 結果の世代番号の開始値。作り直した session が、古い結果と同じ番号を再利用しないように渡す。
-pub fn new_session(mode: ConversionMode, generation: u64) -> Session<RustEngine, ProdLexicon, ProdMemory> {
-    Session::new(
-        Composer::new(RustEngine::new(), ProdLexicon).with_generation(generation),
-        ProdMemory,
-        mode,
-    )
+pub fn new_session(mode: ConversionMode) -> Session<RustEngine, ProdLexicon, ProdMemory> {
+    Session::new(Composer::new(RustEngine::new(), ProdLexicon), ProdMemory, mode)
 }
 
 /// 生きている間 `flag` を true にし、panic で巻き戻っても false に戻す。
@@ -77,6 +67,7 @@ impl Drop for FlagGuard<'_> {
 
 /// L / M の既定は本番の語彙と記憶。テストだけが fake に差し替える。
 pub struct Controller<C, P, E, L: Lexicon = ProdLexicon, M: EnglishMemory = ProdMemory> {
+    /// トレース用の通し番号 (コントローラの見分け)。
     id: u64,
     session: RefCell<Session<RustEngine, L, M>>,
     panel: P,
@@ -89,7 +80,6 @@ pub struct Controller<C, P, E, L: Lexicon = ProdLexicon, M: EnglishMemory = Prod
     /// クライアントの bundle id。コントローラは 1 つのクライアントに付くので、最初に取れたものを使い回す。
     /// 取れなかったときは入れず、次の機会に取り直す。
     bundle_id: OnceCell<String>,
-    gate: RerankGate,
 }
 
 impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: EnglishMemory> Controller<C, P, E, L, M> {
@@ -103,7 +93,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             syncing: Cell::new(false),
             panel_line: Cell::new(0),
             bundle_id: OnceCell::new(),
-            gate: RerankGate::default(),
         }
     }
 
@@ -140,6 +129,20 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
 
     /// キー 1 打。処理したら true (false ならホストアプリへ素通しする)。
     pub fn on_key(&self, route: Route, client: C) -> bool {
+        let handled = self.on_key_inner(route, client);
+        self.sync_activity();
+        handled
+    }
+
+    /// 入力中かどうかを環境へ伝える (Empty に戻ったら終わらせる)。
+    fn sync_activity(&self) {
+        // panic の後始末 (reset_after_panic) からも呼ぶので、借用中なら (状態が分からないので) 触らない。
+        if let Ok(session) = self.session.try_borrow() {
+            self.env.set_composing(session.phase() != Phase::Empty);
+        }
+    }
+
+    fn on_key_inner(&self, route: Route, client: C) -> bool {
         if route != Route::PassThrough {
             *self.last_client.borrow_mut() = Some(client.clone());
             self.sync_conversion_mode();
@@ -173,22 +176,24 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             self.panel_line.set(selected);
         }
         self.run(effects, Some(&client));
+        self.sync_activity();
     }
 
     /// パネルで候補が選ばれた。
     pub fn on_candidate_selected(&self, text: &str) {
         let Some(client) = self.client() else { return };
         self.env.trace("candidateSelected", &format!("phase={:?}", self.phase()));
-        // 確定だけで再変換は起きないので、AI 送信の可否 (Keychain を見る) は問い合わせない。
-        let gates = self.gates(Some(&client), false);
+        let gates = self.gates(Some(&client));
         let effects = self.session.borrow_mut().commit_selected(&gates, text);
         self.run(effects, Some(&client));
+        self.sync_activity();
     }
 
     pub fn on_commit_composition(&self, client: Option<C>) {
-        let gates = self.gates(client.as_ref(), true);
+        let gates = self.gates(client.as_ref());
         let effects = self.session.borrow_mut().commit_composition(&gates);
         self.run(effects, client.as_ref());
+        self.sync_activity();
     }
 
     /// 全体の設定を反転して保存し、このコントローラにも反映する。ほかのコントローラは次のキーかメニューで追従する。
@@ -208,32 +213,16 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         if let Some(client) = self.client() {
             self.run(effects, Some(&client));
         }
-    }
-
-    /// AI 並べ替えの結果 (選ばれた候補)。
-    pub fn on_rerank_result(&self, generation: u64, choice: &Choice) {
-        let Some(client) = self.client() else { return };
-        let effects = {
-            // 変換処理の途中に run loop が再入した場合は、結果を捨てる (借用の二重取得で落とさない)。
-            let Ok(mut session) = self.session.try_borrow_mut() else {
-                return;
-            };
-            session.apply_rerank(generation, choice)
-        };
-        self.run(effects, Some(&client));
+        self.sync_activity();
     }
 
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
-    /// `rerank` が false のときは AI 送信の可否 (Keychain を見る) を問い合わせず、不許可にする。
-    fn gates(&self, client: Option<&C>, rerank: bool) -> Gates {
+    fn gates(&self, client: Option<&C>) -> Gates {
         let bundle_id = self.bundle_id(client);
-        Gates {
-            learning: outbound::learning_allowed(self.env.secure_input(), bundle_id),
-            rerank: rerank && self.env.rerank_allowed(),
-        }
+        Gates { learning: outbound::learning_allowed(self.env.secure_input(), bundle_id) }
     }
 
-    /// クライアントの bundle id (学習判定と AI 送信判定で共通)。最初に取れたものを使い回す。
+    /// クライアントの bundle id (学習判定に使う)。最初に取れたものを使い回す。
     fn bundle_id(&self, client: Option<&C>) -> Option<&str> {
         if self.bundle_id.get().is_none() {
             let fetched = match client {
@@ -249,7 +238,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
 
     /// session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
-        let gates = self.gates(Some(client), true);
+        let gates = self.gates(Some(client));
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
         let outcome = self.session.borrow_mut().handle(&gates, key, text);
         let Outcome { handled, action, phase, effects } = outcome;
@@ -289,8 +278,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                 }
                 Effect::ShowCandidates { selected } => self.show_candidates(selected),
                 Effect::HideCandidates => self.panel.hide(),
-                Effect::RequestRerank { urgent, job } => self.send_rerank(urgent, &job),
-                Effect::CancelRerank => self.env.cancel_rerank(self.id),
             }
         }
     }
@@ -310,16 +297,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.env.trace("select", &format!("line={selected} moved={delta}"));
     }
 
-    /// urgent は Space 押下時用。デバウンスを待たずに送る(送信済みなら重複しない)。
-    fn send_rerank(&self, urgent: bool, job: &RerankJob) {
-        let client = self.client();
-        let bundle_id = self.bundle_id(client.as_ref());
-        match self.gate.check(&self.env, bundle_id, client.as_ref(), &job.hiragana, &job.candidates) {
-            GateOutcome::Send(screened) => self.env.send_rerank(self.id, job.generation, &screened, urgent),
-            // デバウンス中の古い要求が、外へ出せない文脈のまま送られないようにする。
-            GateOutcome::Cancel => self.env.cancel_rerank(self.id),
-        }
-    }
 }
 
 // session の作り直しは本番の語彙と記憶に決まっている。
@@ -330,17 +307,17 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         match self.session.try_borrow_mut() {
             Ok(mut session) => {
                 // 作り直した session にも、メニューの表示と同じ現在のモードを引き継ぐ。
-                *session = new_session(session.mode(), session.generation());
+                *session = new_session(session.mode());
             }
             Err(_) => self.env.log("reset_after_panic: session is borrowed, not recreated"),
         }
-        self.env.cancel_rerank(self.id);
         self.panel.hide();
         self.syncing.set(false);
         self.panel_line.set(0);
         if let Some(client) = self.client() {
             client.set_marked("");
         }
+        self.sync_activity();
     }
 }
 
@@ -357,7 +334,7 @@ mod tests {
 
     fn fixture() -> Fixture {
         let panel = FakePanel::default();
-        let controller = Controller::new(1, new_session(ConversionMode::Space, 0), panel.clone(), FakeEnv::default());
+        let controller = Controller::new(1, new_session(ConversionMode::Space), panel.clone(), FakeEnv::default());
         (controller, FakeClient::default(), panel)
     }
 
@@ -377,6 +354,25 @@ mod tests {
         type_letters(&f, "a");
         assert_eq!(f.1.marked(), "あ");
         assert_eq!(f.1.committed(), "");
+    }
+
+    #[test]
+    fn 入力中だけ活動を持ち_確定でもキャンセルでも空に戻ったら手放す() {
+        let f = fixture();
+        let last = |f: &Fixture| f.0.env.last_composing();
+        assert_eq!(last(&f), None);
+        type_letters(&f, "a");
+        assert_eq!(last(&f), Some(true));
+        assert!(press(&f, Key::Enter, "\r"));
+        assert_eq!(last(&f), Some(false), "確定");
+        type_letters(&f, "a");
+        assert_eq!(last(&f), Some(true));
+        f.0.on_commit_composition(Some(f.1.clone()));
+        assert_eq!(last(&f), Some(false), "commitComposition (非アクティブ化)");
+        type_letters(&f, "a");
+        assert!(press(&f, Key::Escape, "\u{1b}"));
+        assert_eq!(f.0.phase(), Phase::Empty);
+        assert_eq!(last(&f), Some(false), "キャンセル");
     }
 
     #[test]
@@ -436,7 +432,7 @@ mod tests {
     #[test]
     fn 別のコントローラで切り替えても_次のキーでライブ変換に追従する() {
         let a = fixture();
-        let b = Controller::new(2, new_session(ConversionMode::Space, 0), FakePanel::default(), a.0.env.clone());
+        let b = Controller::new(2, new_session(ConversionMode::Space), FakePanel::default(), a.0.env.clone());
         let client = FakeClient::default();
         b.on_key(Route::Navigation, client.clone());
         a.0.on_key(Route::Navigation, a.1.clone());
@@ -477,9 +473,7 @@ mod tests {
     struct RecClient {
         bundle: Rc<RefCell<Option<String>>>,
         bundle_calls: Rc<Cell<usize>>,
-        preceding_calls: Rc<Cell<usize>>,
         marked: Rc<RefCell<String>>,
-        preceding: Rc<RefCell<String>>,
     }
 
     impl RecClient {
@@ -495,10 +489,6 @@ mod tests {
         fn set_marked(&self, text: &str) {
             *self.marked.borrow_mut() = text.to_string();
         }
-        fn preceding_text(&self, _max_utf16: usize) -> String {
-            self.preceding_calls.set(self.preceding_calls.get() + 1);
-            self.preceding.borrow().clone()
-        }
         fn bundle_id(&self) -> Option<String> {
             self.bundle_calls.set(self.bundle_calls.get() + 1);
             self.bundle.borrow().clone()
@@ -507,12 +497,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecEnv {
-        allowed: Rc<Cell<bool>>,
         secure: Rc<Cell<bool>>,
-        sent: Rc<RefCell<Vec<u64>>>,
-        /// 送られた payload の (文脈, 文脈を空にした理由の名前)。
-        payloads: Rc<RefCell<Vec<(String, Option<&'static str>)>>>,
-        cancels: Rc<Cell<usize>>,
         logs: Rc<RefCell<Vec<String>>>,
         live: Rc<Cell<bool>>,
     }
@@ -527,20 +512,10 @@ mod tests {
         fn set_live_conversion(&self, enabled: bool) {
             self.live.set(enabled);
         }
-        fn rerank_allowed(&self) -> bool {
-            self.allowed.get()
-        }
         fn log(&self, line: &str) {
             self.logs.borrow_mut().push(line.to_string());
         }
         fn trace(&self, _entry: &str, _fields: &str) {}
-        fn send_rerank(&self, _id: u64, generation: u64, payload: &Screened, _urgent: bool) {
-            self.sent.borrow_mut().push(generation);
-            self.payloads.borrow_mut().push((payload.context().to_string(), payload.context_dropped().map(|r| r.name())));
-        }
-        fn cancel_rerank(&self, _id: u64) {
-            self.cancels.set(self.cancels.get() + 1);
-        }
     }
 
     /// show / move_highlight の中で呼ぶフックを持つパネル (本物のパネルが同期で呼び戻すのを真似る)。
@@ -578,7 +553,7 @@ mod tests {
 
     fn rec_fixture() -> (Rc<RecController>, RecClient, HookPanel, RecEnv) {
         let (client, panel, env) = (RecClient::default(), HookPanel::default(), RecEnv::default());
-        let controller = Rc::new(Controller::new(7, new_session(ConversionMode::Space, 0), panel.clone(), env.clone()));
+        let controller = Rc::new(Controller::new(1, new_session(ConversionMode::Space), panel.clone(), env.clone()));
         (controller, client, panel, env)
     }
 
@@ -600,7 +575,7 @@ mod tests {
         let memory = lexicon.memory();
         let composer = Composer::new(RustEngine::new(), lexicon);
         let session = Session::new(composer, memory.clone(), ConversionMode::Space);
-        (Controller::new(8, session, HookPanel::default(), env), memory)
+        (Controller::new(1, session, HookPanel::default(), env), memory)
     }
 
     /// 大文字 1 字を打って Enter で確定し、記憶に書かれた語を返す。
@@ -658,7 +633,7 @@ mod tests {
         let memory = lexicon.memory();
         let composer = Composer::new(RustEngine::with_core(core.clone()), lexicon);
         let session = Session::new(composer, memory.clone(), ConversionMode::Space);
-        (Controller::new(9, session, HookPanel::default(), env), core, memory)
+        (Controller::new(1, session, HookPanel::default(), env), core, memory)
     }
 
     fn engine_learned(core: &KkcCore) -> bool {
@@ -737,14 +712,14 @@ mod tests {
 
     #[test]
     fn reset_after_panic_clears_the_screen_and_keeps_the_conversion_mode() {
-        let (c, client, panel, env) = rec_fixture();
+        let (c, client, panel, _env) = rec_fixture();
         rec_type(&c, &client, "kyou");
         rec_press(&c, &client, Key::Space, " ");
         rec_press(&c, &client, Key::Space, " ");
         c.on_toggle_conversion_mode();
         c.syncing.set(true);
         c.panel_line.set(3);
-        let (hidden, cancels) = (panel.hidden.get(), env.cancels.get());
+        let hidden = panel.hidden.get();
 
         c.reset_after_panic();
 
@@ -752,7 +727,6 @@ mod tests {
         assert_eq!(panel.hidden.get(), hidden + 1);
         assert_eq!(c.mode(), ConversionMode::Live);
         assert_eq!(c.phase(), Phase::Empty);
-        assert_eq!(env.cancels.get(), cancels + 1);
         assert!(!c.syncing.get());
         assert_eq!(c.panel_line.get(), 0);
     }
@@ -764,104 +738,6 @@ mod tests {
         let _held = c.session.borrow_mut();
         c.reset_after_panic();
         assert_eq!(env.logs.borrow().len(), 1);
-        assert_eq!(env.cancels.get(), 1);
-    }
-
-    #[test]
-    fn a_stale_rerank_result_is_not_applied_after_the_session_is_recreated() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(Some("com.apple.TextEdit"));
-        rec_type(&c, &client, "kyou");
-        let old = *env.sent.borrow().last().expect("a rerank request was sent");
-
-        c.reset_after_panic();
-        env.sent.borrow_mut().clear();
-        rec_type(&c, &client, "kyou");
-        let fresh = *env.sent.borrow().last().expect("a rerank request was sent");
-        let before = client.marked.borrow().clone();
-
-        assert_ne!(old, fresh, "generation numbers must not be reused");
-        c.on_rerank_result(old, &Choice { index: 1, text: "x".into() });
-        assert_eq!(*client.marked.borrow(), before);
-    }
-
-    #[test]
-    fn no_rerank_request_is_sent_while_typing_english() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(Some("com.apple.TextEdit"));
-        rec_type(&c, &client, "ente");
-        assert!(!env.sent.borrow().is_empty(), "kana input is still reranked");
-        env.sent.borrow_mut().clear();
-        rec_type(&c, &client, "rsa");
-        assert!(env.sent.borrow().is_empty(), "{:?}", env.sent.borrow());
-        assert_eq!(*client.marked.borrow(), "entersa");
-    }
-
-    #[test]
-    fn skipped_rerank_cancels_the_pending_request_and_sends_nothing() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(None);
-        rec_type(&c, &client, "kyou");
-        assert!(env.sent.borrow().is_empty());
-        assert!(env.cancels.get() > 0);
-    }
-
-    #[test]
-    fn a_secret_in_the_preceding_text_is_sent_with_an_empty_context() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(Some("com.apple.TextEdit"));
-        *client.preceding.borrow_mut() = "パスワードは hunter2".to_string();
-        rec_type(&c, &client, "kyou");
-        let payloads = env.payloads.borrow();
-        assert!(!payloads.is_empty(), "the request is still sent");
-        assert!(payloads.iter().all(|p| *p == (String::new(), Some("secret_word"))), "{payloads:?}");
-    }
-
-    #[test]
-    fn an_ordinary_preceding_text_is_sent_as_the_context() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(Some("com.apple.TextEdit"));
-        *client.preceding.borrow_mut() = "昨日は雨。今日は".to_string();
-        rec_type(&c, &client, "kyou");
-        let payloads = env.payloads.borrow();
-        assert!(!payloads.is_empty());
-        assert!(payloads.iter().all(|p| *p == ("今日は".to_string(), None)), "{payloads:?}");
-    }
-
-    #[test]
-    fn preceding_text_is_not_read_when_the_app_gate_refuses() {
-        for (secure, bundle) in [(true, Some("com.apple.TextEdit")), (false, Some("com.apple.Terminal")), (false, Some("com.1password.1password")), (false, None)] {
-            let (c, client, _panel, env) = rec_fixture();
-            env.allowed.set(true);
-            env.secure.set(secure);
-            client.set_bundle(bundle);
-            rec_type(&c, &client, "kyou");
-            assert!(env.sent.borrow().is_empty(), "{secure} {bundle:?}");
-            assert_eq!(client.preceding_calls.get(), 0, "{secure} {bundle:?}");
-        }
-    }
-
-    #[test]
-    fn preceding_text_is_read_when_the_app_gate_passes() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(Some("com.apple.TextEdit"));
-        rec_type(&c, &client, "kyou");
-        assert!(client.preceding_calls.get() > 0);
-    }
-
-    #[test]
-    fn the_same_gate_reason_is_logged_once() {
-        let (c, client, _panel, env) = rec_fixture();
-        env.allowed.set(true);
-        client.set_bundle(None);
-        rec_type(&c, &client, "kyouha");
-        assert_eq!(env.logs.borrow().len(), 1, "{:?}", env.logs.borrow());
     }
 
     #[test]

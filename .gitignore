@@ -11,3 +11,4 @@ docs/superpowers/
 __pycache__/
 .claude/settings.local.json
 .claude/worktrees/
+resources/judge/
