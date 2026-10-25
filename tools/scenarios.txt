@@ -461,3 +461,12 @@ egao<space><space>5	☺️
 inu<space><space>5	🐕
 bi-ru<space><space>6	🍻
 ha-to<space><space>5	🧡
+mergeshite<enter>	mergeして
+mergesite<enter>	mergeして
+commitshite<enter>	commitして
+rebaseshite<enter>	rebaseして
+deploysuru<enter>	deployする
+madeni<enter>	までに
+sameni<enter>	さめに
+kaneshite<enter>	かねして
+cachega<enter>	cacheが

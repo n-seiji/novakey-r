@@ -55,7 +55,26 @@ pub fn words(table: &Table) -> HashSet<&str> {
         .collect()
 }
 
-static WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| words(&TABLE));
+/// 1 行 1 語の一覧 (`resources/dev_words.txt`)。`#` 始まりと空行は読み飛ばし、小文字の英字だけの行を語とする。
+pub fn parse_words(text: &str) -> HashSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|w| w.bytes().all(|b| b.is_ascii_lowercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した集合。一覧が無ければ表だけ。
+static WORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let extra = crate::config::get()
+        .dev_words_path
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| parse_words(&s))
+        .unwrap_or_default();
+    words(&TABLE).into_iter().map(str::to_string).chain(extra).collect()
+});
 
 /// 打鍵列が表に載っている英単語か。
 pub fn is_english_word(typed: &str) -> bool {
@@ -98,6 +117,12 @@ mod tests {
     fn 英単語の集合は句を語に分け小文字の英字だけの語を持つ() {
         let t = parse("ア\tenter\nイ\topen account\tiPhone\tT-shirt\n");
         assert_eq!(words(&t), HashSet::from(["enter", "open", "account"]));
+    }
+
+    #[test]
+    fn 一覧はコメントと空行を読み飛ばし小文字の英字だけの語を持つ() {
+        let w = parse_words("# dev\n\nmerge\n  commit \nOAuth\nT-shirt\n");
+        assert_eq!(w, HashSet::from(["merge".to_string(), "commit".to_string()]));
     }
 
     #[test]

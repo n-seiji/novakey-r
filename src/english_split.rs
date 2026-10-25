@@ -11,6 +11,9 @@ const TAILS: &[&str] = &[
     "した", "しま", "され", "させ", "でき",
 ];
 
+/// 辞書の英単語を頭に使う最小の長さ (Composer::is_typing_english の MIN_LEN と同じ)。
+const DICTIONARY_MIN_LEN: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Split {
     pub head: String,
@@ -56,10 +59,29 @@ fn has_ascii(units: &[(String, String)]) -> bool {
     units.iter().any(|(_, kana)| kana.chars().any(|c| c.is_ascii_alphabetic()))
 }
 
+/// 辞書の英単語を頭に使ってよいか。日本語の打ちかけと紛れないよう 4 文字以上で、かな読みが日本語の語なら使わない。
+fn dictionary_head(head: &str, is_word: &impl Fn(&str) -> bool, is_japanese: &impl Fn(&str) -> bool) -> bool {
+    if head.len() < DICTIONARY_MIN_LEN || !is_word(head) {
+        return false;
+    }
+    let (units, pending) = convert(head, true);
+    let kana: String = units.iter().map(|(_, k)| k.as_str()).collect();
+    // かなにしきれない語 (commit の こっみt) は日本語の語になりえない。
+    has_ascii(&units) || !pending.is_empty() || !is_japanese(&kana)
+}
+
 /// raw を 英単語 + 助詞などで始まるかな に分ける。分けられなければ None。
-/// 英単語と見なすのは、全体がかなにしきれない (artifact の rt) か、英語として確定したことのある語。
+/// 英単語と見なすのは、全体がかなにしきれない (artifact の rt)、英語として確定したことのある語、
+/// または辞書の英単語 (4 文字以上。merge, commit) のいずれか。
+/// ただし辞書の英単語は、そのかな読みが日本語の語なら見なさない (made → まで)。確定済みの語 (knows) にこの除外は掛けない。
 /// finished は Enter などで打ち終えたとき。途中なら末尾の未確定ローマ字を許す。
-pub fn split(raw: &str, finished: bool, knows: impl Fn(&str) -> bool) -> Option<Split> {
+pub fn split(
+    raw: &str,
+    finished: bool,
+    knows: impl Fn(&str) -> bool,
+    is_dictionary_word: impl Fn(&str) -> bool,
+    is_japanese_reading: impl Fn(&str) -> bool,
+) -> Option<Split> {
     if raw.len() < 3 || !raw.bytes().all(|b| b.is_ascii_lowercase()) {
         return None;
     }
@@ -68,7 +90,7 @@ pub fn split(raw: &str, finished: bool, knows: impl Fn(&str) -> bool) -> Option<
     (2..raw.len()).rev().find_map(|i| {
         let (head, rest) = raw.split_at(i);
         let consonant_end = !head.ends_with(['a', 'i', 'u', 'e', 'o']);
-        if !(consonant_end && foreign || knows(head)) {
+        if !(consonant_end && foreign || knows(head) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading)) {
             return None;
         }
         let (tail, pending) = convert(rest, finished);
@@ -89,7 +111,7 @@ mod tests {
     use super::*;
 
     fn shown(raw: &str) -> Option<String> {
-        split(raw, false, |_| false).map(|s| s.display())
+        split(raw, false, |_| false, |_| false, |_| false).map(|s| s.display())
     }
 
     #[test]
@@ -106,8 +128,8 @@ mod tests {
 
     #[test]
     fn 打ち終えたら残りのローマ字が変換できないものは分けない() {
-        assert_eq!(split("artifactnish", true, |_| false), None);
-        let done = split("artifactnin", true, |_| false).unwrap();
+        assert_eq!(split("artifactnish", true, |_| false, |_| false, |_| false), None);
+        let done = split("artifactnin", true, |_| false, |_| false, |_| false).unwrap();
         assert_eq!(done.display(), "artifactにん");
     }
 
@@ -127,8 +149,48 @@ mod tests {
 
     #[test]
     fn 英語として確定したことのある語は母音で終わっても詰まりがなくても分ける() {
-        assert_eq!(split("mergeni", false, |w| w == "merge").map(|s| s.display()).as_deref(), Some("mergeに"));
-        assert_eq!(split("openni", false, |w| w == "open").map(|s| s.display()).as_deref(), Some("openに"));
-        assert_eq!(split("openni", false, |_| false), None);
+        assert_eq!(split("mergeni", false, |w| w == "merge", |_| false, |_| false).map(|s| s.display()).as_deref(), Some("mergeに"));
+        assert_eq!(split("openni", false, |w| w == "open", |_| false, |_| false).map(|s| s.display()).as_deref(), Some("openに"));
+        assert_eq!(split("openni", false, |_| false, |_| false, |_| false), None);
+    }
+
+    fn dict_split(raw: &str, words: &[&str], japanese: &[&str]) -> Option<String> {
+        split(raw, false, |_| false, |w| words.contains(&w), |k| japanese.contains(&k)).map(|s| s.display())
+    }
+
+    #[test]
+    fn 辞書の英単語は母音で終わっても助詞の前で分ける() {
+        assert_eq!(dict_split("mergesite", &["merge"], &[]).as_deref(), Some("mergeして"));
+        assert_eq!(dict_split("mergeshite", &["merge"], &[]).as_deref(), Some("mergeして"));
+        assert_eq!(dict_split("mergeni", &["merge"], &[]).as_deref(), Some("mergeに"));
+    }
+
+    #[test]
+    fn 辞書の英単語でも読みが日本語の語なら分けない() {
+        assert_eq!(dict_split("madeni", &["made"], &["まで"]), None);
+        assert_eq!(dict_split("madeni", &["made"], &[]).as_deref(), Some("madeに"));
+    }
+
+    #[test]
+    fn 辞書の英単語は4文字未満なら分けない() {
+        assert_eq!(dict_split("atoni", &["ato"], &[]), None);
+    }
+
+    #[test]
+    fn 辞書に無い語や助詞が続かない語は分けない() {
+        assert_eq!(dict_split("mergesite", &[], &[]), None);
+        assert_eq!(dict_split("merger", &["merge"], &[]), None);
+    }
+
+    #[test]
+    fn かなにしきれない辞書の語は読みを引かずに分ける() {
+        // commit は こっみt になるので、日本語の語かは問わない。
+        assert_eq!(dict_split("commitni", &["commit"], &["こっみ"]).as_deref(), Some("commitに"));
+    }
+
+    #[test]
+    fn 確定済みの語は読みが日本語の語でも分ける() {
+        let s = split("madeni", false, |w| w == "made", |_| false, |_| true);
+        assert_eq!(s.map(|s| s.display()).as_deref(), Some("madeに"));
     }
 }

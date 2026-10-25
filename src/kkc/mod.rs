@@ -59,6 +59,13 @@ impl KkcCore {
         self.learning.borrow_mut().learn(data, &|c| self.dict.char_id(c) != 255);
     }
 
+    /// 読みがそのまま辞書の見出しにあるか。トライを 1 本たどるだけで、ラティスは作らない。学習・動的な語は見ない。
+    pub fn has_reading(&self, hiragana: &str) -> bool {
+        let katakana = dict::to_katakana(hiragana);
+        !katakana.is_empty()
+            && self.dict.prefix_entries(&katakana).is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana))
+    }
+
     /// 読み全体を変換する。結果の全件 (`mainResults` / `firstClauseResults`)。毎回ラティスを作り直す。
     pub fn convert_all(&self, reading: &str) -> Converted {
         if reading.is_empty() {
@@ -199,6 +206,10 @@ impl CandidateEngine for RustEngine {
     fn cancel(&mut self) {
         self.last = None;
     }
+
+    fn has_reading(&self, hiragana: &str) -> bool {
+        self.core.as_ref().is_some_and(|core| core.has_reading(hiragana))
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +224,16 @@ mod tests {
     /// 上位 9 件のうち `want` の添字。
     fn index_of(cands: &[String], want: &str) -> usize {
         cands.iter().position(|c| c == want).unwrap_or_else(|| panic!("{want} が候補にない: {cands:?}"))
+    }
+
+    #[test]
+    fn has_reading_is_true_only_for_an_exact_dictionary_headword() {
+        let e = engine(Learning::in_memory());
+        assert!(e.has_reading("まで"));
+        assert!(e.has_reading("さめ"));
+        assert!(!e.has_reading("こっみと"));
+        assert!(!e.has_reading("まで\u{3042}\u{3042}\u{3042}x"));
+        assert!(!e.has_reading(""));
     }
 
     #[test]
