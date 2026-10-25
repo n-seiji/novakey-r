@@ -37,6 +37,24 @@ The conversion dictionary in dictionary/ is data from azooKey_dictionary_storage
 (https://github.com/ensan-hcl/azooKey_dictionary_storage), licensed under the
 Apache License 2.0. See dictionary/LICENSE and dictionary/NOTICE.
 
+rinna/japanese-gpt2-xsmall
+--------------------------
+The on-device judge (src/judge.rs) scores candidates with rinna Co., Ltd.'s
+japanese-gpt2-xsmall (https://huggingface.co/rinna/japanese-gpt2-xsmall), a
+Japanese GPT-2 distributed under the MIT License. The weights and tokenizer are
+not in this repository: `mise run judge-model` downloads them and converts them
+to resources/judge/ (q8_0 weights and tokenizer.json), and `mise run app`
+bundles them. The MIT License text is the one above, with:
+
+    Copyright (c) rinna Co., Ltd.
+
+Rust crates for the judge
+-------------------------
+The judge links candle-core (MIT or Apache-2.0, Hugging Face), tokenizers
+(Apache-2.0, Hugging Face), onig (MIT) and rayon (MIT or Apache-2.0), plus
+their dependencies, each under its own permissive license. See each crate's
+repository, or `cargo tree` and the crate sources, for the full texts.
+
 Other data
 ----------
 See the "クレジット" section of README.md for the loanword table (JMdict,

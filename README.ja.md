@@ -33,13 +33,17 @@
 - **英語。** かなにならない英単語は英字のまま表示します (enter, merge)。英語の途中の Space は空白として入ります。一度英語で確定した語は、次から打った時点で英字になります (git)。
 - **候補。** カタカナ語の英単語 (デスクトップ → desktop) と絵文字 (ねこ → 🐈) も候補に出ます。
 - **学習。** 選んだ候補を覚えて、次から先に出します。パスワード欄とパスワード管理アプリでは覚えません。
+- **並べ替え。** 小さな日本語言語モデル (rinna japanese-gpt2-xsmall) を Mac の中で動かし、文全体の候補を自然な順に並べ替えます。通信はしません。読み込み中は 175〜190 MB ほどメモリを使い、モデルファイルが必要です (下記)。無いときは変換エンジン本来の順のままです。
 - **ライブ変換 (任意)。** 打ちながら変換結果を表示します。入力メニューから切り替えます。
 
 ## インストール
 
 macOS 26 以降、[mise](https://mise.jdx.dev/) と Rust が必要です。
 
+並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
+
 ```sh
+mise run judge-model
 mise run install
 ```
 
@@ -69,6 +73,7 @@ mise run install
 - ローマ字の表 (`src/romaji_table.tsv`) は [Mozc](https://github.com/google/mozc) の `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.) です。
 - カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
 - 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
+- 並べ替えは [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.) を使います。`tools/gen_judge_model.py` で変換して使い、このリポジトリには含みません。
 - ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。

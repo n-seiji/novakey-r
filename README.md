@@ -33,13 +33,17 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 - **English.** English words that cannot become kana stay in English letters (enter, merge). Space in the middle of English inserts a space. A word you have committed as English shows up in English from then on (git).
 - **Candidates.** English words for katakana loanwords (デスクトップ → desktop) and emoji (ねこ → 🐈).
 - **Learning.** The candidates you pick come first next time. Nothing is learned in password fields or password managers.
+- **Re-ranking.** A small Japanese language model (rinna japanese-gpt2-xsmall) runs on your Mac and re-orders the full-sentence candidates so the natural one comes first. There is no network access. It adds about 175-190 MB of memory while loaded, and needs the model files (see below); without them the engine's own order is used.
 - **Live conversion (optional).** Shows the converted text as you type. Toggle it from the input menu.
 
 ## Install
 
 Requires macOS 26 or later, [mise](https://mise.jdx.dev/), and Rust.
 
+Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
+
 ```sh
+mise run judge-model
 mise run install
 ```
 
@@ -69,6 +73,7 @@ Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`
 - The romaji table (`src/romaji_table.tsv`) is [Mozc](https://github.com/google/mozc)'s `romanji-hiragana.tsv` (BSD-3-Clause, © Google Inc.).
 - English words for loanwords (`resources/loanwords.tsv`) are built from [EDRDG](https://www.edrdg.org/)'s JMdict (CC BY-SA 4.0).
 - Emoji (`resources/emoji.tsv`) are built from Unicode emoji data and CLDR Japanese annotations (Unicode License v3) via [azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage).
+- Re-ranking uses [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.), converted by `tools/gen_judge_model.py` and not included in this repository.
 - The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
 
 Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
