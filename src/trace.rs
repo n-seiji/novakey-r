@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 調査用のキー操作トレース。`defaults write me.sijis.inputmethod.NovakeyR NovakeyRTrace -bool true` で有効になり、
+//! 調査用のキー操作トレース。`defaults write dev.n-seiji.inputmethod.NovakeyR NovakeyRTrace -bool true` で有効になり、
 //! ~/Library/Logs/NovakeyR/trace.log に 1 行ずつ追記する。入力文字や候補の文字列は書かない。
 use std::io::Write;
 use std::path::PathBuf;

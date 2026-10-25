@@ -414,6 +414,25 @@ pub fn key_event(event: &AnyObject) -> Option<KeyInput> {
     }
 }
 
+/// main bundle の Info.plist から文字列の値を読む。bundle 外 (cargo run など) や NSString でない値は None。
+pub fn bundle_info_string(key: &str) -> Option<String> {
+    autoreleasepool(|_| {
+        let key = NSString::from_str(key);
+        // SAFETY: mainBundle は常に有効な NSBundle を返し、objectForInfoDictionaryKey: は NSString を取って
+        // id (nil 可) を返す。isKindOfClass: で NSString と判定できたオブジェクトだけを NSString として参照する。
+        unsafe {
+            let bundle: Id<AnyObject> = msg_send_id![class!(NSBundle), mainBundle];
+            let value: Option<Id<AnyObject>> =
+                msg_send_id![&*bundle, objectForInfoDictionaryKey: &*key];
+            let value = value?;
+            let plain: Bool = msg_send![&*value, isKindOfClass: class!(NSString)];
+            plain
+                .as_bool()
+                .then(|| lossy_string(&*(&*value as *const AnyObject as *const NSString)))
+        }
+    })
+}
+
 /// 入力メソッドサーバーを起動し、メインの run loop に入る。戻らない想定。
 pub fn run_application(connection_name: &str) {
     autoreleasepool(|_| {

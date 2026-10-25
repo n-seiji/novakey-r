@@ -11,17 +11,21 @@
 	<key>CFBundleIconFile</key>
 	<string>app.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>me.sijis.inputmethod.NovakeyR</string>
+	<string>dev.n-seiji.inputmethod.NovakeyR</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>NovakeyR</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>InputMethodConnectionName</key>
-	<string>me.sijis.inputmethod.NovakeyR_Connection</string>
+	<string>dev.n-seiji.inputmethod.NovakeyR_Connection</string>
 	<key>InputMethodServerControllerClass</key>
 	<string>NovakeyRInputController</string>
 	<key>LSBackgroundOnly</key>
-	<string>1</string>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>TISIconIsTemplate</key>

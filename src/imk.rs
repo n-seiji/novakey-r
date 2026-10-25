@@ -243,16 +243,34 @@ pub fn register_controller() {
     ));
 }
 
+/// Info.plist の InputMethodConnectionName が読めないとき (bundle 外の起動など) の接続名。
+const CONNECTION_NAME_FALLBACK: &str = "dev.n-seiji.inputmethod.NovakeyR_Connection";
+
 /// 入力メソッドとして起動し、run loop に入る。
 pub fn run() {
-    platform::run_application("me.sijis.inputmethod.NovakeyR_Connection");
+    let connection_name = platform::bundle_info_string("InputMethodConnectionName")
+        .unwrap_or_else(|| CONNECTION_NAME_FALLBACK.to_string());
+    platform::run_application(&connection_name);
 }
 
 #[cfg(test)]
 mod tests {
     use objc2::ClassType;
 
-    use super::NovakeyRInputController;
+    use super::{NovakeyRInputController, CONNECTION_NAME_FALLBACK};
+
+    #[test]
+    fn connection_name_in_info_plist_matches_the_fallback() {
+        let plist = include_str!("../Info.plist");
+        assert!(
+            plist.contains(&format!("<string>{CONNECTION_NAME_FALLBACK}</string>")),
+            "Info.plist lacks the connection name {CONNECTION_NAME_FALLBACK}"
+        );
+        assert_eq!(
+            CONNECTION_NAME_FALLBACK,
+            "dev.n-seiji.inputmethod.NovakeyR_Connection"
+        );
+    }
 
     #[test]
     fn the_controller_class_registers_with_imk_overrides() {
