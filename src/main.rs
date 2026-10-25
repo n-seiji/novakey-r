@@ -37,10 +37,6 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
         std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
     }
-    if let Some(i) = args.iter().position(|a| a == "--judge-dump") {
-        simulate::setup_env();
-        std::process::exit(judge::dump_cli(args.get(i + 1).map_or("", String::as_str)));
-    }
     if let Some(i) = args.iter().position(|a| a == "--judge-bench") {
         simulate::setup_env();
         std::process::exit(judge::bench_cli(args.get(i + 1).map_or("", String::as_str)));
@@ -58,10 +54,10 @@ fn main() {
         platform::check_main_queue();
     }
 
-    config::init(config::Config::from_env());
-    platform::begin_activity();
-    judge::preload();
+    // preload の背景スレッドが panic しても payload (ユーザー文字列を含みうる) を stderr に出さないよう、先に hook を入れる。
     platform::install_panic_hook();
+    config::init(config::Config::from_env());
+    judge::preload();
     imk::register_controller();
     imk::run();
 }

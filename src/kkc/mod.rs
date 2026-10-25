@@ -148,22 +148,39 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
     })
 }
 
+/// 全文候補の並べ替え。(文字列, engine のスコア) -> 良い順の添字、使えなければ `None`。本番は `judge::rerank`。
+type Judge = fn(&[&str], &[f32]) -> Option<Vec<usize>>;
+
 /// Rust 実装のかな漢字変換エンジン。
 pub struct RustEngine {
     core: Option<Rc<KkcCore>>,
+    judge: Judge,
     /// 直近の変換の revision と、返した候補ごとの `Candidate.data`。`select` の検証と学習用。
     last: Option<(u64, Vec<Vec<Rc<elem::Elem>>>)>,
 }
 
 impl RustEngine {
     pub fn new() -> Self {
-        Self { core: shared_core(), last: None }
+        Self { core: shared_core(), judge: crate::judge::rerank, last: None }
     }
 
     #[cfg(test)]
     pub fn with_core(core: Rc<KkcCore>) -> Self {
-        Self { core: Some(core), last: None }
+        Self { core: Some(core), judge: crate::judge::rerank, last: None }
     }
+
+    /// 審判を差し替える (テスト用。実際の並べ替え経路を fake で通す)。
+    #[cfg(test)]
+    pub fn with_judge(mut self, judge: Judge) -> Self {
+        self.judge = judge;
+        self
+    }
+}
+
+/// `order` が `0..n` の並べ替えか (審判の返り値が壊れていても、候補が欠けたり重なったりしないように)。
+fn is_permutation(order: &[usize], n: usize) -> bool {
+    let mut seen = vec![false; n];
+    order.len() == n && order.iter().all(|&k| k < n && !std::mem::replace(&mut seen[k], true))
 }
 
 impl Default for RustEngine {
@@ -189,7 +206,7 @@ impl CandidateEngine for RustEngine {
         let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let scores: Vec<f32> = slots.iter().map(|&i| top[i].value).collect();
-        if let Some(ranked) = crate::judge::rerank(&refs, &scores) {
+        if let Some(ranked) = (self.judge)(&refs, &scores).filter(|r| is_permutation(r, slots.len())) {
             for (&slot, k) in slots.iter().zip(ranked) {
                 order[slot] = slots[k];
             }
@@ -236,6 +253,64 @@ mod tests {
     /// 上位 9 件のうち `want` の添字。
     fn index_of(cands: &[String], want: &str) -> usize {
         cands.iter().position(|c| c == want).unwrap_or_else(|| panic!("{want} が候補にない: {cands:?}"))
+    }
+
+    fn reverse_judge(texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        Some((0..texts.len()).rev().collect())
+    }
+
+    fn no_judge(_texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        None
+    }
+
+    fn broken_judge(texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        Some(vec![0; texts.len()])
+    }
+
+    fn full_slots(core: &KkcCore, reading: &str) -> Vec<usize> {
+        let converted = core.convert_all(reading);
+        let n = converted.main.len().min(TOP_N);
+        (0..n).filter(|&i| converted.main[i].source == result::Source::Full).collect()
+    }
+
+    #[test]
+    fn judge_reverses_only_the_full_slots_in_the_displayed_order() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let slots = full_slots(&core, "かんじ");
+        assert!(slots.len() >= 2, "前提: 全文候補が 2 つ以上 ({slots:?})");
+        let base = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, "かんじ");
+        let shown = RustEngine::with_core(core).with_judge(reverse_judge).convert(1, "かんじ");
+        assert_eq!(base.len(), shown.len());
+        for (pos, &slot) in slots.iter().enumerate() {
+            assert_eq!(shown[slot], base[slots[slots.len() - 1 - pos]], "全文候補の枠だけが逆順になる");
+        }
+        for i in (0..base.len()).filter(|i| !slots.contains(i)) {
+            assert_eq!(shown[i], base[i], "全文以外の枠は動かない");
+        }
+        assert_ne!(shown, base);
+    }
+
+    #[test]
+    fn selecting_a_judge_reordered_candidate_learns_that_candidate() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let slots = full_slots(&core, "かんじ");
+        let mut e = RustEngine::with_core(core.clone()).with_judge(reverse_judge);
+        let shown = e.convert(1, "かんじ");
+        // 審判で最後の全文候補が先頭の枠に来ている。それを選ぶ。
+        let picked = shown[slots[0]].clone();
+        assert_ne!(RustEngine::with_core(core.clone()).with_judge(no_judge).convert(9, "かんじ")[slots[0]], picked);
+        assert!(e.select(1, slots[0]));
+        // 審判なしで引き直すと、選んだ候補が (表示順ではなく中身で) 学習されて先頭に出る。
+        let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "かんじ");
+        assert_eq!(after[0], picked, "{after:?}");
+    }
+
+    #[test]
+    fn a_broken_judge_result_keeps_the_engine_order() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let base = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, "かんじ");
+        let shown = RustEngine::with_core(core).with_judge(broken_judge).convert(1, "かんじ");
+        assert_eq!(shown, base);
     }
 
     #[test]

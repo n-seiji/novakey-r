@@ -720,17 +720,43 @@ pub fn set_qos_user_interactive() {
     }
 }
 
-/// App Nap とタイマーの間引きを止める。戻りトークンはプロセスの寿命まで持つ (1 度だけ呼ぶ)。
-pub fn begin_activity() {
-    // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical (idle sleep は止めない)
-    const OPTIONS: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
-    // SAFETY: processInfo は NSProcessInfo のシングルトン。beginActivityWithOptions:reason: は NSUInteger と NSString を取り
-    // 保持された NSObject を返す。それを forget して解放しない (終了まで有効)。
-    unsafe {
-        let info: Id<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
-        let reason = NSString::from_str("input method conversion");
-        let token: Id<AnyObject> = msg_send_id![&*info, beginActivityWithOptions: OPTIONS, reason: &*reason];
-        std::mem::forget(token);
+/// 入力中だけ App Nap とタイマーの間引きを止める活動。`begin` / `end` は何度呼んでも 1 つしか持たない (冪等)。
+/// 落とす (Drop) と終わるので、コントローラごと解放されても漏れない。
+#[derive(Default)]
+pub struct Activity(std::cell::RefCell<Option<Id<AnyObject>>>);
+
+impl Activity {
+    pub fn begin(&self) {
+        let mut slot = self.0.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical (idle sleep は止めない)
+        const OPTIONS: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
+        // SAFETY: processInfo は NSProcessInfo のシングルトン。beginActivityWithOptions:reason: は NSUInteger と NSString を取り
+        // 保持された NSObject (活動のトークン) を返す。トークンは end で endActivity: に渡すまで保持する。
+        let token = unsafe {
+            let info: Id<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
+            let reason = NSString::from_str("input method composition");
+            let token: Id<AnyObject> = msg_send_id![&*info, beginActivityWithOptions: OPTIONS, reason: &*reason];
+            token
+        };
+        *slot = Some(token);
+    }
+
+    pub fn end(&self) {
+        let Some(token) = self.0.borrow_mut().take() else { return };
+        // SAFETY: token は beginActivityWithOptions:reason: が返したもの。endActivity: は 1 度だけ呼ぶ (take 済み)。
+        unsafe {
+            let info: Id<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
+            let _: () = msg_send![&*info, endActivity: &*token];
+        }
+    }
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -749,9 +775,12 @@ pub fn sgemm_abt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32],
         return;
     }
     assert!(lda >= k && ldb >= k && ldc >= n, "sgemm: bad leading dimension");
-    assert!((m - 1) * lda + k <= a.len(), "sgemm: A too short");
-    assert!((n - 1) * ldb + k <= b.len(), "sgemm: B too short");
-    assert!((m - 1) * ldc + n <= c.len(), "sgemm: C too short");
+    let fits = |rows: usize, ld: usize, width: usize, len: usize| {
+        (rows - 1).checked_mul(ld).and_then(|v| v.checked_add(width)).is_some_and(|need| need <= len)
+    };
+    assert!(fits(m, lda, k, a.len()), "sgemm: A too short");
+    assert!(fits(n, ldb, k, b.len()), "sgemm: B too short");
+    assert!(fits(m, ldc, n, c.len()), "sgemm: C too short");
     assert!([m, n, k, lda, ldb, ldc].iter().all(|&v| i32::try_from(v).is_ok()), "sgemm: dimension too large");
     // SAFETY: 上の assert で A / B / C のどの要素も範囲内。C は &mut なので A / B と重ならない。
     unsafe {
@@ -770,9 +799,15 @@ pub fn q8_dot_rows(w: &[u8], wd: &[f32], x: &[i8], xd: &[f32], bpr: usize, m: us
         return;
     }
     let nrows = wd.len() / bpr;
-    assert!(wd.len() == nrows * bpr && w.len() == nrows * bpr * 32, "q8_dot_rows: bad weight size");
-    assert!(x.len() == m * bpr * 32 && xd.len() == m * bpr, "q8_dot_rows: bad input size");
-    assert!(out.len() == nrows * m, "q8_dot_rows: bad output size");
+    let sizes = (|| {
+        let wb = nrows.checked_mul(bpr)?;
+        let xb = m.checked_mul(bpr)?;
+        Some((wb, wb.checked_mul(32)?, xb, xb.checked_mul(32)?, nrows.checked_mul(m)?))
+    })();
+    let Some((wblocks, wbytes, xblocks, xbytes, nout)) = sizes else { panic!("q8_dot_rows: size overflow") };
+    assert!(wd.len() == wblocks && w.len() == wbytes, "q8_dot_rows: bad weight size");
+    assert!(x.len() == xbytes && xd.len() == xblocks, "q8_dot_rows: bad input size");
+    assert!(out.len() == nout, "q8_dot_rows: bad output size");
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("dotprod") {

@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use candle_core::quantized::{gguf_file, GgmlDType};
@@ -21,6 +21,8 @@ use tokenizers::Tokenizer;
 const NL: usize = 6;
 const NH: usize = 8;
 const DM: usize = 512;
+/// MLP の中間幅 (rinna/japanese-gpt2-xsmall は 4.5 倍の 2304)。
+const FF: usize = 2304;
 const EPS: f64 = 1e-5;
 const BOS: u32 = 1;
 const EOS: u32 = 2;
@@ -48,10 +50,12 @@ const PAR_ATTN_ROWS: usize = 24;
 /// 木に残すノード数の上限 (1 ノード約 26KB)。
 const MAX_NODES: usize = 640;
 
-type R<T> = Result<T, String>;
+/// エラーは固定文字列だけ (candle / tokenizers のエラー文はログに出さない)。
+type R<T> = Result<T, &'static str>;
 
-fn e<E: std::fmt::Display>(err: E) -> String {
-    err.to_string()
+/// 元のエラー (candle / tokenizers / io) は捨てて、場所を表す固定文字列にする。
+fn fail<E>(msg: &'static str) -> impl Fn(E) -> &'static str {
+    move |_| msg
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -87,18 +91,18 @@ struct QMat {
 
 impl QMat {
     fn from_gguf(q: &candle_core::quantized::QTensor) -> R<Self> {
-        let (rows, cols) = q.shape().dims2().map_err(e)?;
+        let (rows, cols) = q.shape().dims2().map_err(fail("tensor is not a matrix"))?;
         if cols % 32 != 0 {
-            return Err("cols not a multiple of 32".to_string());
+            return Err("cols not a multiple of 32");
         }
-        let data = q.data().map_err(e)?;
-        let nb = rows * cols / 32;
+        let data = q.data().map_err(fail("cannot read tensor data"))?;
+        let nb = rows.checked_mul(cols).ok_or("tensor too large")? / 32;
         if q.dtype() != GgmlDType::Q8_0 {
-            return Err(format!("unsupported dtype {:?}", q.dtype()));
+            return Err("unsupported tensor dtype");
         }
         let bsz = 34;
-        if data.len() != nb * bsz {
-            return Err("unexpected tensor size".to_string());
+        if nb.checked_mul(bsz) != Some(data.len()) {
+            return Err("unexpected tensor size");
         }
         let qlen = bsz - 2;
         let mut scales = Vec::with_capacity(nb);
@@ -402,12 +406,16 @@ struct Model {
 impl Model {
     fn load(path: &Path) -> R<Self> {
         let dev = Device::Cpu;
-        let mut file = std::fs::File::open(path).map_err(e)?;
-        let content = gguf_file::Content::read(&mut file).map_err(e)?;
+        let mut file = std::fs::File::open(path).map_err(fail("cannot open model file"))?;
+        let content = gguf_file::Content::read(&mut file).map_err(fail("cannot parse model file"))?;
         let file = std::cell::RefCell::new(file);
-        let get = |k: &str| content.tensor(&mut *file.borrow_mut(), k, &dev).map_err(e);
+        let get = |k: &str| content.tensor(&mut *file.borrow_mut(), k, &dev).map_err(fail("missing or unreadable tensor"));
         let get_v = |k: &str| -> R<Vec<f32>> {
-            get(k)?.dequantize(&dev).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()).map_err(e)
+            get(k)?
+                .dequantize(&dev)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(fail("unreadable vector tensor"))
         };
         let ln = |p: &str, n: &str| -> R<Ln> {
             Ok(Ln { w: get_v(&format!("{p}.{n}.weight"))?, b: get_v(&format!("{p}.{n}.bias"))? })
@@ -429,28 +437,76 @@ impl Model {
             });
         }
         let wte = QMat::from_gguf(&get("transformer.wte.weight")?)?;
-        if wte.cols != DM {
-            return Err("unexpected embedding width".to_string());
-        }
         let wpe = get_v("transformer.wpe.weight")?;
-        if wpe.len() % DM != 0 || wpe.len() / DM <= MAX_TOKENS + 1 {
-            return Err("unexpected position table".to_string());
-        }
         let work = Work { scratch: vec![0f32; SCRATCH_ELEMS], cache: Cache::new() };
-        Ok(Self { wte, wpe, blocks, lnf: ln("transformer", "ln_f")?, work: Mutex::new(work) })
+        let model = Self { wte, wpe, blocks, lnf: ln("transformer", "ln_f")?, work: Mutex::new(work) };
+        model.check_shapes()?;
+        Ok(model)
+    }
+
+    /// 全テンソルの形が GPT-2 xsmall と一致するか。ここで通れば、以降の添字・長さの前提 (zip の打ち切りや
+    /// スライスの範囲外) が崩れない。外れていれば読み込みの失敗として扱い、engine の順に戻す。
+    fn check_shapes(&self) -> R<()> {
+        let mat = |m: &QMat, rows: usize, cols: usize| -> R<()> {
+            let ok = m.rows == rows
+                && m.cols == cols
+                && m.scales.len() == rows * cols / 32
+                && m.qs.len() == rows * cols;
+            if ok { Ok(()) } else { Err("unexpected weight shape") }
+        };
+        let lin = |l: &Linear, rows: usize, cols: usize| -> R<()> {
+            mat(&l.w, rows, cols)?;
+            if l.b.len() == rows { Ok(()) } else { Err("unexpected bias length") }
+        };
+        let ln = |l: &Ln| -> R<()> {
+            if l.w.len() == DM && l.b.len() == DM { Ok(()) } else { Err("unexpected layer norm length") }
+        };
+        if self.blocks.len() != NL {
+            return Err("unexpected layer count");
+        }
+        for blk in &self.blocks {
+            ln(&blk.ln1)?;
+            ln(&blk.ln2)?;
+            lin(&blk.attn, 3 * DM, DM)?;
+            lin(&blk.proj, DM, DM)?;
+            lin(&blk.fc, FF, DM)?;
+            lin(&blk.out, DM, FF)?;
+        }
+        ln(&self.lnf)?;
+        // 語彙は BOS / EOS を含み、少なくとも 1 塊の出力射影ができること。
+        if self.wte.cols != DM || self.wte.rows <= (EOS as usize).max(BOS as usize) {
+            return Err("unexpected embedding shape");
+        }
+        mat(&self.wte, self.wte.rows, DM)?;
+        if self.wpe.len() % DM != 0 || self.wpe.len() / DM <= MAX_TOKENS + 1 {
+            return Err("unexpected position table");
+        }
+        Ok(())
     }
 
     /// 木に溜めた分を捨てる。
     fn clear_cache(&self) {
-        self.work.lock().unwrap_or_else(PoisonError::into_inner).cache = Cache::new();
+        self.lock_work().cache = Cache::new();
+    }
+
+    /// 作業領域のロック。毒された (= 以前の呼び出しが途中で panic した) なら、木は信用できないので作り直す。
+    fn lock_work(&self) -> std::sync::MutexGuard<'_, Work> {
+        self.work.lock().unwrap_or_else(|poisoned| {
+            let mut guard = poisoned.into_inner();
+            guard.cache = Cache::new();
+            guard
+        })
     }
 
     /// 各系列 (BOS に続くトークン列。EOS は含めない) の対数尤度 (BOS の後から EOS まで) の合計と、今回新しく計算したトークン数。
     /// 共通の接頭辞と前回までに計算した分は木から使い回し、足りない分だけを 1 まとめにして流す。
     fn score(&self, seqs: &[Vec<u32>]) -> R<(Vec<f64>, usize)> {
-        let mut guard = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.lock_work();
         let work: &mut Work = &mut guard;
-        let r = self.score_in(seqs, work);
+        // forward の途中で panic すると、K / V が 0・対数確率が NaN のノードが木に残り、後の呼び出しがそれを信用してしまう。
+        // panic も失敗も、木を捨てて Err にする (呼び出し側はその文字では engine の順に戻す)。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.score_in(seqs, work)))
+            .unwrap_or(Err("panic while scoring"));
         if r.is_err() {
             work.cache = Cache::new();
         }
@@ -460,7 +516,7 @@ impl Model {
     fn score_in(&self, seqs: &[Vec<u32>], work: &mut Work) -> R<(Vec<f64>, usize)> {
         let Work { scratch, cache } = work;
         if seqs.iter().flatten().any(|&t| t as usize >= self.wte.rows || t == BOS || t == EOS) {
-            return Err("token id out of range".to_string());
+            return Err("token id out of range");
         }
         cache.stamp += 1;
         let mut pending: Vec<u32> = Vec::new();
@@ -508,6 +564,11 @@ impl Model {
         let m = pending.len();
         let paths: Vec<Vec<u32>> = pending.iter().map(|&p| cache.path(p)).collect();
         let mut x = vec![0f32; m * DM];
+        #[cfg(test)]
+        if tests::INJECT_PANIC.with(Cell::get) {
+            cache.nodes[pending[0] as usize].kv = vec![0f32; KV_LEN];
+            panic!("injected failure in forward");
+        }
         for (row, &p) in x.chunks_exact_mut(DM).zip(pending) {
             let (tok, depth) = (cache.nodes[p as usize].tok as usize, cache.nodes[p as usize].depth as usize);
             self.wte.dequant_rows(tok, tok + 1, row);
@@ -713,7 +774,7 @@ impl Judge {
             .start_handler(|_| crate::platform::set_qos_user_interactive())
             .build_global();
         let model = Model::load(&dir.join("model_q8_0.gguf"))?;
-        let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(e)?;
+        let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(fail("cannot load tokenizer"))?;
         let judge = Self { model, tok };
         // 遅延初期化 (Accelerate・スレッドプール) を読み込みの時間に含める。
         judge.model.score(&[vec![100], vec![100, 101]])?;
@@ -722,7 +783,7 @@ impl Judge {
     }
 
     fn sequence(&self, text: &str) -> R<Vec<u32>> {
-        let enc = self.tok.encode(text.to_lowercase(), false).map_err(e)?;
+        let enc = self.tok.encode(text.to_lowercase(), false).map_err(fail("cannot tokenize"))?;
         Ok(enc.get_ids().to_vec())
     }
 
@@ -730,14 +791,16 @@ impl Judge {
     fn score(&self, texts: &[&str]) -> R<(Vec<f64>, usize)> {
         let seqs = texts.iter().map(|t| self.sequence(t)).collect::<R<Vec<_>>>()?;
         if seqs.iter().any(|s| s.len() + 2 > MAX_TOKENS) {
-            return Err("too long".to_string());
+            return Err("too long");
         }
         self.model.score(&seqs)
     }
 }
 
 static JUDGE: OnceLock<Option<Judge>> = OnceLock::new();
-static LOGGED: AtomicBool = AtomicBool::new(false);
+/// 読み込みの失敗と採点の失敗は別々に 1 度ずつログする (片方が出ても、もう片方を隠さない)。
+static LOAD_LOGGED: AtomicBool = AtomicBool::new(false);
+static SCORE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// `preload` で背景読み込みを始めた。立っている間、読み込み中の `rerank` は待たずに審判なしで返す。
 static PRELOADED: AtomicBool = AtomicBool::new(false);
 
@@ -745,8 +808,9 @@ thread_local! {
     static LAST_MS: Cell<Option<f64>> = const { Cell::new(None) };
 }
 
-fn log_once(message: &str) {
-    if !LOGGED.swap(true, Ordering::Relaxed) {
+/// `flag` ごとに 1 度だけログする。`message` は固定文字列 (入力文字列や外部ライブラリのエラー文を入れない)。
+fn log_once(flag: &AtomicBool, message: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
         crate::platform::log(message);
     }
 }
@@ -755,17 +819,23 @@ fn judge() -> Option<&'static Judge> {
     JUDGE
         .get_or_init(|| {
             let Some(dir) = crate::config::get().judge_dir.clone() else {
-                log_once("judge: not configured; conversion keeps the engine order");
+                log_once(&LOAD_LOGGED, "judge: not configured; conversion keeps the engine order");
                 return None;
             };
             let t0 = Instant::now();
-            match Judge::open(&dir) {
-                Ok(j) => {
+            // 読み込みの panic は、結果を `None` として確定させる (そうしないと preload の背景スレッドが落ちて
+            // 初期化されないまま、`rerank` が黙って `None` を返し続ける)。
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Judge::open(&dir))) {
+                Ok(Ok(j)) => {
                     crate::trace::record("judge-load", &format!("ms={:.0}", t0.elapsed().as_secs_f64() * 1e3));
                     Some(j)
                 }
-                Err(err) => {
-                    log_once(&format!("judge: model unavailable; conversion keeps the engine order: {err}"));
+                Ok(Err(err)) => {
+                    log_once(&LOAD_LOGGED, &format!("judge: model unavailable; conversion keeps the engine order ({err})"));
+                    None
+                }
+                Err(_) => {
+                    log_once(&LOAD_LOGGED, "judge: model load panicked; conversion keeps the engine order");
                     None
                 }
             }
@@ -779,18 +849,34 @@ pub fn preload() {
     if PRELOADED.swap(true, Ordering::Relaxed) {
         return;
     }
-    if let Err(err) = std::thread::Builder::new().name("judge-preload".to_string()).spawn(|| {
-        crate::platform::set_qos_user_interactive();
-        let _ = judge();
-    }) {
+    if std::thread::Builder::new()
+        .name("judge-preload".to_string())
+        .spawn(|| {
+            crate::platform::set_qos_user_interactive();
+            let _ = judge();
+        })
+        .is_err()
+    {
         PRELOADED.store(false, Ordering::Relaxed);
-        log_once(&format!("judge: preload thread failed: {err}"));
+        log_once(&LOAD_LOGGED, "judge: preload thread failed to start");
     }
 }
 
 /// 直近の `rerank` にかかった時間 (ms)。取り出すと消える。
 pub fn take_last_ms() -> Option<f64> {
     LAST_MS.with(Cell::take)
+}
+
+/// engine のスコアと審判の対数尤度の合計が大きい順の添字。どれかが有限でなければ `None`
+/// (NaN が混じると並べ替えが全順序にならず、順番が不定になるため)。
+fn order_by_total(engine_scores: &[f32], judge_scores: &[f64]) -> Option<Vec<usize>> {
+    let combined: Vec<f64> = engine_scores.iter().zip(judge_scores).map(|(&b, &j)| f64::from(b) + WEIGHT * j).collect();
+    if combined.len() != engine_scores.len() || combined.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..combined.len()).collect();
+    order.sort_by(|&a, &b| combined[b].total_cmp(&combined[a]));
+    Some(order)
 }
 
 /// 全文候補 `texts` を `engine_scores` (大きいほど良い) + 審判の対数尤度で並べ替えた添字 (良い順)。
@@ -801,11 +887,18 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
     }
     let judge = if PRELOADED.load(Ordering::Relaxed) {
         // 背景で読み込み中なら待たない。
-        let loaded = JUDGE.get().and_then(Option::as_ref);
-        if loaded.is_none() && JUDGE.get().is_none() {
-            crate::trace::record("judge-skip", "loading=1");
+        match JUDGE.get() {
+            None => {
+                crate::trace::record("judge-skip", "loading=1");
+                return None;
+            }
+            Some(None) => {
+                // 読み込みは終わったが使えない。理由は読み込み側がログ済み (まだなら固定文を 1 度)。
+                log_once(&LOAD_LOGGED, "judge: unavailable; conversion keeps the engine order");
+                return None;
+            }
+            Some(Some(j)) => j,
         }
-        loaded?
     } else {
         judge()?
     };
@@ -813,17 +906,14 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
     let (scores, rows) = match judge.score(texts) {
         Ok(s) => s,
         Err(err) => {
-            log_once(&format!("judge: scoring failed: {err}"));
+            log_once(&SCORE_LOGGED, &format!("judge: scoring failed; this key keeps the engine order ({err})"));
             return None;
         }
     };
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     LAST_MS.with(|c| c.set(Some(ms)));
     crate::trace::record("judge", &format!("ms={ms:.1} n={} rows={rows}", texts.len()));
-    let combined: Vec<f64> = engine_scores.iter().zip(&scores).map(|(&b, &j)| f64::from(b) + WEIGHT * j).collect();
-    let mut order: Vec<usize> = (0..texts.len()).collect();
-    order.sort_by(|&a, &b| combined[b].partial_cmp(&combined[a]).unwrap_or(std::cmp::Ordering::Equal));
-    Some(order)
+    order_by_total(engine_scores, &scores)
 }
 
 /// `--judge-bench <testset.tsv>`: 読み (1 列目) と正解 (2 列目、`|` 区切り) の表を、
@@ -869,28 +959,119 @@ pub fn bench_cli(path: &str) -> i32 {
     0
 }
 
-/// `--judge-dump <nbest.json>`: 各 N-best (`cands` の 1 列目) の対数尤度の合計を JSON 配列で標準出力に出す (開発用)。
-pub fn dump_cli(path: &str) -> i32 {
-    let Some(v) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
-        eprintln!("cannot read {path}");
-        return 2;
-    };
-    let Some(judge) = judge() else {
-        eprintln!("judge unavailable (set NOVAKEY_JUDGE_DIR)");
-        return 2;
-    };
-    let mut all = Vec::new();
-    for item in v.as_array().into_iter().flatten() {
-        let texts: Vec<&str> = item["cands"].as_array().into_iter().flatten().filter_map(|c| c[0].as_str()).collect();
-        all.push(judge.score(&texts).map(|r| r.0).unwrap_or_default());
-    }
-    println!("{}", serde_json::to_string(&all).unwrap_or_default());
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// 立っている間、`forward` が K / V を 0 で確保した直後に panic する (途中失敗の再現)。
+        pub(super) static INJECT_PANIC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn rand_qmat(rows: usize, cols: usize, st: &mut u64) -> QMat {
+        let nb = rows * cols / 32;
+        let qs: Vec<u8> = (0..nb * 32).map(|_| (lcg(st) * 127.0) as i8 as u8).collect();
+        let scales: Vec<f32> = (0..nb).map(|_| 0.0005 + lcg(st).abs() * 0.002).collect();
+        QMat { rows, cols, qs, scales }
+    }
+
+    fn rand_vec(n: usize, st: &mut u64) -> Vec<f32> {
+        (0..n).map(|_| lcg(st) * 0.1).collect()
+    }
+
+    fn rand_ln(st: &mut u64) -> Ln {
+        Ln { w: vec![1.0; DM].iter().map(|v| v + lcg(st) * 0.05).collect(), b: rand_vec(DM, st) }
+    }
+
+    fn rand_lin(rows: usize, cols: usize, st: &mut u64) -> Linear {
+        Linear { w: rand_qmat(rows, cols, st), b: rand_vec(rows, st) }
+    }
+
+    /// 形だけ本物と同じ、乱数の重みの小さなモデル (語彙 64)。
+    fn synthetic_model() -> Model {
+        let mut st = 99u64;
+        let blocks = (0..NL)
+            .map(|_| Block {
+                ln1: rand_ln(&mut st),
+                ln2: rand_ln(&mut st),
+                attn: rand_lin(3 * DM, DM, &mut st),
+                proj: rand_lin(DM, DM, &mut st),
+                fc: rand_lin(FF, DM, &mut st),
+                out: rand_lin(DM, FF, &mut st),
+            })
+            .collect();
+        let wte = rand_qmat(64, DM, &mut st);
+        let wpe = rand_vec((MAX_TOKENS + 2) * DM, &mut st);
+        let work = Work { scratch: vec![0f32; SCRATCH_ELEMS], cache: Cache::new() };
+        Model { wte, wpe, blocks, lnf: rand_ln(&mut st), work: Mutex::new(work) }
+    }
+
+    #[test]
+    fn 形の揃ったモデルは検査を通り_どこかの形が外れると失敗する() {
+        let mut m = synthetic_model();
+        assert_eq!(m.check_shapes(), Ok(()));
+        m.blocks[3].fc.b.pop();
+        assert!(m.check_shapes().is_err(), "bias");
+        let mut m = synthetic_model();
+        m.blocks[0].ln2.w.push(0.0);
+        assert!(m.check_shapes().is_err(), "layer norm");
+        let mut m = synthetic_model();
+        m.blocks[5].out.w = rand_qmat(DM, FF + 32, &mut 1);
+        assert!(m.check_shapes().is_err(), "weight");
+        let mut m = synthetic_model();
+        m.lnf.b.pop();
+        assert!(m.check_shapes().is_err(), "final layer norm");
+        let mut m = synthetic_model();
+        m.wpe.truncate(DM * 10);
+        assert!(m.check_shapes().is_err(), "position table");
+    }
+
+    /// forward の途中で panic しても、木は捨てられて Err になり、次の呼び出しは壊れた結果を信用せず正しい値を返す。
+    #[test]
+    fn 採点の途中で_panic_しても木を捨て_次の呼び出しは正しい() {
+        let m = synthetic_model();
+        let seqs = vec![vec![10, 11, 12], vec![10, 11, 13]];
+        let want = m.score(&seqs).unwrap().0;
+        m.clear_cache();
+        INJECT_PANIC.with(|c| c.set(true));
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let failed = m.score(&seqs);
+        std::panic::set_hook(prev_hook);
+        INJECT_PANIC.with(|c| c.set(false));
+        assert!(failed.is_err());
+        assert_eq!(m.lock_work().cache.nodes.len(), 0, "壊れた木は捨てる");
+        let got = m.score(&seqs).unwrap().0;
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-3, "{got:?} {want:?}");
+        }
+        assert!(got.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn 毒されたロックでも_木を作り直して使える() {
+        let m = synthetic_model();
+        let seqs = vec![vec![10, 11]];
+        let want = m.score(&seqs).unwrap().0;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m.work.lock().unwrap();
+            g.cache.nodes[0].kv = vec![0.0; KV_LEN];
+            g.cache.nodes[1].lp = f32::NAN;
+            std::panic::resume_unwind(Box::new("poison"));
+        }));
+        assert!(m.work.is_poisoned());
+        let got = m.score(&seqs).unwrap().0;
+        assert!((got[0] - want[0]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn 合計が有限でないときは並べ替えず_有限なら大きい順() {
+        assert_eq!(order_by_total(&[0.0, 0.0, 0.0], &[-3.0, -1.0, -2.0]), Some(vec![1, 2, 0]));
+        assert_eq!(order_by_total(&[-1.0, 0.0], &[0.0, -0.5]), Some(vec![1, 0]));
+        assert_eq!(order_by_total(&[0.0, 0.0], &[f64::NAN, -1.0]), None);
+        assert_eq!(order_by_total(&[f32::INFINITY, 0.0], &[0.0, -1.0]), None);
+        assert_eq!(order_by_total(&[0.0, f32::NAN], &[0.0, -1.0]), None);
+    }
 
     fn lcg(state: &mut u64) -> f32 {
         *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
