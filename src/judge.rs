@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use candle_core::quantized::{gguf_file, GgmlDType};
-use candle_core::Device;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
+
+use crate::gguf;
 
 const NL: usize = 6;
 const NH: usize = 8;
@@ -50,10 +50,10 @@ const PAR_ATTN_ROWS: usize = 24;
 /// 木に残すノード数の上限 (1 ノード約 26KB)。
 const MAX_NODES: usize = 640;
 
-/// エラーは固定文字列だけ (candle / tokenizers のエラー文はログに出さない)。
+/// エラーは固定文字列だけ (tokenizers のエラー文はログに出さない)。
 type R<T> = Result<T, &'static str>;
 
-/// 元のエラー (candle / tokenizers / io) は捨てて、場所を表す固定文字列にする。
+/// 元のエラー (tokenizers / io) は捨てて、場所を表す固定文字列にする。
 fn fail<E>(msg: &'static str) -> impl Fn(E) -> &'static str {
     move |_| msg
 }
@@ -90,14 +90,16 @@ struct QMat {
 }
 
 impl QMat {
-    fn from_gguf(q: &candle_core::quantized::QTensor) -> R<Self> {
-        let (rows, cols) = q.shape().dims2().map_err(fail("tensor is not a matrix"))?;
+    fn from_gguf(q: &gguf::Tensor<'_>) -> R<Self> {
+        let &[rows, cols] = q.dims else {
+            return Err("tensor is not a matrix");
+        };
         if cols % 32 != 0 {
             return Err("cols not a multiple of 32");
         }
-        let data = q.data().map_err(fail("cannot read tensor data"))?;
+        let data = q.data;
         let nb = rows.checked_mul(cols).ok_or("tensor too large")? / 32;
-        if q.dtype() != GgmlDType::Q8_0 {
+        if q.dtype != gguf::Dtype::Q8_0 {
             return Err("unsupported tensor dtype");
         }
         let bsz = 34;
@@ -405,17 +407,14 @@ struct Model {
 
 impl Model {
     fn load(path: &Path) -> R<Self> {
-        let dev = Device::Cpu;
-        let mut file = std::fs::File::open(path).map_err(fail("cannot open model file"))?;
-        let content = gguf_file::Content::read(&mut file).map_err(fail("cannot parse model file"))?;
-        let file = std::cell::RefCell::new(file);
-        let get = |k: &str| content.tensor(&mut *file.borrow_mut(), k, &dev).map_err(fail("missing or unreadable tensor"));
+        let file = gguf::Gguf::read(path)?;
+        let get = |k: &str| file.tensor(k);
         let get_v = |k: &str| -> R<Vec<f32>> {
-            get(k)?
-                .dequantize(&dev)
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>())
-                .map_err(fail("unreadable vector tensor"))
+            let t = get(k)?;
+            if t.dtype != gguf::Dtype::F32 {
+                return Err("unreadable vector tensor");
+            }
+            Ok(t.data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
         };
         let ln = |p: &str, n: &str| -> R<Ln> {
             Ok(Ln { w: get_v(&format!("{p}.{n}.weight"))?, b: get_v(&format!("{p}.{n}.bias"))? })
