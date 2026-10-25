@@ -38,9 +38,22 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 
 ## Install
 
-Requires macOS 26 or later, [mise](https://mise.jdx.dev/), and Rust.
+Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
 
-Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
+Install it in one of two ways (available from v0.1.0):
+
+- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- Or download the zip from Releases with a browser, unzip it in Finder, and move `NovakeyR.app` to `~/Library/Input Methods`.
+
+Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first.
+
+### Uninstall
+
+First remove NovakeyR from Input Sources. Then, if you installed with Homebrew, run `brew uninstall --zap --cask novakey-r`. If you installed from the zip, delete `~/Library/Input Methods/NovakeyR.app`.
+
+### Build from source
+
+Needs [mise](https://mise.jdx.dev/) and Rust. Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
 
 ```sh
 mise run judge-model
@@ -48,6 +61,10 @@ mise run install
 ```
 
 This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
+
+## No network at runtime
+
+NovakeyR opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.
 
 ## Keys
 
@@ -64,7 +81,23 @@ This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then 
 
 ## Where data lives
 
-Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it.
+Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it. The key-event trace is off by default, and it never records what you type.
+
+## Releasing
+
+For maintainers. Releases are built, signed and notarized by `.github/workflows/release.yml`; nothing is published until the `release` environment is approved.
+
+1. Once, in this order (the order matters: with the variable set before the environment and its reviewer exist, a release would be published without anyone approving it):
+   1. Run `scripts/setup-release-env.sh` to create the `release` environment (one required reviewer, main only).
+   2. Add the repository secrets `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD`, `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8_BASE64`.
+   3. Set the repository variable that turns releases on: `gh variable set RELEASE_ENABLED --body true`. Until it is `true`, the workflow only reports "release disabled" and builds nothing, so merging to main is safe.
+2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs it, notarizes and staples it, and creates a draft release with `NovakeyR-<version>.app.zip` and its `.sha256`.
+3. Test the draft before approving it:
+   - Download the zip from the draft **in Safari**, so it gets the quarantine attribute. Unzip it in Finder, move `NovakeyR.app` to `~/Library/Input Methods`, log out and back in, add the input source and type.
+   - Repeat with Homebrew. The draft's URL is not public, so copy `packaging/homebrew/novakey-r.rb`, set `url "file:///<path to the downloaded zip>"` and that zip's sha256, and put the copy in a local tap (`brew tap-new --no-git <you>/local`, then its `Casks/`), because Homebrew only installs casks from a tap. Install it with `brew install --cask <you>/local/novakey-r` and check `xattr -p com.apple.quarantine ~/Library/Input\ Methods/NovakeyR.app`.
+   - If Gatekeeper blocks the IME, do not approve.
+4. Approve the `release` environment. The publish job checks the draft against the build's checksums, attests the zip and publishes the release.
+5. Run `scripts/bump-cask.sh <version> <tap>/Casks/novakey-r.rb` (it verifies the checksum and the attestation) and push the tap.
 
 ## Credits
 
@@ -77,3 +110,7 @@ Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`
 - The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
 
 Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE). Third-party notices are in [`NOTICE`](NOTICE), and the licenses of the Rust crates are in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).

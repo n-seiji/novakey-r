@@ -1,0 +1,254 @@
+name: release
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      # write is only needed to see draft releases; this job writes nothing.
+      contents: write
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide whether to release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED }}
+        run: |
+          set -eu
+          # Releases are off until a maintainer sets the RELEASE_ENABLED repository variable (see README, Releasing).
+          if [ "$RELEASE_ENABLED" != true ]; then
+            echo "release disabled (set the RELEASE_ENABLED repository variable to true)"
+            echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "releases run from main only, not $GITHUB_REF" >&2; exit 1; }
+          # Only the [package] table: dependencies also have version keys.
+          version="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"$/\1/p')"
+          [ -n "$version" ] || { echo "version not found in the [package] table of Cargo.toml" >&2; exit 1; }
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "version '$version' is not X.Y.Z" >&2; exit 1; }
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Only a real 404 means absent; any other error fails the job.
+          releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')"
+          if printf '%s\n' "$releases" | grep -Fxq -- "$tag"; then
+            echo "$tag already has a release or draft; nothing to do"
+            echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if out="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1)"; then
+            echo "$tag already has a git tag; nothing to do"
+            echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
+          elif ! printf '%s' "$out" | grep -q 'HTTP 404'; then
+            echo "could not check the tag $tag: $out" >&2; exit 1
+          fi
+          echo "$tag is new; releasing"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      # Otherwise the first `mise run` also installs cargo-about (built from source) and actionlint.
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      TAG: ${{ needs.check.outputs.tag }}
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Release must not exist yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')"
+          if printf '%s\n' "$releases" | grep -Fxq -- "$TAG"; then
+            echo "a release or draft for $TAG already exists" >&2; exit 1
+          fi
+          if out="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1)"; then
+            echo "the git tag $TAG already exists" >&2; exit 1
+          elif ! printf '%s' "$out" | grep -q 'HTTP 404'; then
+            echo "could not check the tag $TAG: $out" >&2; exit 1
+          fi
+      - name: Check signing and notarization secrets
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -eu
+          # A release is always signed and notarized; there is no ad-hoc fallback.
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ] || [ -z "$KEY_ID" ] \
+            || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8_BASE64" ]; then
+            echo "release needs DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8_BASE64" >&2
+            exit 1
+          fi
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          install_args: rust uv
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/uv
+          key: judge-model-${{ runner.os }}-${{ hashFiles('tools/gen_judge_model.py', 'tools/gen_judge_model.py.lock', 'tools/judge.sha256') }}
+      - run: scripts/check-no-network.sh
+      - run: mise run judge-model
+      - run: mise run app
+      - run: scripts/check-no-network.sh --binary
+      - run: scripts/check-version.sh "$TAG"
+      - run: scripts/stage-app.sh
+      - name: Import Developer ID certificate
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -eu
+          keychain="$RUNNER_TEMP/novakey-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          (umask 077; printf '%s' "$P12_BASE64" | base64 --decode > "$p12")
+          security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          existing="$(security list-keychains -d user | sed 's/^ *"//; s/"$//')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$keychain" $existing
+          security default-keychain -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/^ *[0-9]*) [0-9A-F]* "\(Developer ID Application: .*\)"$/\1/p' | head -n 1)"
+          [ -n "$identity" ] || { echo "no 'Developer ID Application' identity in the imported certificate" >&2; exit 1; }
+          # Keep the signer's name and Team ID out of the public logs, including the env shown for later steps.
+          team="$(printf '%s' "$identity" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
+          name="${identity#Developer ID Application: }"; name="${name% (*}"
+          echo "::add-mask::$identity"
+          [ -z "$team" ] || echo "::add-mask::$team"
+          [ -z "$name" ] || echo "::add-mask::$name"
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - run: scripts/sign-app.sh "$CODESIGN_IDENTITY"
+      - run: scripts/package-app.sh
+      - name: Notarize and staple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -eu
+          export ASC_KEY_P8="$RUNNER_TEMP/AuthKey.p8"
+          (umask 077; printf '%s' "$KEY_P8_BASE64" | base64 --decode > "$ASC_KEY_P8")
+          scripts/notarize.sh "dist/NovakeyR-${TAG#v}.app.zip"
+          xcrun stapler staple dist/NovakeyR.app
+          # Zip again so the published zip carries the stapled ticket.
+          scripts/package-app.sh
+      - name: Verify the final zip
+        run: |
+          set -eu
+          check="$RUNNER_TEMP/verify"
+          rm -rf "$check"; mkdir -p "$check"
+          ditto -x -k "dist/NovakeyR-${TAG#v}.app.zip" "$check"
+          codesign --verify --deep --strict --verbose=2 "$check/NovakeyR.app"
+          xcrun stapler validate "$check/NovakeyR.app"
+          spctl --assess --type execute --verbose=4 "$check/NovakeyR.app" > "$RUNNER_TEMP/spctl.txt" 2>&1 || true
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl.txt" \
+            || { cat "$RUNNER_TEMP/spctl.txt" >&2; echo "Gatekeeper does not accept the app as notarized Developer ID" >&2; exit 1; }
+          echo "Gatekeeper: notarized Developer ID"
+      - name: Checksums
+        id: sums
+        run: |
+          set -eu
+          # publish checks the draft against these, not against the draft's own .sha256 files.
+          { echo "sums<<EOF"; cat dist/*.app.zip.sha256; echo EOF; } >> "$GITHUB_OUTPUT"
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # The tag does not exist yet; GitHub creates it at --target when the draft is published.
+          gh release create "$TAG" dist/*.app.zip dist/*.app.zip.sha256 --draft --target "$GITHUB_SHA" --generate-notes
+      - name: Remove signing keychain and keys
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download draft release assets
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -D dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+      - name: Verify the draft is what build made
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+        run: |
+          set -eu
+          expected="$RUNNER_TEMP/expected.sha256"
+          printf '%s\n' "$SUMS" > "$expected"
+          cd dist
+          shasum -a 256 -c "$expected"
+          [ "$(printf '%s\n' *.app.zip | sort)" = "$(awk '{print $2}' "$expected" | sort)" ] \
+            || { echo "the draft's files differ from the ones build made" >&2; exit 1; }
+      - name: Tag must not exist yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -eu
+          # Checked before attesting too: the attestation goes to the public Sigstore log.
+          if out="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1)"; then
+            echo "the git tag $TAG appeared during approval; not publishing" >&2; exit 1
+          elif ! printf '%s' "$out" | grep -q 'HTTP 404'; then
+            echo "could not check the tag $TAG: $out" >&2; exit 1
+          fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.app.zip
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -eu
+          # Publishing creates the tag; refuse if someone made it while we waited for approval.
+          if out="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1)"; then
+            echo "the git tag $TAG appeared during approval; not publishing" >&2; exit 1
+          elif ! printf '%s' "$out" | grep -q 'HTTP 404'; then
+            echo "could not check the tag $TAG: $out" >&2; exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

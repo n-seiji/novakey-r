@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = "==3.12.*"
 # dependencies = [
 #   "huggingface_hub",
 #   "safetensors",
@@ -24,12 +24,20 @@ Layout of the gguf (what src/judge.rs expects):
   - everything else (wpe, biases, layer norms) stays f32
   - the causal-mask buffers (attn.bias / attn.masked_bias) are dropped
 
-Usage:  mise run judge-model        (or: uv run --script tools/gen_judge_model.py [--out DIR])
-Set HF_HUB_OFFLINE=1 to use only the local Hugging Face cache.
+Usage:  mise run judge-model        (or: uv run --locked --script tools/gen_judge_model.py [--out DIR])
+        tools/gen_judge_model.py --verify-only [--out DIR]   check the files against tools/judge.sha256
+Set HF_HUB_OFFLINE=1 to use only the local Hugging Face cache; HF_TOKEN is used if set.
+
+The files are checked against tools/judge.sha256 after they are written. The dependencies are
+locked in tools/gen_judge_model.py.lock (uv lock --script tools/gen_judge_model.py).
 """
 
 import argparse
+import hashlib
+import os
 import struct
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +51,9 @@ GGML_F32 = 0
 GGML_Q8_0 = 8
 ALIGNMENT = 32
 BLOCK = 32
+
+HASH_FILE = Path(__file__).resolve().parent / "judge.sha256"
+FETCH_ATTEMPTS = 3  # the first try plus two retries
 
 
 def quantize_q8_0(x: np.ndarray) -> bytes:
@@ -127,19 +138,59 @@ def build_tokenizer(spiece_path: str, out: Path) -> None:
             raise SystemExit(f"tokenizer mismatch on a probe string: {a} != {b}")
 
 
-def main() -> None:
+def fetch(filename: str) -> str:
+    """Download one file of REPO at REVISION, retrying twice. HF_TOKEN is used when set."""
     from huggingface_hub import hf_hub_download
 
+    token = os.environ.get("HF_TOKEN") or None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            return hf_hub_download(REPO, filename, revision=REVISION, token=token)
+        except Exception as e:  # network and hub errors vary; the last one is re-raised
+            if attempt == FETCH_ATTEMPTS:
+                raise
+            print(f"fetching {filename} failed ({type(e).__name__}); retrying", file=sys.stderr)
+            time.sleep(2 * attempt)
+    raise AssertionError("unreachable")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify(out: Path) -> None:
+    """Check <out>/<name> against each `<sha256>  judge/<name>` line of tools/judge.sha256."""
+    lines = [ln.split() for ln in HASH_FILE.read_text().splitlines() if ln.strip()]
+    if not lines:
+        raise SystemExit(f"{HASH_FILE} has no entries")
+    for expected, rel in lines:
+        name = rel.removeprefix("judge/")
+        path = out / name
+        if not path.is_file() or sha256_file(path) != expected:
+            raise SystemExit(f"judge model hash mismatch: {name}")
+    print(f"verified {out} against {HASH_FILE.name}")
+
+
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent.parent / "resources" / "judge")
+    ap.add_argument("--verify-only", action="store_true", help="only check the existing files against tools/judge.sha256")
     args = ap.parse_args()
+    if args.verify_only:
+        verify(args.out)
+        return
     args.out.mkdir(parents=True, exist_ok=True)
 
-    weights = hf_hub_download(REPO, "model.safetensors", revision=REVISION)
-    spiece = hf_hub_download(REPO, "spiece.model", revision=REVISION)
+    weights = fetch("model.safetensors")
+    spiece = fetch("spiece.model")
     build_gguf(weights, args.out / "model_q8_0.gguf")
     build_tokenizer(spiece, args.out / "tokenizer.json")
     print(f"wrote {args.out}/model_q8_0.gguf and tokenizer.json")
+    verify(args.out)
 
 
 if __name__ == "__main__":

@@ -38,9 +38,22 @@
 
 ## インストール
 
-macOS 26 以降、[mise](https://mise.jdx.dev/) と Rust が必要です。
+動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
+次のどちらかで入れます (v0.1.0 から)。
+
+- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
+
+そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。
+
+### アンインストール
+
+先に入力ソースから NovakeyR を外します。そのあと、Homebrew で入れた場合は `brew uninstall --zap --cask novakey-r` を実行します。zip から入れた場合は `~/Library/Input Methods/NovakeyR.app` を削除します。
+
+### ソースからビルド
+
+[mise](https://mise.jdx.dev/) と Rust が必要です。並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
 
 ```sh
 mise run judge-model
@@ -48,6 +61,10 @@ mise run install
 ```
 
 `~/Library/Input Methods/NovakeyR.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
+
+## 実行時にネットワークは使いません
+
+NovakeyR はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。
 
 ## キー
 
@@ -64,7 +81,23 @@ mise run install
 
 ## データの置き場所
 
-学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。
+学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
+
+## リリース手順
+
+メンテナ向けです。リリースは `.github/workflows/release.yml` がビルド・署名・公証まで行います。`release` 環境を承認するまでは何も公開されません。
+
+1. 初回のみ、次の順で行います (順序が大事です。環境と承認者を作る前に変数を設定すると、誰の承認もなくリリースが公開されてしまいます)。
+   1. `scripts/setup-release-env.sh` で `release` 環境 (承認者 1 人、main のみ) を作ります。
+   2. リポジトリのシークレット `DEVELOPER_ID_P12_BASE64`、`DEVELOPER_ID_P12_PASSWORD`、`ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_P8_BASE64` を登録します。
+   3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行い、`NovakeyR-<version>.app.zip` とその `.sha256` を載せた下書きリリースを作ります。
+3. 承認する前に下書きを試します。
+   - 下書きの zip を **Safari で** ダウンロードします (quarantine 属性を付けるため)。Finder で展開し、`NovakeyR.app` を `~/Library/Input Methods` に移し、ログインし直して入力ソースを追加し、実際に打ちます。
+   - Homebrew でも同じことをします。下書きの URL は公開されていないので、`packaging/homebrew/novakey-r.rb` をコピーして `url "file:///<ダウンロードした zip のパス>"` とその zip の sha256 に書き換え、ローカルの tap (`brew tap-new --no-git <you>/local` の `Casks/`) に置きます。Homebrew は tap にある cask しか入れないためです。`brew install --cask <you>/local/novakey-r` で入れ、`xattr -p com.apple.quarantine ~/Library/Input\ Methods/NovakeyR.app` の結果を確かめます。
+   - Gatekeeper が IME を止めるなら、承認しません。
+4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、zip の attestation を作ってリリースを公開します。
+5. `scripts/bump-cask.sh <version> <tap>/Casks/novakey-r.rb` を実行し (チェックサムと attestation を検証します)、tap を push します。
 
 ## クレジット
 
@@ -77,3 +110,7 @@ mise run install
 - ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。
+
+## ライセンス
+
+GPL-3.0-or-later です。[`LICENSE`](LICENSE) を参照してください。サードパーティの表示は [`NOTICE`](NOTICE)、Rust クレートのライセンスは [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) にあります。
