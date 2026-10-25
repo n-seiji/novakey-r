@@ -53,3 +53,24 @@ jobs:
           rm -rf "$check"; mkdir -p "$check"
           ditto -x -k dist/NovakeyR-*.app.zip "$check"
           codesign --verify --deep --strict --verbose=2 "$check/NovakeyR.app"
+      - run: scripts/build-pkg.sh -
+      - name: Verify the unsigned package
+        run: |
+          set -eu
+          pkg="$(ls dist/NovakeyR-*.pkg)"
+          (cd dist && shasum -a 256 -c "$(basename "$pkg").sha256")
+          expanded="$RUNNER_TEMP/pkg-expanded"
+          rm -rf "$expanded"
+          pkgutil --expand "$pkg" "$expanded"
+          grep -q 'enable_currentUserHome="true"' "$expanded/Distribution"
+          grep -q 'enable_localSystem="false"' "$expanded/Distribution"
+          grep -q 'relocatable="false"' "$expanded/NovakeyR.pkg/PackageInfo"
+          pkgutil --payload-files "$pkg" | grep -qx './NovakeyR.app/Contents/MacOS/novakey_r'
+      # The runner is thrown away afterwards, so installing into its home is harmless. No sudo:
+      # the package only offers the current user's home.
+      - name: Install the package into the runner's home
+        run: |
+          set -eu
+          installer -pkg dist/NovakeyR-*.pkg -target CurrentUserHomeDirectory
+          codesign --verify --deep --strict --verbose=2 "$HOME/Library/Input Methods/NovakeyR.app"
+          [ ! -e "/Library/Input Methods/NovakeyR.app" ] || { echo "the package installed system-wide" >&2; exit 1; }

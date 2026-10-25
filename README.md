@@ -40,18 +40,24 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 
 Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
 
-Install it in one of two ways:
+Download `NovakeyR-<version>.pkg` from Releases and open it. The installer puts NovakeyR in `~/Library/Input Methods` (only for you, so it does not ask for a password). The package is signed with Developer ID and notarized by Apple.
 
-- Homebrew: run `brew trust n-seiji/tap` once (Homebrew only loads casks from third-party taps you trust), then `brew install --cask n-seiji/tap/novakey-r`
-- Or download the zip from Releases with a browser, unzip it in Finder, and move `NovakeyR.app` to `~/Library/Input Methods`.
+The first time, add NovakeyR in System Settings > Keyboard > Input Sources. If it is not listed yet, log out and back in first.
 
-Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first.
+### Update
 
-After `brew upgrade --cask novakey-r`, macOS drops NovakeyR from Input Sources, so add it again. Homebrew replaces the whole bundle, and an in-place update is blocked by macOS's App Management protection.
+Open the newer `.pkg`. It installs over the old version, and NovakeyR stays in Input Sources. Do not delete the old app first: deleting it drops NovakeyR from Input Sources, and you would have to add it again.
 
 ### Uninstall
 
-First remove NovakeyR from Input Sources. Then, if you installed with Homebrew, run `brew uninstall --zap --cask novakey-r`. If you installed from the zip, delete `~/Library/Input Methods/NovakeyR.app`.
+1. Remove NovakeyR from Input Sources.
+2. Delete `~/Library/Input Methods/NovakeyR.app`.
+3. Remove the install receipt: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (the receipt is in your home, so plain `pkgutil --forget` without `--volume ~` does not find it).
+4. To also erase what NovakeyR learned and its settings, delete `~/Library/Application Support/NovakeyR`, `~/Library/Logs/NovakeyR` and `~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist`.
+
+### Moving from the Homebrew cask
+
+NovakeyR 0.1.2 and earlier were also on Homebrew (`n-seiji/tap/novakey-r`). If you installed it that way, run `brew uninstall --cask novakey-r` (without `--zap`, so what NovakeyR learned stays), then install the `.pkg` and add NovakeyR to Input Sources again. This is needed once: uninstalling deletes the app, and otherwise Homebrew would keep managing the app the `.pkg` replaced.
 
 ### Build from source
 
@@ -95,10 +101,12 @@ For maintainers. Releases are built, signed and notarized by `.github/workflows/
 
 1. Once, in this order (the order matters: with the variable set before the environment and its reviewer exist, a release would be published without anyone approving it):
    1. Run `scripts/setup-release-env.sh`. It creates both environments, `signing` (holds the secrets, main only) and `release` (one required reviewer, main only).
-   2. Set the five secrets in the `signing` environment (`gh` prompts for the value of the ones without stdin):
+   2. Set the seven secrets in the `signing` environment (`gh` prompts for the value of the ones without stdin). `cert.p12` holds the Developer ID Application certificate (signs the app) and `installer.p12` the Developer ID Installer certificate (signs the package), each with its private key:
       ```sh
       base64 -i cert.p12 | gh secret set DEVELOPER_ID_P12_BASE64 --env signing
       gh secret set DEVELOPER_ID_P12_PASSWORD --env signing
+      base64 -i installer.p12 | gh secret set DEVELOPER_ID_INSTALLER_P12_BASE64 --env signing
+      gh secret set DEVELOPER_ID_INSTALLER_P12_PASSWORD --env signing
       gh secret set ASC_KEY_ID --env signing
       gh secret set ASC_ISSUER_ID --env signing
       base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set ASC_KEY_P8_BASE64 --env signing
@@ -106,13 +114,12 @@ For maintainers. Releases are built, signed and notarized by `.github/workflows/
    3. Set the repository variable that turns releases on: `gh variable set RELEASE_ENABLED --body true`. Until it is `true`, the workflow only reports "release disabled" and builds nothing, so merging to main is safe.
 
    The secrets are scoped to the `signing` environment, which only jobs running on main can use, so workflows on other branches cannot read them. Use a dedicated App Store Connect API key for this repository, with the Developer role, for notarization.
-2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs it, notarizes and staples it, and creates a draft release with `NovakeyR-<version>.app.zip` and its `.sha256`.
+2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs, notarizes and staples it, and zips it. It then builds `NovakeyR-<version>.pkg` from the stapled app (`scripts/build-pkg.sh`), signs the package with the Developer ID Installer identity, notarizes and staples the package, and checks it with `spctl --assess --type install`. Finally it creates a draft release with the `.pkg`, the `.app.zip` (secondary) and their `.sha256` files.
 3. Test the draft before approving it:
-   - Download the zip from the draft **in Safari**, so it gets the quarantine attribute. Unzip it in Finder, move `NovakeyR.app` to `~/Library/Input Methods`, log out and back in, add the input source and type.
-   - Repeat with Homebrew. The draft's URL is not public, so copy `packaging/homebrew/novakey-r.rb`, set `url "file:///<path to the downloaded zip>"` and that zip's sha256, and put the copy in a local tap (`brew tap-new --no-git <you>/local`, then its `Casks/`), because Homebrew only installs casks from a tap. Install it with `brew install --cask <you>/local/novakey-r` and check `xattr -p com.apple.quarantine ~/Library/Input\ Methods/NovakeyR.app`.
-   - If Gatekeeper blocks the IME, do not approve.
-4. Approve the `release` environment. The publish job checks the draft against the build's checksums, attests the zip and publishes the release.
-5. Run `scripts/bump-cask.sh <version> <tap>/Casks/novakey-r.rb` (it verifies the checksum and the attestation) and push the tap.
+   - Download the `.pkg` from the draft **in Safari**, so it gets the quarantine attribute. Open it, check that the installer does not ask for a password, log out and back in, add the input source and type.
+   - Open the same `.pkg` again over the installed one and check that NovakeyR is still in Input Sources.
+   - If Gatekeeper blocks the package or the IME, do not approve.
+4. Approve the `release` environment. The publish job checks the draft against the build's checksums, attests the `.pkg` and the zip and publishes the release.
 
 ## Credits
 

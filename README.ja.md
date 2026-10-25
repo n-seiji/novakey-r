@@ -40,18 +40,24 @@
 
 動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-次のどちらかで入れます。
+Releases から `NovakeyR-<version>.pkg` をダウンロードして開きます。インストーラが NovakeyR を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
 
-- Homebrew: 最初に一度 `brew trust n-seiji/tap` を実行します (Homebrew は信頼した公式以外の tap の cask しか読み込みません)。そのあと `brew install --cask n-seiji/tap/novakey-r` を実行します
-- または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
+初回は、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。まだ一覧に出ないときは、先にログインし直します。
 
-そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。
+### 更新
 
-`brew upgrade --cask novakey-r` で更新すると、macOS が入力ソースから NovakeyR を外すので、もう一度追加してください。Homebrew はアプリを丸ごと置き直しますが、中身だけの入れ替えは macOS の App 管理の保護で止められるためです。
+新しい `.pkg` を開きます。古い版の上に入るので、NovakeyR は入力ソースに残ります。先に古いアプリを削除しないでください。削除すると入力ソースから NovakeyR が外れ、追加し直すことになります。
 
 ### アンインストール
 
-先に入力ソースから NovakeyR を外します。そのあと、Homebrew で入れた場合は `brew uninstall --zap --cask novakey-r` を実行します。zip から入れた場合は `~/Library/Input Methods/NovakeyR.app` を削除します。
+1. 入力ソースから NovakeyR を外します。
+2. `~/Library/Input Methods/NovakeyR.app` を削除します。
+3. インストールの記録を消します: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (記録はホームにあるので、`--volume ~` を付けない `pkgutil --forget` では見つかりません)。
+4. 学習した内容と設定も消すときは、`~/Library/Application Support/NovakeyR`、`~/Library/Logs/NovakeyR`、`~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist` を削除します。
+
+### Homebrew の cask から移る
+
+NovakeyR 0.1.2 までは Homebrew (`n-seiji/tap/novakey-r`) でも配っていました。その方法で入れた場合は、`brew uninstall --cask novakey-r` を実行します (`--zap` は付けないので、学習した内容は残ります)。そのあと `.pkg` を入れ、入力ソースに NovakeyR を追加し直します。これは 1 度だけ必要です。アンインストールでアプリが消えるためと、そうしないと `.pkg` が置き換えたアプリを Homebrew が管理し続けるためです。
 
 ### ソースからビルド
 
@@ -95,10 +101,12 @@ NovakeyR はネットワーク接続を開きません。`scripts/check-no-netwo
 
 1. 初回のみ、次の順で行います (順序が大事です。環境と承認者を作る前に変数を設定すると、誰の承認もなくリリースが公開されてしまいます)。
    1. `scripts/setup-release-env.sh` を実行します。`signing` 環境 (シークレットを置く、main のみ) と `release` 環境 (承認者 1 人、main のみ) の両方を作ります。
-   2. 5 つのシークレットを `signing` 環境に登録します (標準入力を使わないものは `gh` が値を尋ねます)。
+   2. 7 つのシークレットを `signing` 環境に登録します (標準入力を使わないものは `gh` が値を尋ねます)。`cert.p12` は Developer ID Application 証明書 (アプリの署名)、`installer.p12` は Developer ID Installer 証明書 (パッケージの署名) で、どちらも秘密鍵を含めます。
       ```sh
       base64 -i cert.p12 | gh secret set DEVELOPER_ID_P12_BASE64 --env signing
       gh secret set DEVELOPER_ID_P12_PASSWORD --env signing
+      base64 -i installer.p12 | gh secret set DEVELOPER_ID_INSTALLER_P12_BASE64 --env signing
+      gh secret set DEVELOPER_ID_INSTALLER_P12_PASSWORD --env signing
       gh secret set ASC_KEY_ID --env signing
       gh secret set ASC_ISSUER_ID --env signing
       base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set ASC_KEY_P8_BASE64 --env signing
@@ -106,13 +114,12 @@ NovakeyR はネットワーク接続を開きません。`scripts/check-no-netwo
    3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
 
    シークレットは `signing` 環境に紐づき、この環境を使えるのは main で動くジョブだけなので、他のブランチのワークフローからは読めません。公証には、このリポジトリ専用の App Store Connect API キー (Developer ロール) を使ってください。
-2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行い、`NovakeyR-<version>.app.zip` とその `.sha256` を載せた下書きリリースを作ります。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `NovakeyR-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
 3. 承認する前に下書きを試します。
-   - 下書きの zip を **Safari で** ダウンロードします (quarantine 属性を付けるため)。Finder で展開し、`NovakeyR.app` を `~/Library/Input Methods` に移し、ログインし直して入力ソースを追加し、実際に打ちます。
-   - Homebrew でも同じことをします。下書きの URL は公開されていないので、`packaging/homebrew/novakey-r.rb` をコピーして `url "file:///<ダウンロードした zip のパス>"` とその zip の sha256 に書き換え、ローカルの tap (`brew tap-new --no-git <you>/local` の `Casks/`) に置きます。Homebrew は tap にある cask しか入れないためです。`brew install --cask <you>/local/novakey-r` で入れ、`xattr -p com.apple.quarantine ~/Library/Input\ Methods/NovakeyR.app` の結果を確かめます。
-   - Gatekeeper が IME を止めるなら、承認しません。
-4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、zip の attestation を作ってリリースを公開します。
-5. `scripts/bump-cask.sh <version> <tap>/Casks/novakey-r.rb` を実行し (チェックサムと attestation を検証します)、tap を push します。
+   - 下書きの `.pkg` を **Safari で** ダウンロードします (quarantine 属性を付けるため)。開いてパスワードを求められないことを確かめ、ログインし直して入力ソースを追加し、実際に打ちます。
+   - 同じ `.pkg` をもう一度、入っている版の上から開き、NovakeyR が入力ソースに残っていることを確かめます。
+   - Gatekeeper がパッケージか IME を止めるなら、承認しません。
+4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、`.pkg` と zip の attestation を作ってリリースを公開します。
 
 ## クレジット
 

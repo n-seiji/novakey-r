@@ -98,15 +98,18 @@ jobs:
         env:
           P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
           KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
         run: |
           set -eu
           # A release is always signed and notarized; there is no ad-hoc fallback.
-          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ] || [ -z "$KEY_ID" ] \
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ] \
+            || [ -z "$INSTALLER_P12_BASE64" ] || [ -z "$INSTALLER_P12_PASSWORD" ] || [ -z "$KEY_ID" ] \
             || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8_BASE64" ]; then
-            echo "release needs DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8_BASE64 as secrets of the signing environment (gh secret set NAME --env signing)" >&2
+            echo "release needs DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, DEVELOPER_ID_INSTALLER_P12_BASE64, DEVELOPER_ID_INSTALLER_P12_PASSWORD, ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8_BASE64 as secrets of the signing environment (gh secret set NAME --env signing)" >&2
             exit 1
           fi
       - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
@@ -124,10 +127,12 @@ jobs:
       - run: scripts/check-no-network.sh --binary
       - run: scripts/check-version.sh "$TAG"
       - run: scripts/stage-app.sh
-      - name: Import Developer ID certificate
+      - name: Import Developer ID certificates
         env:
           P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
         run: |
           set -eu
           keychain="$RUNNER_TEMP/novakey-signing.keychain-db"
@@ -141,6 +146,10 @@ jobs:
           (umask 077; printf '%s' "$P12_BASE64" | base64 --decode > "$p12")
           security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           rm -f "$p12"
+          installer_p12="$RUNNER_TEMP/developer-id-installer.p12"
+          (umask 077; printf '%s' "$INSTALLER_P12_BASE64" | base64 --decode > "$installer_p12")
+          security import "$installer_p12" -k "$keychain" -P "$INSTALLER_P12_PASSWORD" -T /usr/bin/productsign -T /usr/bin/productbuild -T /usr/bin/security
+          rm -f "$installer_p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
           existing="$(security list-keychains -d user | sed 's/^ *"//; s/"$//')"
           # shellcheck disable=SC2086
@@ -155,6 +164,15 @@ jobs:
           [ -z "$team" ] || echo "::add-mask::$team"
           [ -z "$name" ] || echo "::add-mask::$name"
           echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          # Installer identities are not code signing identities: list them with -p basic.
+          installer="$(security find-identity -v -p basic "$keychain" | sed -n 's/^ *[0-9]*) [0-9A-F]* "\(Developer ID Installer: .*\)"$/\1/p' | head -n 1)"
+          [ -n "$installer" ] || { echo "no 'Developer ID Installer' identity in the imported certificates" >&2; exit 1; }
+          installer_team="$(printf '%s' "$installer" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
+          installer_name="${installer#Developer ID Installer: }"; installer_name="${installer_name% (*}"
+          echo "::add-mask::$installer"
+          [ -z "$installer_team" ] || echo "::add-mask::$installer_team"
+          [ -z "$installer_name" ] || echo "::add-mask::$installer_name"
+          echo "INSTALLER_IDENTITY=$installer" >> "$GITHUB_ENV"
       - run: scripts/sign-app.sh "$CODESIGN_IDENTITY"
       - run: scripts/package-app.sh
       - name: Notarize and staple
@@ -182,24 +200,50 @@ jobs:
           grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl.txt" \
             || { cat "$RUNNER_TEMP/spctl.txt" >&2; echo "Gatekeeper does not accept the app as notarized Developer ID" >&2; exit 1; }
           echo "Gatekeeper: notarized Developer ID"
+      # Built from the stapled app, so the app inside the package carries its ticket too.
+      - run: scripts/build-pkg.sh "$INSTALLER_IDENTITY"
+      - name: Notarize and staple the package
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -eu
+          pkg="dist/NovakeyR-${TAG#v}.pkg"
+          export ASC_KEY_P8="$RUNNER_TEMP/AuthKey.p8"
+          (umask 077; printf '%s' "$KEY_P8_BASE64" | base64 --decode > "$ASC_KEY_P8")
+          scripts/notarize.sh "$pkg"
+          xcrun stapler staple "$pkg"
+          # Stapling rewrites the package, so the checksum is taken again.
+          (cd dist && shasum -a 256 "NovakeyR-${TAG#v}.pkg" > "NovakeyR-${TAG#v}.pkg.sha256")
+      - name: Verify the final package
+        run: |
+          set -eu
+          pkg="dist/NovakeyR-${TAG#v}.pkg"
+          pkgutil --check-signature "$pkg" > /dev/null
+          xcrun stapler validate "$pkg"
+          spctl --assess --type install -vv "$pkg" > "$RUNNER_TEMP/spctl-pkg.txt" 2>&1 || true
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl-pkg.txt" \
+            || { cat "$RUNNER_TEMP/spctl-pkg.txt" >&2; echo "Gatekeeper does not accept the package as notarized Developer ID" >&2; exit 1; }
+          echo "Gatekeeper: package is notarized Developer ID"
       - name: Checksums
         id: sums
         run: |
           set -eu
           # publish checks the draft against these, not against the draft's own .sha256 files.
-          { echo "sums<<EOF"; cat dist/*.app.zip.sha256; echo EOF; } >> "$GITHUB_OUTPUT"
+          { echo "sums<<EOF"; cat dist/*.pkg.sha256 dist/*.app.zip.sha256; echo EOF; } >> "$GITHUB_OUTPUT"
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           # The tag does not exist yet; GitHub creates it at --target when the draft is published.
-          gh release create "$TAG" dist/*.app.zip dist/*.app.zip.sha256 --draft --target "$GITHUB_SHA" --generate-notes
+          gh release create "$TAG" dist/*.pkg dist/*.pkg.sha256 dist/*.app.zip dist/*.app.zip.sha256 --draft --target "$GITHUB_SHA" --generate-notes
       - name: Remove signing keychain and keys
         if: always()
         run: |
           if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
-          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/developer-id-installer.p12" "$RUNNER_TEMP/AuthKey.p8"
 
   publish:
     needs: [check, build]
@@ -224,7 +268,7 @@ jobs:
           printf '%s\n' "$SUMS" > "$expected"
           cd dist
           shasum -a 256 -c "$expected"
-          [ "$(printf '%s\n' *.app.zip | sort)" = "$(awk '{print $2}' "$expected" | sort)" ] \
+          [ "$(printf '%s\n' *.pkg *.app.zip | sort)" = "$(awk '{print $2}' "$expected" | sort)" ] \
             || { echo "the draft's files differ from the ones build made" >&2; exit 1; }
       - name: Tag must not exist yet
         env:
@@ -240,7 +284,9 @@ jobs:
           fi
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.app.zip
+          subject-path: |
+            dist/*.pkg
+            dist/*.app.zip
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
