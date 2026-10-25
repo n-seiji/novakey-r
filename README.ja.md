@@ -38,9 +38,24 @@
 
 ## インストール
 
-macOS 26 以降、[mise](https://mise.jdx.dev/) と Rust が必要です。
+動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
+近日公開: 最初の署名付きリリースを準備中です。
+
+公開後は次のどちらかで入れます。
+
+- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
+
+そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。
+
+### アンインストール
+
+先に入力ソースから NovakeyR を外し、そのあと `brew uninstall --zap --cask novakey-r` を実行します。
+
+### ソースからビルド
+
+[mise](https://mise.jdx.dev/) と Rust が必要です。並べ替えにはモデルファイルが必要で、リポジトリには入っていません。先に 1 度だけ作ります (Hugging Face から約 41 MB をダウンロード。[uv](https://docs.astral.sh/uv/) は mise が入れます)。作らなくても動き、そのときは変換エンジン本来の順です。
 
 ```sh
 mise run judge-model
@@ -48,6 +63,10 @@ mise run install
 ```
 
 `~/Library/Input Methods/NovakeyR.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
+
+## 実行時にネットワークは使いません
+
+NovakeyR はネットワーク接続を開きません。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読めば、自分で確かめられます。
 
 ## キー
 
@@ -64,7 +83,7 @@ mise run install
 
 ## データの置き場所
 
-学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。
+学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
 
 ## クレジット
 
@@ -77,3 +96,7 @@ mise run install
 - ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。
+
+## ライセンス
+
+GPL-3.0-or-later です。[`LICENSE`](LICENSE) を参照してください。サードパーティの表示は [`NOTICE`](NOTICE)、Rust クレートのライセンスは [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) にあります。

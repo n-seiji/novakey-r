@@ -38,9 +38,24 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 
 ## Install
 
-Requires macOS 26 or later, [mise](https://mise.jdx.dev/), and Rust.
+Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
 
-Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
+Coming soon: the first signed release is in preparation.
+
+Once it is out, install it in one of two ways:
+
+- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- Or download the zip from Releases with a browser, unzip it in Finder, and move `NovakeyR.app` to `~/Library/Input Methods`.
+
+Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first.
+
+### Uninstall
+
+First remove NovakeyR from Input Sources, then run `brew uninstall --zap --cask novakey-r`.
+
+### Build from source
+
+Needs [mise](https://mise.jdx.dev/) and Rust. Re-ranking needs model files, which are not in the repository. Build them once (downloads about 41 MB from Hugging Face; [uv](https://docs.astral.sh/uv/) is installed by mise), then install. You can skip the first step and get the engine's own order.
 
 ```sh
 mise run judge-model
@@ -48,6 +63,10 @@ mise run install
 ```
 
 This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
+
+## No network at runtime
+
+NovakeyR opens no network connections. You can check this yourself: read the sources, and look at `Cargo.lock` for the crates it links.
 
 ## Keys
 
@@ -64,7 +83,7 @@ This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then 
 
 ## Where data lives
 
-Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it.
+Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`learning.tsv` and `english.txt`). Run `mise run reset-memory` to erase it. The key-event trace is off by default, and it never records what you type.
 
 ## Credits
 
@@ -77,3 +96,7 @@ Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`
 - The wordmark is outlined from [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1).
 
 Full license texts are in [`NOTICE`](NOTICE) and [`dictionary/NOTICE`](dictionary/NOTICE).
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE). Third-party notices are in [`NOTICE`](NOTICE), and the licenses of the Rust crates are in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).

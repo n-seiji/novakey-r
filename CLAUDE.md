@@ -11,7 +11,7 @@ NovakeyR is a macOS Input Method Engine (IME) written entirely in Rust (no Swift
 Tasks are defined in `mise.toml`.
 
 ### Building and Packaging
-- `mise run app` - Build the release binary and package `output/NovakeyR.app` (copies `Info.plist`, `resources/` including `resources/judge/` if present, `dictionary/`, `NOTICE`)
+- `mise run app` - Build the release binary and package `output/NovakeyR.app` (copies `Info.plist`, `resources/` including `resources/judge/` if present, `dictionary/`, `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES`)
 - `mise run judge-model` - Download rinna/japanese-gpt2-xsmall (MIT, pinned revision) from Hugging Face and write `resources/judge/model_q8_0.gguf` + `tokenizer.json` with `tools/gen_judge_model.py` (uv script; set `HF_HUB_OFFLINE=1` to use only the local HF cache). The files are 41MB, gitignored and never committed. Run it before `mise run app`; without them the app still works on the engine's order and logs `judge: not configured` once
 - `cargo build --release` - Build the Rust binary only (must stay free of warnings)
 - `mise run install` / `mise run uninstall` - Copy to / remove from `~/Library/Input Methods`
@@ -57,7 +57,7 @@ If the dictionary cannot be opened, the failure is logged once (NSLog), reopenin
 
 ### Dependencies
 - `objc2`, `objc2-foundation` - Objective-C runtime bindings
-- `libc`, `rand`, `once_cell`, `regex`, `unicode-segmentation`, `unicode-normalization`, `serde_json`
+- `regex`, `unicode-segmentation`, `unicode-normalization`, `serde_json`
 - `candle-core` (GGUF reader only; the matmuls call Accelerate directly from `platform.rs`), `tokenizers` (pure-Rust `fancy-regex` backend, no Oniguruma C library), `rayon` - the on-device judge
 
 ## Claude Code Configuration

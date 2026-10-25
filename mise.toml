@@ -1,6 +1,7 @@
 [tools]
 rust = "1.99.1"
 uv = "latest"
+"cargo:cargo-about" = { version = "0.9.2", features = "cli" }
 
 [tasks.build]
 description = "Build the release binary"
@@ -63,8 +64,12 @@ cp Info.plist output/NovakeyR.app/Contents/
 cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
 cp -R resources/. output/NovakeyR.app/Contents/Resources/
 cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
-cp NOTICE output/NovakeyR.app/Contents/Resources/NOTICE
+cp LICENSE NOTICE THIRD_PARTY_LICENSES output/NovakeyR.app/Contents/Resources/
 """
+
+[tasks.licenses]
+description = "Regenerate THIRD_PARTY_LICENSES (Rust crate licenses) with cargo-about"
+run = "cargo about generate about.hbs -o THIRD_PARTY_LICENSES"
 
 [tasks.judge-model]
 description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く。mise run app が .app に入れる"

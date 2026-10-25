@@ -48,13 +48,10 @@ bundles them. The MIT License text is the one above, with:
 
     Copyright (c) rinna Co., Ltd.
 
-Rust crates for the judge
--------------------------
-The judge links candle-core (MIT or Apache-2.0, Hugging Face), tokenizers
-(Apache-2.0, Hugging Face; regex backend fancy-regex, MIT) and rayon (MIT or
-Apache-2.0), plus their dependencies, each under its own permissive license.
-See each crate's repository, or `cargo tree` and the crate sources, for the
-full texts. Two licenses that have no "or MIT" alternative are reproduced here.
+Rust crates with licenses reproduced here
+-----------------------------------------
+Two licenses that have no "or MIT" alternative are also reproduced here; the
+rest are in THIRD_PARTY_LICENSES.
 
 foldhash 0.2.0 (Zlib), pulled in through candle-core / safetensors / hashbrown:
 
@@ -128,8 +125,67 @@ through candle-core:
     Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
     ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 
-Other data
-----------
-See the "クレジット" section of README.md for the loanword table (JMdict,
-CC BY-SA 4.0), the emoji table (Unicode License v3) and the romaji table (Mozc,
-BSD 3-Clause).
+Mozc (romaji table)
+-------------------
+The romaji-to-kana table (src/romaji_table.tsv) is Mozc's
+src/data/preedit/romanji-hiragana.tsv (https://github.com/google/mozc),
+distributed under the BSD 3-Clause License:
+
+    Copyright 2010-2018, Google Inc.
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+      * Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+      * Redistributions in binary form must reproduce the above
+        copyright notice, this list of conditions and the following disclaimer
+        in the documentation and/or other materials provided with the
+        distribution.
+      * Neither the name of Google Inc. nor the names of its
+        contributors may be used to endorse or promote products derived from
+        this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+JMdict (EDRDG)
+--------------
+The English words for katakana loanwords (resources/loanwords.tsv) are built
+from the JMdict dictionary file, which is the property of the Electronic
+Dictionary Research and Development Group (EDRDG) and is used in conformance
+with the Group's licence (https://www.edrdg.org/edrdg/licence.html). JMdict is
+licensed under the Creative Commons Attribution-ShareAlike 4.0 International
+License (CC BY-SA 4.0), https://creativecommons.org/licenses/by-sa/4.0/. The
+data has been modified: only the katakana headwords and their English
+glosses were extracted and normalized by tools/gen_loanwords.py. The resulting
+resources/loanwords.tsv is distributed under the same CC BY-SA 4.0 license.
+Source: https://www.edrdg.org/jmdict/j_jmdict.html
+
+Unicode emoji data and CLDR annotations
+---------------------------------------
+The emoji table (resources/emoji.tsv) is built by tools/gen_emoji.py from
+Unicode, Inc.'s emoji data and the CLDR Japanese annotations, through
+azooKey_emoji_dictionary_storage
+(https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage). It is
+distributed under the Unicode License v3 (https://www.unicode.org/license.txt),
+whose text is reproduced above in the Unicode-3.0 section.
+
+Copyright © Unicode, Inc. All rights reserved.
+
+Rust crates
+-----------
+The licenses of every Rust crate linked into NovakeyR (candle-core, tokenizers,
+rayon, regex and the rest of the dependency tree) are in the file
+THIRD_PARTY_LICENSES, shipped next to this file.
