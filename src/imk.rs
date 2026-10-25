@@ -193,8 +193,8 @@ declare_class!(
             self.guard_session(|| platform::build_menu(&[]), || {
                 self.ivars().controller.sync_conversion_mode();
                 let mode_title = match self.ivars().controller.mode() {
-                    ConversionMode::Live => "ライブ変換: オン",
-                    ConversionMode::Space => "ライブ変換: オフ(スペースで変換)",
+                    ConversionMode::Live => "ライブ変換をオフにする",
+                    ConversionMode::Space => "ライブ変換をオンにする",
                 };
                 platform::build_menu(&[(mode_title, sel!(toggleConversionMode:))])
             })
