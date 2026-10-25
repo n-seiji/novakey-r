@@ -16,7 +16,7 @@ use std::time::Instant;
 use candle_core::quantized::{gguf_file, GgmlDType};
 use candle_core::Device;
 use rayon::prelude::*;
-use tokenizers::Tokenizer;
+use crate::tokenizer::Tokenizer;
 
 const NL: usize = 6;
 const NH: usize = 8;
@@ -795,7 +795,7 @@ impl Judge {
             .start_handler(|_| crate::platform::set_qos_user_interactive())
             .build_global();
         let model = Model::load(&dir.join("model_q8_0.gguf"))?;
-        let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(fail("cannot load tokenizer"))?;
+        let tok = Tokenizer::from_file(&dir.join("tokenizer.json"))?;
         let judge = Self { model, tok };
         // 遅延初期化 (Accelerate・スレッドプール) を読み込みの時間に含める。
         judge.model.score(&[vec![100], vec![100, 101]])?;
@@ -804,8 +804,7 @@ impl Judge {
     }
 
     fn sequence(&self, text: &str) -> R<Vec<u32>> {
-        let enc = self.tok.encode(text.to_lowercase(), false).map_err(fail("cannot tokenize"))?;
-        Ok(enc.get_ids().to_vec())
+        Ok(self.tok.encode(&text.to_lowercase()))
     }
 
     /// 各文の対数尤度 (BOS から EOS まで) と、今回新しく計算したトークン数。

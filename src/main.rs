@@ -20,6 +20,7 @@ mod romaji_converter;
 mod session;
 mod simulate;
 mod symbols;
+mod tokenizer;
 mod trace;
 mod translit;
 

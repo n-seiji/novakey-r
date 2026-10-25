@@ -186,6 +186,6 @@ Copyright © Unicode, Inc. All rights reserved.
 
 Rust crates
 -----------
-The licenses of every Rust crate linked into NovakeyR (candle-core, tokenizers,
+The licenses of every Rust crate linked into NovakeyR (candle-core,
 rayon, regex and the rest of the dependency tree) are in the file
 THIRD_PARTY_LICENSES, shipped next to this file.

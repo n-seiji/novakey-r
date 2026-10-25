@@ -19,7 +19,6 @@ unicode-normalization = "0.1"
 serde_json = "1.0.149"
 # 端末内 LM の審判 (全文候補の並べ替え)
 candle-core = "0.9"
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 
 # C-unwind のフレームを ObjC 例外が通るため、panic を abort にしない
