@@ -37,6 +37,9 @@ pub trait Environment {
     /// ライブ変換が有効か。アプリ全体で 1 つの設定 (全コントローラが共有し、再起動後も残る)。
     fn live_conversion(&self) -> bool;
     fn set_live_conversion(&self, enabled: bool);
+    /// 入力中 (Phase が Empty 以外) かどうか。変わりうる操作のあとに、現在の値で呼ぶ (何度呼んでもよい)。
+    /// 本番は App Nap を止める活動の開始 / 終了に使う。
+    fn set_composing(&self, _composing: bool) {}
     fn log(&self, line: &str);
     /// 名前と数値だけを渡すこと。
     fn trace(&self, entry: &str, fields: &str);
@@ -126,6 +129,20 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
 
     /// キー 1 打。処理したら true (false ならホストアプリへ素通しする)。
     pub fn on_key(&self, route: Route, client: C) -> bool {
+        let handled = self.on_key_inner(route, client);
+        self.sync_activity();
+        handled
+    }
+
+    /// 入力中かどうかを環境へ伝える (Empty に戻ったら終わらせる)。
+    fn sync_activity(&self) {
+        // panic の後始末 (reset_after_panic) からも呼ぶので、借用中なら (状態が分からないので) 触らない。
+        if let Ok(session) = self.session.try_borrow() {
+            self.env.set_composing(session.phase() != Phase::Empty);
+        }
+    }
+
+    fn on_key_inner(&self, route: Route, client: C) -> bool {
         if route != Route::PassThrough {
             *self.last_client.borrow_mut() = Some(client.clone());
             self.sync_conversion_mode();
@@ -159,6 +176,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             self.panel_line.set(selected);
         }
         self.run(effects, Some(&client));
+        self.sync_activity();
     }
 
     /// パネルで候補が選ばれた。
@@ -168,12 +186,14 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         let gates = self.gates(Some(&client));
         let effects = self.session.borrow_mut().commit_selected(&gates, text);
         self.run(effects, Some(&client));
+        self.sync_activity();
     }
 
     pub fn on_commit_composition(&self, client: Option<C>) {
         let gates = self.gates(client.as_ref());
         let effects = self.session.borrow_mut().commit_composition(&gates);
         self.run(effects, client.as_ref());
+        self.sync_activity();
     }
 
     /// 全体の設定を反転して保存し、このコントローラにも反映する。ほかのコントローラは次のキーかメニューで追従する。
@@ -193,6 +213,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         if let Some(client) = self.client() {
             self.run(effects, Some(&client));
         }
+        self.sync_activity();
     }
 
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
@@ -296,6 +317,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment> Controller<C, P, 
         if let Some(client) = self.client() {
             client.set_marked("");
         }
+        self.sync_activity();
     }
 }
 
@@ -332,6 +354,25 @@ mod tests {
         type_letters(&f, "a");
         assert_eq!(f.1.marked(), "あ");
         assert_eq!(f.1.committed(), "");
+    }
+
+    #[test]
+    fn 入力中だけ活動を持ち_確定でもキャンセルでも空に戻ったら手放す() {
+        let f = fixture();
+        let last = |f: &Fixture| f.0.env.last_composing();
+        assert_eq!(last(&f), None);
+        type_letters(&f, "a");
+        assert_eq!(last(&f), Some(true));
+        assert!(press(&f, Key::Enter, "\r"));
+        assert_eq!(last(&f), Some(false), "確定");
+        type_letters(&f, "a");
+        assert_eq!(last(&f), Some(true));
+        f.0.on_commit_composition(Some(f.1.clone()));
+        assert_eq!(last(&f), Some(false), "commitComposition (非アクティブ化)");
+        type_letters(&f, "a");
+        assert!(press(&f, Key::Escape, "\u{1b}"));
+        assert_eq!(f.0.phase(), Phase::Empty);
+        assert_eq!(last(&f), Some(false), "キャンセル");
     }
 
     #[test]

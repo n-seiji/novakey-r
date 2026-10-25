@@ -47,7 +47,11 @@ impl CandidatePanel for PlatformPanel {
     }
 }
 
-struct PlatformEnv;
+/// 入力中 (Phase が Empty 以外) の間だけ App Nap を止める活動を持つ。コントローラと一緒に解放される。
+#[derive(Default)]
+struct PlatformEnv {
+    activity: platform::Activity,
+}
 
 impl Environment for PlatformEnv {
     fn live_conversion(&self) -> bool {
@@ -60,6 +64,14 @@ impl Environment for PlatformEnv {
 
     fn secure_input(&self) -> bool {
         platform::is_secure_input_enabled()
+    }
+
+    fn set_composing(&self, composing: bool) {
+        if composing {
+            self.activity.begin();
+        } else {
+            self.activity.end();
+        }
     }
 
     fn log(&self, line: &str) {
@@ -101,9 +113,9 @@ declare_class!(
                 let this = this.set_ivars(Ivars {
                     controller: Controller::new(
                         controller_id,
-                        new_session(if PlatformEnv.live_conversion() { ConversionMode::Live } else { ConversionMode::Space }),
+                        new_session(if PlatformEnv::default().live_conversion() { ConversionMode::Live } else { ConversionMode::Space }),
                         PlatformPanel,
-                        PlatformEnv,
+                        PlatformEnv::default(),
                     ),
                 });
                 // SAFETY: 親クラスの指定イニシャライザに、IMK から受け取った引数をそのまま渡す。

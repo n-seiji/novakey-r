@@ -227,6 +227,15 @@ pub(crate) struct FakeEnv(Rc<RefCell<EnvState>>);
 pub(crate) struct EnvState {
     /// ライブ変換の全体設定。ユーザー defaults の代わり (既定は Space = false)。
     pub live: bool,
+    /// `set_composing` に渡された値の履歴。
+    pub composing: Vec<bool>,
+}
+
+impl FakeEnv {
+    #[cfg(test)]
+    pub(crate) fn last_composing(&self) -> Option<bool> {
+        self.0.borrow().composing.last().copied()
+    }
 }
 
 impl Environment for FakeEnv {
@@ -240,6 +249,10 @@ impl Environment for FakeEnv {
 
     fn set_live_conversion(&self, enabled: bool) {
         self.0.borrow_mut().live = enabled;
+    }
+
+    fn set_composing(&self, composing: bool) {
+        self.0.borrow_mut().composing.push(composing);
     }
 
     fn log(&self, _line: &str) {}
