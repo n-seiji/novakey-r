@@ -107,6 +107,18 @@ rsync -a --delete output/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app
 echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
 """
 
+[tasks.app-runtime]
+description = "Build, stage, ad-hoc sign with the hardened runtime and install dist/NovakeyR.app (checks the judge still loads under the hardened runtime)"
+run = """
+mise run app
+scripts/stage-app.sh
+scripts/sign-app.sh -
+pkill -x novakey_r || true
+mkdir -p "$HOME/Library/Input Methods"
+rsync -a --delete dist/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
+echo "Installed the signed build. Re-login, then type in live and space mode."
+"""
+
 [tasks.uninstall]
 description = "Remove NovakeyR.app from ~/Library/Input Methods"
 run = """
