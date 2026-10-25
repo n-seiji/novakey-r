@@ -104,8 +104,13 @@ pkill -x novakey_r || true
 mkdir -p "$HOME/Library/Input Methods"
 # バンドルを消して作り直すと macOS が入力ソースの一覧から外すので、中身だけ入れ替える。
 rsync -a --delete output/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
-echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
+mise run register || true
+echo "Installed. The first time, re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
 """
+
+[tasks.register]
+description = "Register the installed ~/Library/Input Methods/NovakeyR.app with Text Input Sources and ask macOS to enable it (third-party IMEs may still need the user to add or allow them in System Settings)"
+run = "\"$HOME/Library/Input Methods/NovakeyR.app/Contents/MacOS/novakey_r\" --register"
 
 [tasks.app-runtime]
 description = "Build, stage, ad-hoc sign with the hardened runtime and install dist/NovakeyR.app (checks the judge still loads under the hardened runtime)"
@@ -116,6 +121,7 @@ scripts/sign-app.sh -
 pkill -x novakey_r || true
 mkdir -p "$HOME/Library/Input Methods"
 rsync -a --delete dist/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
+mise run register || true
 echo "Installed the signed build. Re-login, then type in live and space mode."
 """
 

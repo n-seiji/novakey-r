@@ -16,6 +16,7 @@ mod loanword;
 mod outbound;
 mod platform;
 mod private_fs;
+mod register;
 mod romaji_converter;
 mod session;
 mod simulate;
@@ -36,6 +37,9 @@ fn main() {
     }
     if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
         std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--register") {
+        std::process::exit(register::run_cli(args.get(i + 1).map(String::as_str)));
     }
     if let Some(i) = args.iter().position(|a| a == "--judge-bench") {
         simulate::setup_env();
