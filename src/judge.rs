@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use tokenizers::Tokenizer;
+use crate::tokenizer::Tokenizer;
 
 use crate::gguf;
 
@@ -53,13 +53,8 @@ const MAX_NODES: usize = 640;
 /// モデルファイルからテンソルのデータを読むときの 1 回の読み込みの大きさ (バイト)。
 const READ_CHUNK: usize = 1 << 20;
 
-/// エラーは固定文字列だけ (tokenizers のエラー文はログに出さない)。
+/// エラーは固定文字列だけ (下位のエラー文はログに出さない)。
 type R<T> = Result<T, &'static str>;
-
-/// 元のエラー (tokenizers / io) は捨てて、場所を表す固定文字列にする。
-fn fail<E>(msg: &'static str) -> impl Fn(E) -> &'static str {
-    move |_| msg
-}
 
 fn f16_to_f32(h: u16) -> f32 {
     let sign = u32::from(h >> 15) << 31;
@@ -806,7 +801,7 @@ impl Judge {
             .start_handler(|_| crate::platform::set_qos_user_interactive())
             .build_global();
         let model = Model::load(&dir.join("model_q8_0.gguf"))?;
-        let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(fail("cannot load tokenizer"))?;
+        let tok = Tokenizer::from_file(&dir.join("tokenizer.json"))?;
         let judge = Self { model, tok };
         // 遅延初期化 (Accelerate・スレッドプール) を読み込みの時間に含める。
         judge.model.score(&[vec![100], vec![100, 101]])?;
@@ -815,8 +810,7 @@ impl Judge {
     }
 
     fn sequence(&self, text: &str) -> R<Vec<u32>> {
-        let enc = self.tok.encode(text.to_lowercase(), false).map_err(fail("cannot tokenize"))?;
-        Ok(enc.get_ids().to_vec())
+        Ok(self.tok.encode(&text.to_lowercase()))
     }
 
     /// 各文の対数尤度 (BOS から EOS まで) と、今回新しく計算したトークン数。
