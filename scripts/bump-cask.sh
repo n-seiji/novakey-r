@@ -34,7 +34,8 @@ if [ -z "${RELEASE_DIR:-}" ]; then
       || { echo "bump-cask: attestation verification failed for $zip" >&2; exit 1; }
     echo "attestation verified"
   else
-    echo "note: this gh has no 'attestation' command, so the build attestation was not checked" >&2
+    echo "bump-cask: this gh has no 'attestation' command, so the build attestation cannot be checked; upgrade gh" >&2
+    exit 1
   fi
 fi
 

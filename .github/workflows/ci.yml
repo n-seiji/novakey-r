@@ -27,6 +27,8 @@ jobs:
           key: judge-model-${{ runner.os }}-${{ hashFiles('tools/gen_judge_model.py', 'tools/gen_judge_model.py.lock', 'tools/judge.sha256') }}
       - run: scripts/check-no-network.sh
       - run: mise run build
+        env:
+          RUSTFLAGS: -Dwarnings
       - run: scripts/check-no-network.sh --binary
       - run: cargo test --release
       - run: mise run scenarios
@@ -38,3 +40,13 @@ jobs:
       - run: mise run judge-model
       - run: mise run app
       - run: scripts/check-version.sh
+      - run: scripts/stage-app.sh
+      - run: scripts/sign-app.sh -
+      - run: scripts/package-app.sh
+      - name: Verify the packaged zip
+        run: |
+          set -eu
+          check="$RUNNER_TEMP/verify"
+          rm -rf "$check"; mkdir -p "$check"
+          ditto -x -k dist/NovakeyR-*.app.zip "$check"
+          codesign --verify --deep --strict --verbose=2 "$check/NovakeyR.app"

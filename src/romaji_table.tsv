@@ -1,5 +1,5 @@
 # Source: Mozc src/data/preedit/romanji-hiragana.tsv
-# Copyright 2010-2021, Google Inc. All rights reserved. (BSD 3-Clause License)
+# Copyright 2010-2018, Google Inc. All rights reserved. (BSD 3-Clause License)
 # https://github.com/google/mozc/blob/master/LICENSE
 # Rows with non-letter inputs (symbols) are omitted; the composer handles them separately.
 # Format: input<TAB>output[<TAB>pending]

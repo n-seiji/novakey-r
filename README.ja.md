@@ -49,7 +49,7 @@
 
 ### アンインストール
 
-先に入力ソースから NovakeyR を外し、そのあと `brew uninstall --zap --cask novakey-r` を実行します。
+先に入力ソースから NovakeyR を外します。そのあと、Homebrew で入れた場合は `brew uninstall --zap --cask novakey-r` を実行します。zip から入れた場合は `~/Library/Input Methods/NovakeyR.app` を削除します。
 
 ### ソースからビルド
 
@@ -64,7 +64,7 @@ mise run install
 
 ## 実行時にネットワークは使いません
 
-NovakeyR はネットワーク接続を開きません。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読めば、自分で確かめられます。
+NovakeyR はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。
 
 ## キー
 
@@ -87,7 +87,10 @@ NovakeyR はネットワーク接続を開きません。ソースと、リン�
 
 メンテナ向けです。リリースは `.github/workflows/release.yml` がビルド・署名・公証まで行います。`release` 環境を承認するまでは何も公開されません。
 
-1. 初回のみ: リポジトリのシークレット `DEVELOPER_ID_P12_BASE64`、`DEVELOPER_ID_P12_PASSWORD`、`ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_P8_BASE64` を登録し、`scripts/setup-release-env.sh` で `release` 環境 (承認者 1 人、main のみ) を作ります。
+1. 初回のみ、次の順で行います (順序が大事です。環境と承認者を作る前に変数を設定すると、誰の承認もなくリリースが公開されてしまいます)。
+   1. `scripts/setup-release-env.sh` で `release` 環境 (承認者 1 人、main のみ) を作ります。
+   2. リポジトリのシークレット `DEVELOPER_ID_P12_BASE64`、`DEVELOPER_ID_P12_PASSWORD`、`ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_P8_BASE64` を登録します。
+   3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
 2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行い、`NovakeyR-<version>.app.zip` とその `.sha256` を載せた下書きリリースを作ります。
 3. 承認する前に下書きを試します。
    - 下書きの zip を **Safari で** ダウンロードします (quarantine 属性を付けるため)。Finder で展開し、`NovakeyR.app` を `~/Library/Input Methods` に移し、ログインし直して入力ソースを追加し、実際に打ちます。

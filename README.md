@@ -49,7 +49,7 @@ Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to
 
 ### Uninstall
 
-First remove NovakeyR from Input Sources, then run `brew uninstall --zap --cask novakey-r`.
+First remove NovakeyR from Input Sources. Then, if you installed with Homebrew, run `brew uninstall --zap --cask novakey-r`. If you installed from the zip, delete `~/Library/Input Methods/NovakeyR.app`.
 
 ### Build from source
 
@@ -64,7 +64,7 @@ This installs `~/Library/Input Methods/NovakeyR.app`. Log out and back in, then 
 
 ## No network at runtime
 
-NovakeyR opens no network connections. You can check this yourself: read the sources, and look at `Cargo.lock` for the crates it links.
+NovakeyR opens no network connections. `scripts/check-no-network.sh` checks the sources and the built binary for network use, and CI runs it on every push and pull request. This is a guarantee about runtime: the judge model is fetched once, at build time. You can also check yourself by reading the sources and looking at `Cargo.lock` for the crates it links.
 
 ## Keys
 
@@ -87,7 +87,10 @@ Learning is stored in `~/Library/Application Support/NovakeyR/rust-learning/` (`
 
 For maintainers. Releases are built, signed and notarized by `.github/workflows/release.yml`; nothing is published until the `release` environment is approved.
 
-1. Once: add the repository secrets `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD`, `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8_BASE64`, then run `scripts/setup-release-env.sh` to create the `release` environment (one required reviewer, main only).
+1. Once, in this order (the order matters: with the variable set before the environment and its reviewer exist, a release would be published without anyone approving it):
+   1. Run `scripts/setup-release-env.sh` to create the `release` environment (one required reviewer, main only).
+   2. Add the repository secrets `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD`, `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8_BASE64`.
+   3. Set the repository variable that turns releases on: `gh variable set RELEASE_ENABLED --body true`. Until it is `true`, the workflow only reports "release disabled" and builds nothing, so merging to main is safe.
 2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs it, notarizes and staples it, and creates a draft release with `NovakeyR-<version>.app.zip` and its `.sha256`.
 3. Test the draft before approving it:
    - Download the zip from the draft **in Safari**, so it gets the quarantine attribute. Unzip it in Finder, move `NovakeyR.app` to `~/Library/Input Methods`, log out and back in, add the input source and type.
