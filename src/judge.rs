@@ -484,6 +484,27 @@ impl Model {
         Ok(())
     }
 
+    /// 読み込み後ずっと生きる大きな領域 (q8 の重みと尺度、f32 のテンソル、f32 に戻す作業領域) を物理メモリに留める。
+    /// IME は入力の合間に App Nap で眠り、その間に OS が重みを圧縮すると次の打鍵で展開待ちになるため。
+    /// K / V の木はノードごとに伸び縮みするので対象外。戻り値は (留めようとしたバイト数, 全部成功したか)。
+    fn lock_resident(&self) -> (usize, bool) {
+        let work = self.lock_work();
+        let mut f32s: Vec<&[f32]> = vec![&self.wpe, &self.lnf.w, &self.lnf.b, &work.scratch, &self.wte.scales];
+        let mut u8s: Vec<&[u8]> = vec![&self.wte.qs];
+        for blk in &self.blocks {
+            f32s.extend([&blk.ln1.w[..], &blk.ln1.b, &blk.ln2.w, &blk.ln2.b]);
+            for lin in [&blk.attn, &blk.proj, &blk.fc, &blk.out] {
+                f32s.extend([&lin.w.scales[..], &lin.b]);
+                u8s.push(&lin.w.qs);
+            }
+        }
+        // 作業領域は長さが固定 (作り直さない) なので、ここで留めた番地が使われ続ける。
+        let bytes = f32s.iter().map(|v| std::mem::size_of_val(*v)).chain(u8s.iter().map(|v| v.len())).sum();
+        let ok = f32s.iter().fold(true, |ok, v| crate::platform::lock_memory(v) && ok);
+        let ok = u8s.iter().fold(ok, |ok, v| crate::platform::lock_memory(v) && ok);
+        (bytes, ok)
+    }
+
     /// 木に溜めた分を捨てる。
     fn clear_cache(&self) {
         self.lock_work().cache = Cache::new();
@@ -801,6 +822,9 @@ static JUDGE: OnceLock<Option<Judge>> = OnceLock::new();
 /// 読み込みの失敗と採点の失敗は別々に 1 度ずつログする (片方が出ても、もう片方を隠さない)。
 static LOAD_LOGGED: AtomicBool = AtomicBool::new(false);
 static SCORE_LOGGED: AtomicBool = AtomicBool::new(false);
+static LOCK_LOGGED: AtomicBool = AtomicBool::new(false);
+/// 読み込み後に物理メモリへ留めた (バイト数, 全部成功したか)。
+static LOCKED: OnceLock<(usize, bool)> = OnceLock::new();
 /// `preload` で背景読み込みを始めた。立っている間、読み込み中の `rerank` は待たずに審判なしで返す。
 static PRELOADED: AtomicBool = AtomicBool::new(false);
 
@@ -828,6 +852,12 @@ fn judge() -> Option<&'static Judge> {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Judge::open(&dir))) {
                 Ok(Ok(j)) => {
                     crate::trace::record("judge-load", &format!("ms={:.0}", t0.elapsed().as_secs_f64() * 1e3));
+                    let (bytes, ok) = j.model.lock_resident();
+                    if !ok {
+                        log_once(&LOCK_LOGGED, "judge: could not lock model memory; the judge runs without the lock");
+                    }
+                    let _ = LOCKED.set((bytes, ok));
+                    crate::trace::record("judge-locked", &format!("mb={} ok={}", bytes >> 20, u8::from(ok)));
                     Some(j)
                 }
                 Ok(Err(err)) => {
@@ -860,6 +890,11 @@ pub fn preload() {
         PRELOADED.store(false, Ordering::Relaxed);
         log_once(&LOAD_LOGGED, "judge: preload thread failed to start");
     }
+}
+
+/// 読み込み後に物理メモリへ留めた (バイト数, 全部成功したか)。読み込み前や審判なしなら `None`。
+pub fn locked() -> Option<(usize, bool)> {
+    LOCKED.get().copied()
 }
 
 /// 直近の `rerank` にかかった時間 (ms)。取り出すと消える。

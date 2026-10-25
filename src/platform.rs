@@ -739,6 +739,23 @@ pub fn set_qos_user_interactive() {
     }
 }
 
+unsafe extern "C" {
+    fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+}
+
+/// `buf` の中身 (を含むページ) を物理メモリに留め、圧縮・ページアウトさせない。成功なら true。
+/// 解除はしない (プロセスが終わるまで生きる領域にだけ使う。解放後もページはロックされたまま残りうる)。
+/// RLIMIT_MEMLOCK などで断られたら false (呼び出し側はロックなしで続ける)。空なら何もせず true。
+pub fn lock_memory<T: Copy>(buf: &[T]) -> bool {
+    let len = std::mem::size_of_val(buf);
+    if len == 0 {
+        return true;
+    }
+    // SAFETY: mlock はメモリを読み書きせず、範囲を含むページの常駐属性を変えるだけ。範囲は生きているスライス
+    // `buf` のバイト列そのもので、XNU はページ境界への丸めを自分で行う。
+    unsafe { mlock(buf.as_ptr().cast(), len) == 0 }
+}
+
 /// 入力中だけ App Nap とタイマーの間引きを止める活動。`begin` / `end` は何度呼んでも 1 つしか持たない (冪等)。
 /// 落とす (Drop) と終わるので、コントローラごと解放されても漏れない。
 #[derive(Default)]

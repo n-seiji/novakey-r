@@ -433,6 +433,9 @@ fn print_timing_summary() {
         pct(&mut jm, 0.9),
         pct(&mut jm, 1.0)
     );
+    if let Some((bytes, ok)) = crate::judge::locked() {
+        println!("judge-locked mb={} ok={}", bytes >> 20, u8::from(ok));
+    }
     println!(
         "timing: keys={} median {:.1} ms p95 {:.1} ms max {:.1} ms | keys with judge={} median {:.1} ms p95 {:.1} ms max {:.1} ms | rss {:.0} MB",
         all.len(),
