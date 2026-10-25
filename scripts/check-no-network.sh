@@ -16,8 +16,11 @@ fail() {
   exit 1
 }
 
+[[ -f "$LOCK" ]] || fail "$LOCK not found"
+[[ -d "$SRC" ]] || fail "$SRC not found"
+
 crates=(
-  reqwest ureq hyper hyper-util h2 curl curl-sys isahc surf attohttpc minreq
+  reqwest ureq tokio hyper hyper-util h2 curl curl-sys isahc surf attohttpc minreq
   native-tls rustls openssl openssl-sys hf-hub tokio-native-tls tokio-rustls
 )
 for crate in "${crates[@]}"; do
@@ -35,8 +38,12 @@ done
 
 if [[ "${1:-}" == "--binary" ]]; then
   [[ -f "$BIN" ]] || fail "$BIN not found (run mise run build first)"
-  if otool -L "$BIN" | grep -qiE 'CFNetwork|Network\.framework|libcurl|libssl|libcrypto'; then
-    otool -L "$BIN" | grep -iE 'CFNetwork|Network\.framework|libcurl|libssl|libcrypto' >&2
+  libs=$(otool -L "$BIN") || fail "otool failed on $BIN"
+  # otool exits 0 on a file that is not a Mach-O binary, so also require a library list.
+  grep -q 'compatibility version' <<<"$libs" || fail "otool found no linked libraries in $BIN"
+  pattern='CFNetwork|Network\.framework|libcurl|libssl|libcrypto'
+  if grep -qiE "$pattern" <<<"$libs"; then
+    grep -iE "$pattern" <<<"$libs" >&2
     fail "network library linked into $BIN"
   fi
 fi
