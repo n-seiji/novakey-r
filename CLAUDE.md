@@ -37,6 +37,9 @@ Order: `NOVAKEY_DICTIONARY` (an invalid value is an error, no silent fallback) -
 
 If the dictionary cannot be opened, the failure is logged once (NSLog), reopening is retried at most every 5 minutes, and conversion degrades to hiragana / katakana / raw candidates.
 
+### Dependencies
+Versions published less than 7 days ago must not be used (like pnpm's `minimumReleaseAge`). `mise run release-age` (`scripts/check-release-age.sh`) checks every crates.io package in `Cargo.lock` against the crates.io API (fails closed; `MIN_AGE_DAYS` overrides; results cached in `target/release-age-cache.tsv`). Emergency exceptions: a line `name version # reason` in `tools/release-age-allow.txt`. uv uses `exclude-newer = "7 days"` in `tools/gen_judge_model.py` (re-run `uv lock --script tools/gen_judge_model.py` after changing dependencies), and `mise.toml` sets `minimum_release_age = "7d"`. CI runs the check in `ci.yml` only, not in `release.yml`, so a dependency aging past 7 days never blocks rebuilding an already-reviewed release.
+
 ## Architecture
 
 - `src/main.rs` - Entry point; dispatches dev-tool flags, otherwise starts the IME (`imk::register_controller`, `imk::run`)

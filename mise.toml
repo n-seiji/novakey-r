@@ -8,6 +8,10 @@ actionlint = "1.7.12"
 description = "Build the release binary"
 run = "cargo build --release --locked"
 
+[tasks.release-age]
+description = "Cargo.lock の crates.io 依存が公開から 7 日未満なら失敗する (MIN_AGE_DAYS で変更、例外は tools/release-age-allow.txt)"
+run = "scripts/check-release-age.sh"
+
 [tasks.test]
 description = "Run unit tests"
 run = "cargo test"
@@ -130,3 +134,7 @@ echo "Uninstalled NovakeyR."
 [tasks.logs]
 description = "Stream NSLog output from the running IME"
 run = "log stream --predicate 'process == \"novakey_r\"'"
+
+[settings]
+# Supply-chain guard: do not resolve tool versions published less than 7 days ago.
+minimum_release_age = "7d"
