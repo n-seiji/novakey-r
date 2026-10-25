@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fail unless the Rust engine matches the Swift golden data on every stable row
-# (top1 / top3 / top9 all 100%). Needs target/release/novakey_r (mise run build).
+# (top1 / top3 / top9 all 100%). Needs target/release/shizuku (mise run build).
 # Usage: scripts/check-kkc.sh [<golden.jsonl.gz>...]   (default: tools/golden/fresh.jsonl.gz)
 #
 # tools/golden/typed.jsonl.gz is not in the default set: it is already below 100% on main
@@ -9,7 +9,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-BIN=${BIN:-target/release/novakey_r}
+BIN=${BIN:-target/release/shizuku}
 [[ -x "$BIN" ]] || { echo "check-kkc: $BIN not found (run mise run build first)" >&2; exit 1; }
 
 goldens=("$@")
@@ -18,7 +18,7 @@ goldens=("$@")
 status=0
 for golden in "${goldens[@]}"; do
   # --kkc-compare exits non-zero below 100% top3; the stable line below decides.
-  out=$(NOVAKEY_DICTIONARY="$PWD/dictionary" "$BIN" --kkc-compare --golden "$golden") || true
+  out=$(SHIZUKU_DICTIONARY="$PWD/dictionary" "$BIN" --kkc-compare --golden "$golden") || true
   line=$(grep '^stable' <<<"$out" || true)
   [[ -n "$line" ]] || { echo "check-kkc: no stable line for $golden" >&2; exit 1; }
   echo "$golden: $line"

@@ -2,14 +2,14 @@
 # Fail if the build could talk to the network: no network crate in Cargo.lock, no network API
 # in src/, and (with --binary) no networking framework linked into the release binary.
 # Usage: scripts/check-no-network.sh [--binary]
-# Env:   LOCK (default Cargo.lock), SRC (default src), BIN (default target/release/novakey_r)
+# Env:   LOCK (default Cargo.lock), SRC (default src), BIN (default target/release/shizuku)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 LOCK=${LOCK:-Cargo.lock}
 SRC=${SRC:-src}
-BIN=${BIN:-target/release/novakey_r}
+BIN=${BIN:-target/release/shizuku}
 
 fail() {
   echo "check-no-network: $*" >&2

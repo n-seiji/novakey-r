@@ -50,6 +50,7 @@ def special_kinds(c: Row, reading: str) -> set[str]:
     text = c["text"]
     value = bits_to_float(d["value"])
     kinds: set[str] = set()
+    # The golden data was captured before the rename to Shizuku; its version candidate still reads "NovakeyR 0.1".
     if text.startswith("NovakeyR"):
         kinds.add("version")
     if d["lcid"] == 0 and d["rcid"] == 0:

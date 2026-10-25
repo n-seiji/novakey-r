@@ -33,7 +33,7 @@ impl Writer {
     pub fn spawn(path: PathBuf, entries: Entries, interval: Duration) -> Option<Self> {
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
-            .name("novakey-learning".into())
+            .name("shizuku-learning".into())
             .spawn(move || writer_loop(&rx, &path, entries, interval))
             .ok()?;
         Some(Self { tx: Some(tx), handle: Some(handle), warned: Cell::new(false) })

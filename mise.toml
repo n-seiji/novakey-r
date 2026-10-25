@@ -17,22 +17,22 @@ description = "Run unit tests"
 run = "cargo test"
 
 [tasks.simulate]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "キー列を headless で流して結果を表示する (mise run simulate -- 'kyouha<space><enter>')"
 run = "cargo run --release -- --simulate"
 
 [tasks.scenarios]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "tools/scenarios.txt を流す。期待付きの行が外れたら失敗"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt"
 
 [tasks.characterization]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "現挙動の固定 (tools/characterization.txt)。リアーキ中に出力が変わったら失敗"
 run = "cargo run --release -- --simulate-file tools/characterization.txt"
 
 [tasks.wysiwyg]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "各キーのあと、未確定ローマ字が無ければ下線付きの表示と Enter で確定される文字列が一致するかを scenarios / characterization の全行で確かめる"
 run = "cargo run --release -- --simulate-file tools/scenarios.txt --check-preedit && cargo run --release -- --simulate-file tools/characterization.txt --check-preedit"
 
@@ -41,99 +41,103 @@ description = "別スレッドから積んだ処理がメインスレッドで�
 run = "cargo run --release -- --check-main-queue"
 
 [tasks.scenarios-learning]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "学習ありのシナリオを流す (記憶は一時ディレクトリ)"
-run = "NOVAKEY_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learning_scenarios.txt"
+run = "SHIZUKU_SIM_LEARNING=1 cargo run --release -- --simulate-file tools/learning_scenarios.txt"
 
 
 
 
 [tasks.kkc-compare]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "Rust 版 KKC を azooKey (Swift) 版の golden と比べる (mise run kkc-compare -- --golden tools/golden/typed.jsonl.gz --show 20)"
 depends = ["build"]
-run = "./target/release/novakey_r --kkc-compare"
+run = "./target/release/shizuku --kkc-compare"
 
 [tasks.reset-memory]
 description = "変換学習データを全消去する"
-run = "rm -rf \"$HOME/Library/Application Support/NovakeyR\" && echo 'Learning memory cleared.'"
+run = "rm -rf \"$HOME/Library/Application Support/Shizuku\" && echo 'Learning memory cleared.'"
 
 [tasks.app]
-description = "Package the release binary into output/NovakeyR.app"
+description = "Package the release binary into output/Shizuku.app"
 depends = ["build"]
 run = """
-rm -rf output/NovakeyR.app
-mkdir -p output/NovakeyR.app/Contents/MacOS
-mkdir -p output/NovakeyR.app/Contents/Resources
-cp Info.plist output/NovakeyR.app/Contents/
+rm -rf output/Shizuku.app
+mkdir -p output/Shizuku.app/Contents/MacOS
+mkdir -p output/Shizuku.app/Contents/Resources
+cp Info.plist output/Shizuku.app/Contents/
 v=$(cargo metadata --no-deps --format-version 1 | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
-plutil -replace CFBundleShortVersionString -string "$v" output/NovakeyR.app/Contents/Info.plist
-plutil -replace CFBundleVersion -string "$v" output/NovakeyR.app/Contents/Info.plist
-cp target/release/novakey_r output/NovakeyR.app/Contents/MacOS/
-cp -R resources/. output/NovakeyR.app/Contents/Resources/
-cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
-cp LICENSE NOTICE THIRD_PARTY_LICENSES output/NovakeyR.app/Contents/Resources/
+plutil -replace CFBundleShortVersionString -string "$v" output/Shizuku.app/Contents/Info.plist
+plutil -replace CFBundleVersion -string "$v" output/Shizuku.app/Contents/Info.plist
+cp target/release/shizuku output/Shizuku.app/Contents/MacOS/
+cp -R resources/. output/Shizuku.app/Contents/Resources/
+cp -R dictionary output/Shizuku.app/Contents/Resources/dictionary
+cp LICENSE NOTICE THIRD_PARTY_LICENSES output/Shizuku.app/Contents/Resources/
 """
 
 [tasks.licenses]
 description = "Regenerate THIRD_PARTY_LICENSES (Rust crate licenses) with cargo-about"
 run = "cargo about generate about.hbs -o THIRD_PARTY_LICENSES"
 
+[tasks.logo]
+description = "ロゴ一式 (docs/assets/mark.svg, wordmark-*.svg, resources/app.icns, resources/logo.tiff) を tools/gen_logo.py で作り直す。Quicksand は固定コミットから取って sha256 を確かめる (依存は tools/gen_logo.py.lock で固定)"
+run = "uv run --locked --script tools/gen_logo.py"
+
 [tasks.judge-model]
 description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く (tools/judge.sha256 で検証、依存は tools/gen_judge_model.py.lock で固定)。mise run app が .app に入れる"
 run = "uv run --locked --script tools/gen_judge_model.py"
 
 [tasks.judge-bench]
-env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary", NOVAKEY_JUDGE_DIR = "{{config_root}}/resources/judge" }
+env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary", SHIZUKU_JUDGE_DIR = "{{config_root}}/resources/judge" }
 description = "審判の精度と時間を測る (mise run judge-bench -- testset.tsv。1 行 = 読み<TAB>正解(|区切り))"
 depends = ["build"]
-run = "./target/release/novakey_r --judge-bench"
+run = "./target/release/shizuku --judge-bench"
 
 [tasks.clean]
 description = "Remove the generated app bundle"
-run = "rm -rf output/NovakeyR.app"
+run = "rm -rf output/Shizuku.app"
 
 [tasks.run]
 description = "Run the packaged binary directly (smoke test)"
 depends = ["app"]
-run = "./output/NovakeyR.app/Contents/MacOS/novakey_r"
+run = "./output/Shizuku.app/Contents/MacOS/shizuku"
 
 [tasks.install]
-description = "Install NovakeyR.app into ~/Library/Input Methods (no sudo needed)"
+description = "Install Shizuku.app into ~/Library/Input Methods (no sudo needed)"
 depends = ["app"]
 run = """
-[ -d "/Library/Input Methods/NovakeyR.app" ] && \
-  echo "Warning: /Library/Input Methods/NovakeyR.app was found. This older system-wide install can cause duplicate entries in Input Sources. Please remove it manually with: sudo rm -rf /Library/Input Methods/NovakeyR.app"
-pkill -x novakey_r || true
+[ -d "/Library/Input Methods/Shizuku.app" ] && \
+  echo "Warning: /Library/Input Methods/Shizuku.app was found. This older system-wide install can cause duplicate entries in Input Sources. Please remove it manually with: sudo rm -rf /Library/Input Methods/Shizuku.app"
+pkill -x shizuku || true
 mkdir -p "$HOME/Library/Input Methods"
 # バンドルを消して作り直すと macOS が入力ソースの一覧から外すので、中身だけ入れ替える。
-rsync -a --delete output/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
-echo "Installed. Re-login (or restart) and add NovakeyR from System Settings > Keyboard > Input Sources."
+rsync -a --delete output/Shizuku.app/ "$HOME/Library/Input Methods/Shizuku.app/"
+echo "Installed. Re-login (or restart) and add Shizuku from System Settings > Keyboard > Input Sources."
 """
 
 [tasks.app-runtime]
-description = "Build, stage, ad-hoc sign with the hardened runtime and install dist/NovakeyR.app (checks the judge still loads under the hardened runtime)"
+description = "Build, stage, ad-hoc sign with the hardened runtime and install dist/Shizuku.app (checks the judge still loads under the hardened runtime)"
 run = """
 mise run app
 scripts/stage-app.sh
 scripts/sign-app.sh -
-pkill -x novakey_r || true
+pkill -x shizuku || true
 mkdir -p "$HOME/Library/Input Methods"
-rsync -a --delete dist/NovakeyR.app/ "$HOME/Library/Input Methods/NovakeyR.app/"
+rsync -a --delete dist/Shizuku.app/ "$HOME/Library/Input Methods/Shizuku.app/"
 echo "Installed the signed build. Re-login, then type in live and space mode."
 """
 
 [tasks.uninstall]
-description = "Remove NovakeyR.app from ~/Library/Input Methods"
+description = "Remove Shizuku.app from ~/Library/Input Methods"
 run = """
-pkill -x novakey_r || true
-rm -rf "$HOME/Library/Input Methods/NovakeyR.app"
-echo "Uninstalled NovakeyR."
+pkill -x shizuku || true
+rm -rf "$HOME/Library/Input Methods/Shizuku.app"
+echo "Uninstalled Shizuku."
 """
 
 [tasks.logs]
 description = "Stream NSLog output from the running IME"
-run = "log stream --predicate 'process == \"novakey_r\"'"
+run = "log stream --predicate 'process == \"shizuku\"'"
 
 [settings]
 # Supply-chain guard: do not resolve tool versions published less than 7 days ago.

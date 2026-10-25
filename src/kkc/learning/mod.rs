@@ -10,7 +10,7 @@
 //!   たびにやり直しになる。ここでは `lastUpdatedDay` も保存して、意図どおり 32 日ごとに 1 回だけ半減する。
 //! - 上限 (65536) を超えるときは、Swift と同じく読みの長いエントリから捨てる。ただし今回の確定で
 //!   触れたエントリは捨てない。
-//! - 直前の確定との bigram (`lastData`) は移植しない (NovakeyR は確定のたびに変換を止めるので発火しない)。
+//! - 直前の確定との bigram (`lastData`) は移植しない (Shizuku は確定のたびに変換を止めるので発火しない)。
 #![forbid(unsafe_code)]
 
 mod format;
@@ -428,7 +428,7 @@ mod tests {
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("novakey-r-learning-test-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("shizuku-learning-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

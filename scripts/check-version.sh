@@ -15,7 +15,7 @@ version=$(cargo metadata --no-deps --format-version 1 |
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Cargo version $version is not X.Y.Z"
 
-plist=output/NovakeyR.app/Contents/Info.plist
+plist=output/Shizuku.app/Contents/Info.plist
 [[ -f "$plist" ]] || fail "$plist not found (run mise run app first)"
 
 for key in CFBundleShortVersionString CFBundleVersion; do

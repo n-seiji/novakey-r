@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Sign dist/NovakeyR.app with the hardened runtime and verify it.
+# Sign dist/Shizuku.app with the hardened runtime and verify it.
 # Usage: scripts/sign-app.sh <identity>   (identity "-" = ad-hoc, no timestamp)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-APP=dist/NovakeyR.app
+APP=dist/Shizuku.app
 
 fail() {
   echo "sign-app: $*" >&2

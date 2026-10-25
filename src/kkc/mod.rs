@@ -2,7 +2,7 @@
 //!
 //! 辞書ファイル形式 (`dict` / `louds`)、ラティスと N-best Viterbi (`lattice`)、動的エントリ (`wise`)、
 //! 候補の組み立て (`result`) を持つ。IME から使うのは `RustEngine`。
-//! 学習は `learning` (設定 `learning_enabled` (環境変数 `NOVAKEY_DISABLE_LEARNING=1` で false) で無効)。
+//! 学習は `learning` (設定 `learning_enabled` (環境変数 `SHIZUKU_DISABLE_LEARNING=1` で false) で無効)。
 #![forbid(unsafe_code)]
 
 pub mod check;
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn learning_survives_reopening_the_file() {
-        let dir = std::env::temp_dir().join(format!("novakey-r-engine-learn-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shizuku-engine-learn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut e = engine(Learning::open(&dir));
         let before = e.convert(1, "かんじ");

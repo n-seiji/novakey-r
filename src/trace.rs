@@ -1,21 +1,21 @@
 #![forbid(unsafe_code)]
 
-//! 調査用のキー操作トレース。`defaults write dev.n-seiji.inputmethod.NovakeyR NovakeyRTrace -bool true` で有効になり、
-//! ~/Library/Logs/NovakeyR/trace.log に 1 行ずつ追記する。入力文字や候補の文字列は書かない。
+//! 調査用のキー操作トレース。`defaults write dev.n-seiji.inputmethod.Shizuku ShizukuTrace -bool true` で有効になり、
+//! ~/Library/Logs/Shizuku/trace.log に 1 行ずつ追記する。入力文字や候補の文字列は書かない。
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::platform;
 
-const TRACE_KEY: &str = "NovakeyRTrace";
+const TRACE_KEY: &str = "ShizukuTrace";
 
 /// fields は "名前=値" のように内容を含まない語だけを渡すこと。
 pub fn record(entry: &str, fields: &str) {
     if !platform::defaults_bool(TRACE_KEY) {
         return;
     }
-    let Some(dir) = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Logs/NovakeyR"))
+    let Some(dir) = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Logs/Shizuku"))
     else {
         return;
     };

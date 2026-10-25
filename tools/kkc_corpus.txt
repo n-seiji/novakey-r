@@ -1,4 +1,4 @@
-# NovakeyR KKC 差分テスト用コーパス。1 行 1 読み (ひらがな中心)。`#` 始まりはコメント。
+# Shizuku KKC 差分テスト用コーパス。1 行 1 読み (ひらがな中心)。`#` 始まりはコメント。
 # `typed-seq: a|ab|abc` は prefix の列を順に変換し最後の結果を取る (削除経路用)。
 # scenarios.txt の読み (composer が convert に渡すもの。prefix・英字混じり・記号を含む)
 ch

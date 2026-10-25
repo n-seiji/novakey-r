@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Submit each file to Apple's notary service and wait for the verdict. Fails unless every
 # submission is Accepted; on failure the notary log is printed. Staple the app yourself afterwards
-# (xcrun stapler staple dist/NovakeyR.app), then zip it again with scripts/package-app.sh.
+# (xcrun stapler staple dist/Shizuku.app), then zip it again with scripts/package-app.sh.
 # Usage: scripts/notarize.sh <file.zip|.dmg|.pkg>...
 # Env:   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (path to the AuthKey_<id>.p8 App Store Connect API key)
 set -euo pipefail

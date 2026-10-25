@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 未設定ならスペース変換 (オフ)。全コントローラで共有する。
-const LIVE_CONVERSION_KEY: &str = "NovakeyRLiveConversionEnabled";
+const LIVE_CONVERSION_KEY: &str = "ShizukuLiveConversionEnabled";
 
 extern_class!(
     #[derive(Debug, PartialEq, Eq, Hash)]
@@ -88,19 +88,19 @@ pub struct Ivars {
 }
 
 declare_class!(
-    pub struct NovakeyRInputController;
+    pub struct ShizukuInputController;
 
-    unsafe impl ClassType for NovakeyRInputController {
+    unsafe impl ClassType for ShizukuInputController {
         type Super = IMKInputController;
         type Mutability = mutability::InteriorMutable;
-        const NAME: &'static str = "NovakeyRInputController";
+        const NAME: &'static str = "ShizukuInputController";
     }
 
-    impl DeclaredClass for NovakeyRInputController {
+    impl DeclaredClass for ShizukuInputController {
         type Ivars = Ivars;
     }
 
-    unsafe impl NovakeyRInputController {
+    unsafe impl ShizukuInputController {
         #[method_id(initWithServer:delegate:client:)]
         fn init_with_server(
             this: Allocated<Self>,
@@ -216,7 +216,7 @@ declare_class!(
     }
 );
 
-impl NovakeyRInputController {
+impl ShizukuInputController {
     /// session を触るコールバックを panic から守る。panic した時点で session / composer は中途半端かもしれないので、
     /// 作り直して画面側 (候補パネル・マーク文字) も揃えてから fallback を返す。
     fn guard_session<T>(&self, fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
@@ -236,15 +236,15 @@ impl NovakeyRInputController {
 }
 
 pub fn register_controller() {
-    let _ = NovakeyRInputController::class();
+    let _ = ShizukuInputController::class();
     platform::log(&format!(
         "Registered input controller class: {}",
-        NovakeyRInputController::NAME
+        ShizukuInputController::NAME
     ));
 }
 
 /// Info.plist の InputMethodConnectionName が読めないとき (bundle 外の起動など) の接続名。
-const CONNECTION_NAME_FALLBACK: &str = "dev.n-seiji.inputmethod.NovakeyR_Connection";
+const CONNECTION_NAME_FALLBACK: &str = "dev.n-seiji.inputmethod.Shizuku_Connection";
 
 /// 入力メソッドとして起動し、run loop に入る。
 pub fn run() {
@@ -257,7 +257,7 @@ pub fn run() {
 mod tests {
     use objc2::ClassType;
 
-    use super::{NovakeyRInputController, CONNECTION_NAME_FALLBACK};
+    use super::{ShizukuInputController, CONNECTION_NAME_FALLBACK};
 
     #[test]
     fn connection_name_in_info_plist_matches_the_fallback() {
@@ -268,13 +268,13 @@ mod tests {
         );
         assert_eq!(
             CONNECTION_NAME_FALLBACK,
-            "dev.n-seiji.inputmethod.NovakeyR_Connection"
+            "dev.n-seiji.inputmethod.Shizuku_Connection"
         );
     }
 
     #[test]
     fn the_controller_class_registers_with_imk_overrides() {
         // debug ビルドの objc2 は、上書きしたメソッドの型を IMKInputController 側と照合する。
-        let _ = NovakeyRInputController::class();
+        let _ = ShizukuInputController::class();
     }
 }

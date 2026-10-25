@@ -1,4 +1,4 @@
-# 学習ありのシナリオ: `mise run scenarios-learning`。`NOVAKEY_SIM_LEARNING=1` で学習 on・空の一時メモリで流す。
+# 学習ありのシナリオ: `mise run scenarios-learning`。`SHIZUKU_SIM_LEARNING=1` で学習 on・空の一時メモリで流す。
 # 行は上から順に 1 つの記憶へ積み上がるので、並びを変えると結果が変わる。形式は scenarios.txt と同じ。
 # 学習前: 感じ / kanji / 漢字 / 幹事 の順
 kanji<space><enter>	感じ

@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wordmark-dark.svg">
-  <img src="docs/assets/wordmark-light.svg" alt="NovakeyR" width="320">
+  <img src="docs/assets/wordmark-light.svg" alt="Shizuku" width="320">
 </picture>
 
 [English](README.md) · **日本語**
@@ -40,24 +40,20 @@
 
 動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-Releases から `NovakeyR-<version>.pkg` をダウンロードして開きます。インストーラが NovakeyR を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
+Releases から `Shizuku-<version>.pkg` をダウンロードして開きます。インストーラが Shizuku を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
 
-初回は、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。まだ一覧に出ないときは、先にログインし直します。
+初回は、システム設定 > キーボード > 入力ソース で Shizuku を追加してください。まだ一覧に出ないときは、先にログインし直します。
 
 ### 更新
 
-新しい `.pkg` を開きます。古い版の上に入るので、NovakeyR は入力ソースに残ります。先に古いアプリを削除しないでください。削除すると入力ソースから NovakeyR が外れ、追加し直すことになります。
+新しい `.pkg` を開きます。古い版の上に入るので、Shizuku は入力ソースに残ります。先に古いアプリを削除しないでください。削除すると入力ソースから Shizuku が外れ、追加し直すことになります。
 
 ### アンインストール
 
-1. 入力ソースから NovakeyR を外します。
-2. `~/Library/Input Methods/NovakeyR.app` を削除します。
-3. インストールの記録を消します: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (記録はホームにあるので、`--volume ~` を付けない `pkgutil --forget` では見つかりません)。
-4. 学習した内容と設定も消すときは、`~/Library/Application Support/NovakeyR`、`~/Library/Logs/NovakeyR`、`~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist` を削除します。
-
-### Homebrew の cask から移る
-
-NovakeyR 0.1.2 までは Homebrew (`n-seiji/tap/novakey-r`) でも配っていました。その方法で入れた場合は、`brew uninstall --cask novakey-r` を実行します (`--zap` は付けないので、学習した内容は残ります)。そのあと `.pkg` を入れ、入力ソースに NovakeyR を追加し直します。これは 1 度だけ必要です。アンインストールでアプリが消えるためと、そうしないと `.pkg` が置き換えたアプリを Homebrew が管理し続けるためです。
+1. 入力ソースから Shizuku を外します。
+2. `~/Library/Input Methods/Shizuku.app` を削除します。
+3. インストールの記録を消します: `pkgutil --forget dev.n-seiji.inputmethod.Shizuku.pkg --volume ~` (記録はホームにあるので、`--volume ~` を付けない `pkgutil --forget` では見つかりません)。
+4. 学習した内容と設定も消すときは、`~/Library/Application Support/Shizuku`、`~/Library/Logs/Shizuku`、`~/Library/Preferences/dev.n-seiji.inputmethod.Shizuku.plist` を削除します。
 
 ### ソースからビルド
 
@@ -68,7 +64,7 @@ mise run judge-model
 mise run install
 ```
 
-`~/Library/Input Methods/NovakeyR.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
+`~/Library/Input Methods/Shizuku.app` に入ります。ログインし直してから、システム設定 > キーボード > 入力ソース で Shizuku を追加してください。
 
 ### 依存パッケージ
 
@@ -76,7 +72,7 @@ mise run install
 
 ## 実行時にネットワークは使いません
 
-NovakeyR はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。
+Shizuku はネットワーク接続を開きません。`scripts/check-no-network.sh` がソースとビルドしたバイナリのネットワーク利用を調べ、CI が push と pull request のたびに実行します。これは実行時の保証です。審判モデルはビルド時に 1 度だけ取得します。ソースと、リンクしているクレートの一覧 `Cargo.lock` を読んで自分で確かめることもできます。
 
 ## キー
 
@@ -93,7 +89,7 @@ NovakeyR はネットワーク接続を開きません。`scripts/check-no-netwo
 
 ## データの置き場所
 
-学習は `~/Library/Application Support/NovakeyR/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
+学習は `~/Library/Application Support/Shizuku/rust-learning/` に保存されます (`learning.tsv` と `english.txt`)。消すときは `mise run reset-memory` です。キー入力のトレースは初期状態でオフで、打った文字は記録しません。
 
 ## リリース手順
 
@@ -114,10 +110,10 @@ NovakeyR はネットワーク接続を開きません。`scripts/check-no-netwo
    3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
 
    シークレットは `signing` 環境に紐づき、この環境を使えるのは main で動くジョブだけなので、他のブランチのワークフローからは読めません。公証には、このリポジトリ専用の App Store Connect API キー (Developer ロール) を使ってください。
-2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `NovakeyR-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `Shizuku-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
 3. 承認する前に下書きを試します。
    - 下書きの `.pkg` を **Safari で** ダウンロードします (quarantine 属性を付けるため)。開いてパスワードを求められないことを確かめ、ログインし直して入力ソースを追加し、実際に打ちます。
-   - 同じ `.pkg` をもう一度、入っている版の上から開き、NovakeyR が入力ソースに残っていることを確かめます。
+   - 同じ `.pkg` をもう一度、入っている版の上から開き、Shizuku が入力ソースに残っていることを確かめます。
    - Gatekeeper がパッケージか IME を止めるなら、承認しません。
 4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、`.pkg` と zip の attestation を作ってリリースを公開します。
 
@@ -129,7 +125,7 @@ NovakeyR はネットワーク接続を開きません。`scripts/check-no-netwo
 - カタカナ語の英単語 (`resources/loanwords.tsv`) は [EDRDG](https://www.edrdg.org/) の JMdict (CC BY-SA 4.0) から作っています。
 - 絵文字 (`resources/emoji.tsv`) は Unicode の絵文字データと CLDR の日本語注釈 (Unicode License v3) から、[azooKey_emoji_dictionary_storage](https://github.com/ensan-hcl/azooKey_emoji_dictionary_storage) 経由で作っています。
 - 並べ替えは [rinna/japanese-gpt2-xsmall](https://huggingface.co/rinna/japanese-gpt2-xsmall) (MIT, © rinna Co., Ltd.) を使います。`tools/gen_judge_model.py` で変換して使い、このリポジトリには含みません。
-- ロゴの文字は [Newsreader](https://github.com/productiontype/Newsreader) (SIL Open Font License 1.1) をアウトライン化したものです。
+- ロゴの文字は [Quicksand](https://github.com/andrew-paglinawan/QuicksandFamily) (SIL Open Font License 1.1) をアウトライン化したものです。
 
 ライセンス全文は [`NOTICE`](NOTICE) と [`dictionary/NOTICE`](dictionary/NOTICE) にあります。
 

@@ -393,6 +393,7 @@ impl SpecialDetector {
         }
         let d = &c.data[0];
         let value = bits_to_f32(d.value);
+        // The golden data (tools/golden) was captured before the rename; its version candidate still reads "NovakeyR 0.1".
         if c.text.starts_with("NovakeyR") {
             return Some("version");
         }

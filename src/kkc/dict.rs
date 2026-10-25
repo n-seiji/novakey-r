@@ -93,17 +93,17 @@ pub fn escaped_identifier(id: &str) -> String {
 }
 
 /// 辞書ディレクトリを探す。
-/// 1. 環境変数 `NOVAKEY_DICTIONARY` (指定されているのに不正ならエラー。黙ってフォールバックしない)
+/// 1. 環境変数 `SHIZUKU_DICTIONARY` (指定されているのに不正ならエラー。黙ってフォールバックしない)
 /// 2. 実行ファイルの `../Resources/dictionary` (アプリバンドル)
 /// 3. ビルド時のリポジトリの `dictionary/` (テストとデバッグビルドだけ。リリースビルドには入れない。
-///    バンドルへのコピー漏れを開発中の環境で見逃さないため。CLI の開発ツールは `NOVAKEY_DICTIONARY` で渡す)
+///    バンドルへのコピー漏れを開発中の環境で見逃さないため。CLI の開発ツールは `SHIZUKU_DICTIONARY` で渡す)
 pub fn locate_dictionary_dir() -> Result<PathBuf, DictError> {
-    if let Some(v) = std::env::var_os("NOVAKEY_DICTIONARY") {
+    if let Some(v) = std::env::var_os("SHIZUKU_DICTIONARY") {
         let p = PathBuf::from(v);
         return if is_dictionary_dir(&p) {
             Ok(p)
         } else {
-            Err(DictError::NotFound(format!("NOVAKEY_DICTIONARY={} は辞書ディレクトリではありません", p.display())))
+            Err(DictError::NotFound(format!("SHIZUKU_DICTIONARY={} は辞書ディレクトリではありません", p.display())))
         };
     }
     let mut tried = Vec::new();
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn missing_dictionary_is_an_error_not_a_panic() {
-        let r = Dictionary::open(Path::new("/nonexistent/novakey"));
+        let r = Dictionary::open(Path::new("/nonexistent/shizuku"));
         assert!(matches!(r, Err(DictError::NotFound(_))));
     }
 }

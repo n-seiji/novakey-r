@@ -971,7 +971,7 @@ pub fn bench_cli(path: &str) -> i32 {
     let mut engine = crate::kkc::RustEngine::new();
     let t0 = Instant::now();
     if judge().is_none() {
-        eprintln!("judge unavailable (set NOVAKEY_JUDGE_DIR)");
+        eprintln!("judge unavailable (set SHIZUKU_JUDGE_DIR)");
         return 2;
     }
     println!("load {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
