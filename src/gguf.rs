@@ -7,6 +7,7 @@
 //! 対応する版は 2 と 3 (どちらも個数・長さが u64 で同じ配置)、テンソルの型は F32 と Q8_0 だけ。
 //! 壊れた / 対応外の入力は固定文字列の `Err` を返し、panic しない (オフセットと大きさは全部 checked_*)。
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -23,6 +24,10 @@ const MAX_NESTING: u32 = 8;
 const HEADER_BUF: usize = 64 * 1024;
 /// テンソル名の長さの上限 (壊れた長さで大きな確保をしないように)。
 const MAX_NAME: usize = 1024;
+/// テンソル数の上限 (審判のモデルは 76 個)。壊れた個数でテンソル情報を大量に積まないように。
+const MAX_TENSORS: usize = 1024;
+/// メタデータの項目数の上限 (審判のモデルは 0 個)。
+const MAX_KV: usize = 1024;
 
 const GGML_F32: u32 = 0;
 const GGML_Q8_0: u32 = 8;
@@ -211,6 +216,12 @@ impl<S: Read + Seek> Gguf<S> {
         }
         let n_tensors = h.len()?;
         let n_kv = h.len()?;
+        if n_tensors > MAX_TENSORS {
+            return Err("too many gguf tensors");
+        }
+        if n_kv > MAX_KV {
+            return Err("too many gguf metadata entries");
+        }
 
         let mut alignment = DEFAULT_ALIGNMENT;
         for _ in 0..n_kv {
@@ -266,15 +277,17 @@ impl<S: Read + Seek> Gguf<S> {
 
         let data_start = h.pos.checked_next_multiple_of(alignment).ok_or("gguf truncated")?;
         drop(h);
+        let mut seen = HashSet::with_capacity(raw.len());
+        if !raw.iter().all(|(name, _, _)| seen.insert(name.as_str())) {
+            return Err("duplicate gguf tensor name");
+        }
+        drop(seen);
         let mut infos: Vec<(String, Tensor)> = Vec::with_capacity(raw.len());
         for (name, mut t, off) in raw {
             let start = data_start.checked_add(off).ok_or("gguf truncated")?;
             let len = u64::try_from(t.len).map_err(|_| "gguf truncated")?;
             if start.checked_add(len).ok_or("gguf truncated")? > end {
                 return Err("gguf truncated");
-            }
-            if infos.iter().any(|(n, _)| *n == name) {
-                return Err("duplicate gguf tensor name");
             }
             t.start = start;
             infos.push((name, t));
@@ -438,6 +451,29 @@ mod tests {
         for t in [1, 2] {
             assert_eq!(parse(tiny(3, t)).err(), Some("unsupported gguf tensor type"));
         }
+    }
+
+    #[test]
+    fn テンソル数やメタデータ数が上限を超えると読む前にすぐ失敗する() {
+        for n in [MAX_TENSORS as u64 + 1, 1_300_000, u64::MAX] {
+            let mut b = tiny(3, GGML_Q8_0);
+            b[8..16].copy_from_slice(&n.to_le_bytes()); // tensor count
+            let t = std::time::Instant::now();
+            assert_eq!(parse(b).err(), Some("too many gguf tensors"), "{n}");
+            assert!(t.elapsed() < std::time::Duration::from_millis(100));
+            let mut b = tiny(3, GGML_Q8_0);
+            b[16..24].copy_from_slice(&n.to_le_bytes()); // kv count
+            assert_eq!(parse(b).err(), Some("too many gguf metadata entries"), "{n}");
+        }
+    }
+
+    #[test]
+    fn 同じ名前のテンソルが2つあると失敗する() {
+        let mut b = tiny(3, GGML_Q8_0);
+        // 2 つ目のテンソル名 "q" を "f" にする (名前の長さ 1 の直後の 1 バイト)
+        let pos = b.windows(9).rposition(|w| w == [1, 0, 0, 0, 0, 0, 0, 0, b'q']).unwrap();
+        b[pos + 8] = b'f';
+        assert_eq!(parse(b).err(), Some("duplicate gguf tensor name"));
     }
 
     #[test]

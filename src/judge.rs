@@ -1052,7 +1052,6 @@ mod tests {
         Model { wte, wpe, blocks, lnf: rand_ln(&mut st), work: Mutex::new(work) }
     }
 
-
     #[test]
     fn 形の揃ったモデルは検査を通り_どこかの形が外れると失敗する() {
         let mut m = synthetic_model();
