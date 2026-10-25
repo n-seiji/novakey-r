@@ -40,9 +40,9 @@ Kana-kanji conversion is written in Rust and runs entirely on your Mac. What you
 
 Requirements: macOS 26 or later, Apple Silicon (M1 or later). Intel Macs are not supported.
 
-Install it in one of two ways (available from v0.1.0):
+Install it in one of two ways:
 
-- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- Homebrew: run `brew trust n-seiji/tap` once (Homebrew only loads casks from third-party taps you trust), then `brew install --cask n-seiji/tap/novakey-r`
 - Or download the zip from Releases with a browser, unzip it in Finder, and move `NovakeyR.app` to `~/Library/Input Methods`.
 
 Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first.

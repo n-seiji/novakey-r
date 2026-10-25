@@ -40,9 +40,9 @@
 
 動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-次のどちらかで入れます (v0.1.0 から)。
+次のどちらかで入れます。
 
-- Homebrew: `brew install --cask n-seiji/tap/novakey-r`
+- Homebrew: 最初に一度 `brew trust n-seiji/tap` を実行します (Homebrew は信頼した公式以外の tap の cask しか読み込みません)。そのあと `brew install --cask n-seiji/tap/novakey-r` を実行します
 - または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
 
 そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。
