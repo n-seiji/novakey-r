@@ -47,6 +47,8 @@
 
 そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。
 
+`brew upgrade --cask novakey-r` で更新すると、macOS が入力ソースから NovakeyR を外すので、もう一度追加してください。Homebrew はアプリを丸ごと置き直しますが、中身だけの入れ替えは macOS の App 管理の保護で止められるためです。
+
 ### アンインストール
 
 先に入力ソースから NovakeyR を外します。そのあと、Homebrew で入れた場合は `brew uninstall --zap --cask novakey-r` を実行します。zip から入れた場合は `~/Library/Input Methods/NovakeyR.app` を削除します。

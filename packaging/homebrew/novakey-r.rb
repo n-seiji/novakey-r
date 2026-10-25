@@ -27,6 +27,8 @@ cask "novakey-r" do
   caveats <<~EOS
     Add NovakeyR in System Settings > Keyboard > Input Sources (Japanese).
     You may need to log out and back in first.
+    After an upgrade, add NovakeyR to Input Sources again: macOS drops it
+    when the bundle is replaced.
     Before uninstalling, remove NovakeyR from Input Sources.
   EOS
 end

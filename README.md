@@ -47,6 +47,8 @@ Install it in one of two ways:
 
 Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first.
 
+After `brew upgrade --cask novakey-r`, macOS drops NovakeyR from Input Sources, so add it again. Homebrew replaces the whole bundle, and an in-place update is blocked by macOS's App Management protection.
+
 ### Uninstall
 
 First remove NovakeyR from Input Sources. Then, if you installed with Homebrew, run `brew uninstall --zap --cask novakey-r`. If you installed from the zip, delete `~/Library/Input Methods/NovakeyR.app`.
