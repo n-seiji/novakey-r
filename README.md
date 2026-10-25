@@ -53,6 +53,11 @@ Open the newer `.pkg`. It installs over the old version, and NovakeyR stays in I
 1. Remove NovakeyR from Input Sources.
 2. Delete `~/Library/Input Methods/NovakeyR.app`.
 3. Remove the install receipt: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (the receipt is in your home, so plain `pkgutil --forget` without `--volume ~` does not find it).
+4. To also erase what NovakeyR learned and its settings, delete `~/Library/Application Support/NovakeyR`, `~/Library/Logs/NovakeyR` and `~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist`.
+
+### Moving from the Homebrew cask
+
+NovakeyR 0.1.2 and earlier were also on Homebrew (`n-seiji/tap/novakey-r`). If you installed it that way, run `brew uninstall --cask novakey-r` (without `--zap`, so what NovakeyR learned stays), then install the `.pkg` and add NovakeyR to Input Sources again. This is needed once: uninstalling deletes the app, and otherwise Homebrew would keep managing the app the `.pkg` replaced.
 
 ### Build from source
 

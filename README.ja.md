@@ -53,6 +53,11 @@ Releases から `NovakeyR-<version>.pkg` をダウンロードして開きます
 1. 入力ソースから NovakeyR を外します。
 2. `~/Library/Input Methods/NovakeyR.app` を削除します。
 3. インストールの記録を消します: `pkgutil --forget dev.n-seiji.inputmethod.NovakeyR.pkg --volume ~` (記録はホームにあるので、`--volume ~` を付けない `pkgutil --forget` では見つかりません)。
+4. 学習した内容と設定も消すときは、`~/Library/Application Support/NovakeyR`、`~/Library/Logs/NovakeyR`、`~/Library/Preferences/dev.n-seiji.inputmethod.NovakeyR.plist` を削除します。
+
+### Homebrew の cask から移る
+
+NovakeyR 0.1.2 までは Homebrew (`n-seiji/tap/novakey-r`) でも配っていました。その方法で入れた場合は、`brew uninstall --cask novakey-r` を実行します (`--zap` は付けないので、学習した内容は残ります)。そのあと `.pkg` を入れ、入力ソースに NovakeyR を追加し直します。これは 1 度だけ必要です。アンインストールでアプリが消えるためと、そうしないと `.pkg` が置き換えたアプリを Homebrew が管理し続けるためです。
 
 ### ソースからビルド
 
