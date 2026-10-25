@@ -20,23 +20,39 @@ cask "novakey-r" do
   stage_only true
 
   # Install steps run in Homebrew's sandbox with a temporary HOME, so paths under the real home use
-  # `base: :home`. Command arguments have no such base, hence /Users/{{user}} for the rsync target.
+  # `base: :home`. Command arguments have no such base, so they spell the home as /Users/{{user}}
+  # ({{user}} is $USER): the install fails if the home directory is not /Users/$USER.
+  # The steps stop at the first failure, and are ordered so a failure never leaves a half-replaced bundle:
+  # 1. probe that the existing bundle is writable (nothing is changed if it is not),
+  # 2. copy without --delete (a failure here leaves old and new files together, never an empty bundle),
+  # 3. only then prune files that are gone (--delete),
+  # 4. check the signature of the result.
   # --extended-attributes keeps the quarantine flag, as the `input_method` artifact did.
-  # The sandbox also blocks the Text Input Sources service, so `novakey_r --register` cannot run here.
   postflight_steps do
     terminate_process "novakey_r"
     mkdir_p "Library/Input Methods", base: :home
+    if_path_exists "Library/Input Methods/NovakeyR.app/Contents", base: :home do
+      touch "Library/Input Methods/NovakeyR.app/Contents/.homebrew-write-probe", base: :home
+      remove "Library/Input Methods/NovakeyR.app/Contents/.homebrew-write-probe", base: :home
+    end
+    run "/usr/bin/rsync",
+        args:           ["-a", "--extended-attributes", "{{staged_path}}/NovakeyR.app/",
+                         "/Users/{{user}}/Library/Input Methods/NovakeyR.app/"],
+        writable_paths: ["Library/Input Methods"],
+        writable_base:  :home
     run "/usr/bin/rsync",
         args:           ["-a", "--delete", "--extended-attributes", "{{staged_path}}/NovakeyR.app/",
                          "/Users/{{user}}/Library/Input Methods/NovakeyR.app/"],
         writable_paths: ["Library/Input Methods"],
         writable_base:  :home
+    run "/usr/bin/codesign",
+        args: ["--verify", "--strict", "/Users/{{user}}/Library/Input Methods/NovakeyR.app"]
   end
 
-  # No `uninstall` stanza: Homebrew rejects one next to `stage_only` (it counts as an activatable artifact),
-  # and its `delete` would also run on upgrade, removing the directory we keep. The postflight stops the
-  # running IME on install and upgrade. Only `zap` removes the bundle, so a plain `brew uninstall` leaves
-  # ~/Library/Input Methods/NovakeyR.app in place.
+  # No `uninstall` stanza. `uninstall` and `zap` both count as activatable artifacts, so with `stage_only`
+  # Homebrew rejects the cask once `zap` is defined after `uninstall`. Its `delete` would also run on upgrade,
+  # removing the directory we keep. The postflight stops the running IME on install and upgrade. Only `zap`
+  # removes the bundle, so a plain `brew uninstall` leaves ~/Library/Input Methods/NovakeyR.app in place.
   zap signal: [["TERM", "dev.n-seiji.inputmethod.NovakeyR"]],
       trash:  [
         "~/Library/Application Support/NovakeyR",
@@ -52,5 +68,7 @@ cask "novakey-r" do
     To remove NovakeyR completely, first remove it from Input Sources, then run:
       brew uninstall --zap --cask novakey-r
     A plain `brew uninstall` leaves ~/Library/Input Methods/NovakeyR.app in place.
+
+    Installing needs the home directory to be /Users/$USER.
   EOS
 end

@@ -45,7 +45,7 @@ Install it in one of two ways:
 - Homebrew: run `brew trust n-seiji/tap` once (Homebrew only loads casks from third-party taps you trust), then `brew install --cask n-seiji/tap/novakey-r`
 - Or download the zip from Releases with a browser, unzip it in Finder, and move `NovakeyR.app` to `~/Library/Input Methods`.
 
-Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first. You only do this once: Homebrew upgrades replace the app's contents in place, so NovakeyR stays in Input Sources. If NovakeyR is not offered in the list, run `~/Library/Input\ Methods/NovakeyR.app/Contents/MacOS/novakey_r --register` (0.1.2 or later) and look again.
+Then add NovakeyR in System Settings > Keyboard > Input Sources. You may need to log out and back in first. You only do this once: Homebrew upgrades replace the app's contents in place, so NovakeyR stays in Input Sources.
 
 ### Uninstall
 
@@ -60,7 +60,7 @@ mise run judge-model
 mise run install
 ```
 
-This installs `~/Library/Input Methods/NovakeyR.app` (it replaces the contents in place, then runs `mise run register`). The first time, log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
+This installs `~/Library/Input Methods/NovakeyR.app` (it replaces the contents in place). The first time, log out and back in, then add NovakeyR in System Settings > Keyboard > Input Sources.
 
 ## No network at runtime
 

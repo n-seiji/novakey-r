@@ -45,7 +45,7 @@
 - Homebrew: 最初に一度 `brew trust n-seiji/tap` を実行します (Homebrew は信頼した公式以外の tap の cask しか読み込みません)。そのあと `brew install --cask n-seiji/tap/novakey-r` を実行します
 - または Releases の zip をブラウザでダウンロードし、Finder で展開して `NovakeyR.app` を `~/Library/Input Methods` に移します。
 
-そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。追加は 1 度だけです。Homebrew のアップグレードはアプリの中身をその場で入れ替えるので、NovakeyR は入力ソースに残ります。一覧に NovakeyR が出てこないときは `~/Library/Input\ Methods/NovakeyR.app/Contents/MacOS/novakey_r --register` (0.1.2 以降) を実行してから探し直してください。
+そのあと、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。先にログインし直す必要がある場合があります。追加は 1 度だけです。Homebrew のアップグレードはアプリの中身をその場で入れ替えるので、NovakeyR は入力ソースに残ります。
 
 ### アンインストール
 
@@ -60,7 +60,7 @@ mise run judge-model
 mise run install
 ```
 
-`~/Library/Input Methods/NovakeyR.app` に入ります (中身をその場で入れ替え、そのあと `mise run register` を実行します)。初回はログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
+`~/Library/Input Methods/NovakeyR.app` に入ります (中身をその場で入れ替えます)。初回はログインし直してから、システム設定 > キーボード > 入力ソース で NovakeyR を追加してください。
 
 ## 実行時にネットワークは使いません
 
