@@ -436,6 +436,7 @@ fn setup_env() {
         memory_dir: Some(memory_dir),
         learning_enabled: learning,
         loanwords_path: Some(repo_table("NOVAKEY_LOANWORDS", "loanwords.tsv")),
+        dev_words_path: Some(repo_table("NOVAKEY_DEV_WORDS", "dev_words.txt")),
         emoji_path: Some(repo_table("NOVAKEY_EMOJI", "emoji.tsv")),
     });
 }

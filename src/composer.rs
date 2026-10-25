@@ -60,6 +60,10 @@ pub trait CandidateEngine {
     fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String>;
     fn select(&mut self, revision: u64, engine_index: usize) -> bool;
     fn cancel(&mut self);
+    /// ひらがなの読みがそのまま辞書の見出しにあるか (made → まで)。英単語として切り分ける前の衝突確認に使う。
+    fn has_reading(&self, _hiragana: &str) -> bool {
+        false
+    }
 }
 
 /// 未確定文の局面。Empty は未確定文が無い状態。
@@ -467,7 +471,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if !self.is_kana_editing() {
             return None;
         }
-        english_split::split(&self.raw(), finished, |w| self.lexicon.knows_english(w))
+        english_split::split(
+            &self.raw(),
+            finished,
+            |w| self.lexicon.knows_english(w),
+            |w| self.lexicon.is_english_word(w),
+            |kana| self.engine.has_reading(kana),
+        )
     }
 
     /// 英単語を 1 つの単位にまとめ、かな混じり (Mixed) として確定・変換できるようにする。

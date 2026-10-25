@@ -14,6 +14,8 @@ pub struct Config {
     pub learning_enabled: bool,
     /// カタカナ語 -> 英語の表 (`NOVAKEY_LOANWORDS`、無ければアプリバンドルの Resources)。
     pub loanwords_path: Option<PathBuf>,
+    /// 開発用語の英単語の一覧 (`NOVAKEY_DEV_WORDS`、無ければアプリバンドルの Resources)。
+    pub dev_words_path: Option<PathBuf>,
     /// 読み -> 絵文字の表 (`NOVAKEY_EMOJI`、無ければアプリバンドルの Resources)。
     pub emoji_path: Option<PathBuf>,
 }
@@ -21,7 +23,7 @@ pub struct Config {
 impl Config {
     /// 何も読み書きしない設定 (`init` されていないテストの既定)。
     pub fn inert() -> Self {
-        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, emoji_path: None }
+        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, dev_words_path: None, emoji_path: None }
     }
 
     pub fn from_env() -> Self {
@@ -33,6 +35,7 @@ impl Config {
             memory_dir,
             learning_enabled: !std::env::var("NOVAKEY_DISABLE_LEARNING").is_ok_and(|v| v == "1"),
             loanwords_path: std::env::var_os("NOVAKEY_LOANWORDS").map(PathBuf::from).or_else(|| bundled("loanwords.tsv")),
+            dev_words_path: std::env::var_os("NOVAKEY_DEV_WORDS").map(PathBuf::from).or_else(|| bundled("dev_words.txt")),
             emoji_path: std::env::var_os("NOVAKEY_EMOJI").map(PathBuf::from).or_else(|| bundled("emoji.tsv")),
         }
     }
@@ -73,7 +76,7 @@ mod tests {
     fn init_されていない間は何も読み書きしない設定を返す() {
         let c = get();
         assert!(!c.learning_enabled);
-        assert!(c.memory_dir.is_none() && c.loanwords_path.is_none() && c.emoji_path.is_none());
+        assert!(c.memory_dir.is_none() && c.loanwords_path.is_none() && c.dev_words_path.is_none() && c.emoji_path.is_none());
     }
 
     #[test]
