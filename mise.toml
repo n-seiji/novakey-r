@@ -71,6 +71,16 @@ cp -R dictionary output/NovakeyR.app/Contents/Resources/dictionary
 cp NOTICE output/NovakeyR.app/Contents/Resources/NOTICE
 """
 
+[tasks.judge-model]
+description = "端末内の審判モデル (rinna/japanese-gpt2-xsmall の q8_0 と tokenizer) を Hugging Face から作って resources/judge/ に置く。mise run app が .app に入れる"
+run = "uv run --script tools/gen_judge_model.py"
+
+[tasks.judge-bench]
+env = { NOVAKEY_DICTIONARY = "{{config_root}}/dictionary", NOVAKEY_JUDGE_DIR = "{{config_root}}/resources/judge" }
+description = "審判の精度と時間を測る (mise run judge-bench -- testset.tsv。1 行 = 読み<TAB>正解(|区切り))"
+depends = ["build"]
+run = "./target/release/novakey_r --judge-bench"
+
 [tasks.clean]
 description = "Remove the generated app bundle"
 run = "rm -rf output/NovakeyR.app"

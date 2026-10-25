@@ -114,9 +114,11 @@ impl Environment for PlatformEnv {
     }
 
     fn rerank_allowed(&self) -> bool {
+        // spike: Cloudflare の AI 並べ替えは止める (コードは残す)。ライブ変換は端末内の審判 (judge.rs) が担当する。
+        const SPIKE_CLOUD_RERANK: bool = false;
         // 一時停止が明けた・認証情報の読み直しが済んだことを拾うため、毎回送信側の状態を取り込む (ロックだけで Keychain には触れない)。
         set_ai_status(ai_status().observe(rerank_availability()));
-        ai_status().allows_requests()
+        SPIKE_CLOUD_RERANK && ai_status().allows_requests()
     }
 
     fn log(&self, line: &str) {
@@ -220,7 +222,10 @@ declare_class!(
                     trace::record("handleEvent", "key=Shortcut action=PassThrough");
                     return Bool::NO;
                 }
-                Bool::new(self.ivars().controller.on_key(route, Client::new(client)))
+                let started = std::time::Instant::now();
+                let handled = self.ivars().controller.on_key(route, Client::new(client));
+                trace::record("keyTime", &format!("ms={:.1}", started.elapsed().as_secs_f64() * 1e3));
+                Bool::new(handled)
             })
         }
 

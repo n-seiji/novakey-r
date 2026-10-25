@@ -173,6 +173,8 @@ impl Default for RustEngine {
 }
 
 impl CandidateEngine for RustEngine {
+    /// 全文候補 (Full) だけを審判で並べ替え、それぞれ元の枠に入れ直す。審判が使えなければ engine の順。
+    /// `last` (学習用) も同じ並びで持つので、添字と学習データはずれない。
     fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
         let Some(core) = &self.core else {
             return Vec::new();
@@ -182,8 +184,18 @@ impl CandidateEngine for RustEngine {
         }
         let converted = core.convert_all(hiragana);
         let top = &converted.main[..converted.main.len().min(TOP_N)];
-        let texts: Vec<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
-        self.last = Some((revision, top.iter().map(|c| c.data.clone()).collect()));
+        let mut order: Vec<usize> = (0..top.len()).collect();
+        let slots: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
+        let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let scores: Vec<f32> = slots.iter().map(|&i| top[i].value).collect();
+        if let Some(ranked) = crate::judge::rerank(&refs, &scores) {
+            for (&slot, k) in slots.iter().zip(ranked) {
+                order[slot] = slots[k];
+            }
+        }
+        let texts: Vec<String> = order.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
+        self.last = Some((revision, order.iter().map(|&i| top[i].data.clone()).collect()));
         texts
     }
 

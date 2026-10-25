@@ -18,12 +18,14 @@ pub struct Config {
     pub dev_words_path: Option<PathBuf>,
     /// 読み -> 絵文字の表 (`NOVAKEY_EMOJI`、無ければアプリバンドルの Resources)。
     pub emoji_path: Option<PathBuf>,
+    /// ライブ変換の審判モデルの置き場所 (`NOVAKEY_JUDGE_DIR`、無ければアプリバンドルの Resources/judge)。
+    pub judge_dir: Option<PathBuf>,
 }
 
 impl Config {
     /// 何も読み書きしない設定 (`init` されていないテストの既定)。
     pub fn inert() -> Self {
-        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, dev_words_path: None, emoji_path: None }
+        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, dev_words_path: None, emoji_path: None, judge_dir: None }
     }
 
     pub fn from_env() -> Self {
@@ -37,6 +39,7 @@ impl Config {
             loanwords_path: std::env::var_os("NOVAKEY_LOANWORDS").map(PathBuf::from).or_else(|| bundled("loanwords.tsv")),
             dev_words_path: std::env::var_os("NOVAKEY_DEV_WORDS").map(PathBuf::from).or_else(|| bundled("dev_words.txt")),
             emoji_path: std::env::var_os("NOVAKEY_EMOJI").map(PathBuf::from).or_else(|| bundled("emoji.tsv")),
+            judge_dir: std::env::var_os("NOVAKEY_JUDGE_DIR").map(PathBuf::from).or_else(|| bundled("judge")),
         }
     }
 }

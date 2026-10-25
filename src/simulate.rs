@@ -417,7 +417,7 @@ impl Sim {
     }
 }
 
-fn setup_env() {
+pub(crate) fn setup_env() {
     // 既定は学習 off。`NOVAKEY_SIM_LEARNING=1` なら学習 on (記憶先は一時ディレクトリ。NOVAKEY_MEMORY_DIR で変えられる)。
     // 学習は 1 つのファイルの中に積み上がるので、`--simulate-file` の行どうしにも効く。
     let learning = std::env::var("NOVAKEY_SIM_LEARNING").is_ok_and(|v| v == "1");
@@ -438,7 +438,60 @@ fn setup_env() {
         loanwords_path: Some(repo_table("NOVAKEY_LOANWORDS", "loanwords.tsv")),
         dev_words_path: Some(repo_table("NOVAKEY_DEV_WORDS", "dev_words.txt")),
         emoji_path: Some(repo_table("NOVAKEY_EMOJI", "emoji.tsv")),
+        // シミュレータは NOVAKEY_JUDGE_DIR を指定したときだけ審判を読む。
+        judge_dir: std::env::var_os("NOVAKEY_JUDGE_DIR").map(PathBuf::from),
     });
+}
+
+thread_local! {
+    /// 打鍵ごとの処理時間 (ms) と、審判が走ったか。`NOVAKEY_SIM_TIMING=1` の要約用。
+    static TIMINGS: std::cell::RefCell<Vec<(f64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 審判だけの時間 (ms)。
+    static JUDGE_MS: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn print_timing_summary() {
+    let mut all: Vec<f64> = Vec::new();
+    let mut judged: Vec<f64> = Vec::new();
+    TIMINGS.with(|t| {
+        for &(ms, j) in t.borrow().iter() {
+            all.push(ms);
+            if j {
+                judged.push(ms);
+            }
+        }
+    });
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0)
+    };
+    let rss = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+        / 1024.0;
+    let mut jm = JUDGE_MS.with(|j| j.borrow().clone());
+    println!(
+        "judge: n={} median {:.1} ms p90 {:.1} ms max {:.1} ms",
+        jm.len(),
+        pct(&mut jm, 0.5),
+        pct(&mut jm, 0.9),
+        pct(&mut jm, 1.0)
+    );
+    println!(
+        "timing: keys={} median {:.1} ms p95 {:.1} ms max {:.1} ms | keys with judge={} median {:.1} ms p95 {:.1} ms max {:.1} ms | rss {:.0} MB",
+        all.len(),
+        pct(&mut all, 0.5),
+        pct(&mut all, 0.95),
+        pct(&mut all, 1.0),
+        judged.len(),
+        pct(&mut judged, 0.5),
+        pct(&mut judged, 0.95),
+        pct(&mut judged, 1.0),
+        rss
+    );
 }
 
 /// 1 シナリオを最後まで流す。最後に確定した文字列と、未確定のまま残った文字列を返す。
@@ -454,7 +507,15 @@ struct Run {
 fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
     let mut sim = Sim::new();
     for (label, step) in parse_keys(keys)? {
+        let started = std::time::Instant::now();
         sim.apply(&label, &step)?;
+        let judge_ms = crate::judge::take_last_ms();
+        if let Some(ms) = judge_ms {
+            JUDGE_MS.with(|j| j.borrow_mut().push(ms));
+        }
+        if matches!(step, Step::Key(_)) {
+            TIMINGS.with(|t| t.borrow_mut().push((started.elapsed().as_secs_f64() * 1e3, judge_ms.is_some())));
+        }
         if sim.client.marked() != sim.controller.marked_text() {
             sim.stale.push(label.clone());
         }
@@ -469,6 +530,9 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
                 sim.client.marked(),
                 sim.client.committed()
             );
+            if let Some(ms) = judge_ms {
+                println!("{:>9}  judge {ms:.1} ms", "");
+            }
             let cands = sim.candidates_line();
             if !cands.is_empty() {
                 println!("{:>9}  {cands}", "");
@@ -561,6 +625,9 @@ pub fn simulate_file(path: &str, check_preedit: bool) {
         };
         let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
         println!("{verdict} {keys}  =>  {shown}{want}");
+    }
+    if std::env::var_os("NOVAKEY_SIM_TIMING").is_some() {
+        print_timing_summary();
     }
     if failures > 0 {
         eprintln!("{failures} scenario(s) failed");

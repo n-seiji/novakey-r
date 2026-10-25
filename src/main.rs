@@ -6,6 +6,7 @@ mod deps;
 mod imk;
 mod imk_client;
 mod input;
+mod judge;
 mod keymap;
 mod kkc;
 mod llm_bridge;
@@ -40,6 +41,14 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--kkc-bench") {
         std::process::exit(kkc::compare::bench_cli(args.get(i + 1).map_or("", String::as_str)));
     }
+    if let Some(i) = args.iter().position(|a| a == "--judge-dump") {
+        simulate::setup_env();
+        std::process::exit(judge::dump_cli(args.get(i + 1).map_or("", String::as_str)));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--judge-bench") {
+        simulate::setup_env();
+        std::process::exit(judge::bench_cli(args.get(i + 1).map_or("", String::as_str)));
+    }
     if let Some(i) = args.iter().position(|a| a == "--simulate") {
         simulate::simulate(args.get(i + 1).map_or("", String::as_str), args.iter().any(|a| a == "--check-preedit"));
         return;
@@ -59,6 +68,8 @@ fn main() {
     }
 
     config::init(config::Config::from_env());
+    platform::begin_activity();
+    judge::preload();
     platform::install_panic_hook();
     imk::register_controller();
     imk::init_llm_dispatch();
