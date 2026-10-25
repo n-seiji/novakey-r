@@ -1,10 +1,10 @@
-# Releasing
+# リリース手順
 
-For maintainers. Releases are built, signed and notarized by `.github/workflows/release.yml`; nothing is published until the `release` environment is approved.
+メンテナ向けです。リリースは `.github/workflows/release.yml` がビルド・署名・公証まで行います。`release` 環境を承認するまでは何も公開されません。
 
-1. Once, in this order (the order matters: with the variable set before the environment and its reviewer exist, a release would be published without anyone approving it):
-   1. Run `scripts/setup-release-env.sh`. It creates both environments, `signing` (holds the secrets, main only) and `release` (one required reviewer, main only).
-   2. Set the seven secrets in the `signing` environment (`gh` prompts for the value of the ones without stdin). `cert.p12` holds the Developer ID Application certificate (signs the app) and `installer.p12` the Developer ID Installer certificate (signs the package), each with its private key:
+1. 初回のみ、次の順で行います (順序が大事です。環境と承認者を作る前に変数を設定すると、誰の承認もなくリリースが公開されてしまいます)。
+   1. `scripts/setup-release-env.sh` を実行します。`signing` 環境 (シークレットを置く、main のみ) と `release` 環境 (承認者 1 人、main のみ) の両方を作ります。
+   2. 7 つのシークレットを `signing` 環境に登録します (標準入力を使わないものは `gh` が値を尋ねます)。`cert.p12` は Developer ID Application 証明書 (アプリの署名)、`installer.p12` は Developer ID Installer 証明書 (パッケージの署名) で、どちらも秘密鍵を含めます。
       ```sh
       base64 -i cert.p12 | gh secret set DEVELOPER_ID_P12_BASE64 --env signing
       gh secret set DEVELOPER_ID_P12_PASSWORD --env signing
@@ -14,12 +14,12 @@ For maintainers. Releases are built, signed and notarized by `.github/workflows/
       gh secret set ASC_ISSUER_ID --env signing
       base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set ASC_KEY_P8_BASE64 --env signing
       ```
-   3. Set the repository variable that turns releases on: `gh variable set RELEASE_ENABLED --body true`. Until it is `true`, the workflow only reports "release disabled" and builds nothing, so merging to main is safe.
+   3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
 
-   The secrets are scoped to the `signing` environment, which only jobs running on main can use, so workflows on other branches cannot read them. Use a dedicated App Store Connect API key for this repository, with the Developer role, for notarization.
-2. Bump `version` in `Cargo.toml` and merge to main. The workflow builds the app, signs, notarizes and staples it, and zips it. It then builds `Shizuku-<version>.pkg` from the stapled app (`scripts/build-pkg.sh`), signs the package with the Developer ID Installer identity, notarizes and staples the package, and checks it with `spctl --assess --type install`. Finally it creates a draft release with the `.pkg`, the `.app.zip` (secondary) and their `.sha256` files.
-3. Test the draft before approving it:
-   - Download the `.pkg` from the draft **in Safari**, so it gets the quarantine attribute. Open it, check that the installer does not ask for a password, log out and back in, add the input source and type.
-   - Open the same `.pkg` again over the installed one and check that Shizuku is still in Input Sources.
-   - If Gatekeeper blocks the package or the IME, do not approve.
-4. Approve the `release` environment. The publish job checks the draft against the build's checksums, attests the `.pkg` and the zip and publishes the release.
+   シークレットは `signing` 環境に紐づき、この環境を使えるのは main で動くジョブだけなので、他のブランチのワークフローからは読めません。公証には、このリポジトリ専用の App Store Connect API キー (Developer ロール) を使ってください。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `Shizuku-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
+3. 承認する前に下書きを試します。
+   - 下書きの `.pkg` を **Safari で** ダウンロードします (quarantine 属性を付けるため)。開いてパスワードを求められないことを確かめ、ログインし直して入力ソースを追加し、実際に打ちます。
+   - 同じ `.pkg` をもう一度、入っている版の上から開き、Shizuku が入力ソースに残っていることを確かめます。
+   - Gatekeeper がパッケージか IME を止めるなら、承認しません。
+4. `release` 環境を承認します。publish ジョブが下書きをビルド時のチェックサムと照合し、`.pkg` と zip の attestation を作ってリリースを公開します。
