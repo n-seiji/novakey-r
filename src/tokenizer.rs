@@ -382,15 +382,17 @@ mod tests {
     }
 
     /// `tokenizers` 0.21.4 で作った (入力, id 列) と一致する (tokenizer.json は tools/judge.sha256 のもの)。
-    /// tokenizer.json は git に入らないので、無ければ飛ばす。
+    /// tokenizer.json は git に入らないので、無ければ飛ばす (あるのに読めなければ失敗)。
     #[test]
     fn 本物の語彙で_tokenizers_crate_と同じ_id_列になる() {
         let dir = std::env::var_os("NOVAKEY_JUDGE_DIR")
             .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/judge"), Into::into);
-        let Ok(t) = Tokenizer::from_file(&dir.join("tokenizer.json")) else {
+        let path = dir.join("tokenizer.json");
+        if !path.exists() {
             eprintln!("skip: no tokenizer.json in resources/judge");
             return;
-        };
+        }
+        let t = Tokenizer::from_file(&path).expect("tokenizer.json exists but cannot be loaded");
         let golden = include_str!("../tools/tokenizer_ids.jsonl");
         let mut n = 0;
         for line in golden.lines() {
