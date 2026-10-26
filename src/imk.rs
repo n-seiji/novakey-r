@@ -142,6 +142,8 @@ declare_class!(
                 let route = input::route(&event);
                 if route == Route::PassThrough {
                     trace::record("handleEvent", "key=Shortcut action=PassThrough");
+                    // 文脈を捨てるために知らせる (常に素通し)。
+                    self.ivars().controller.on_key(route, Client::new(client));
                     return Bool::NO;
                 }
                 let started = std::time::Instant::now();

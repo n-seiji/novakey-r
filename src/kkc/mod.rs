@@ -160,25 +160,27 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
     })
 }
 
-/// 全文候補の並べ替え。(文字列, engine のスコア) -> 良い順の添字、使えなければ `None`。本番は `judge::rerank`。
-type Judge = fn(&[&str], &[f32]) -> Option<Vec<usize>>;
+/// 全文候補の並べ替え。(文脈, 文字列, engine のスコア) -> 良い順の添字、使えなければ `None`。本番は `judge::rerank`。
+type Judge = fn(&str, &[&str], &[f32]) -> Option<Vec<usize>>;
 
 /// Rust 実装のかな漢字変換エンジン。
 pub struct RustEngine {
     core: Option<Rc<KkcCore>>,
     judge: Judge,
+    /// 審判に渡す文脈 (アプリで直前に確定した文字列)。メモリ上だけで、ログにも書かない。
+    context: String,
     /// 直近の変換の revision と、返した候補ごとの `Candidate.data`。`select` の検証と学習用。
     last: Option<(u64, Vec<Vec<Rc<elem::Elem>>>)>,
 }
 
 impl RustEngine {
     pub fn new() -> Self {
-        Self { core: shared_core(), judge: crate::judge::rerank, last: None }
+        Self { core: shared_core(), judge: crate::judge::rerank, context: String::new(), last: None }
     }
 
     #[cfg(test)]
     pub fn with_core(core: Rc<KkcCore>) -> Self {
-        Self { core: Some(core), judge: crate::judge::rerank, last: None }
+        Self { core: Some(core), judge: crate::judge::rerank, context: String::new(), last: None }
     }
 
     /// 審判を差し替える (テスト用。実際の並べ替え経路を fake で通す)。
@@ -218,7 +220,7 @@ impl CandidateEngine for RustEngine {
         let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let scores: Vec<f32> = slots.iter().map(|&i| top[i].value).collect();
-        if let Some(ranked) = (self.judge)(&refs, &scores).filter(|r| is_permutation(r, slots.len())) {
+        if let Some(ranked) = (self.judge)(&self.context, &refs, &scores).filter(|r| is_permutation(r, slots.len())) {
             for (&slot, k) in slots.iter().zip(ranked) {
                 order[slot] = slots[k];
             }
@@ -246,6 +248,11 @@ impl CandidateEngine for RustEngine {
 
     fn cancel(&mut self) {
         self.last = None;
+    }
+
+    fn set_context(&mut self, context: &str) {
+        self.context.clear();
+        self.context.push_str(context);
     }
 
     fn has_reading(&self, hiragana: &str) -> bool {
@@ -280,15 +287,15 @@ mod tests {
         cands.iter().position(|c| c == want).unwrap_or_else(|| panic!("{want} が候補にない: {cands:?}"))
     }
 
-    fn reverse_judge(texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+    fn reverse_judge(_context: &str, texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
         Some((0..texts.len()).rev().collect())
     }
 
-    fn no_judge(_texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+    fn no_judge(_context: &str, _texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
         None
     }
 
-    fn broken_judge(texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+    fn broken_judge(_context: &str, texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
         Some(vec![0; texts.len()])
     }
 
@@ -531,5 +538,26 @@ mod tests {
         let before = e.convert(1, "かんじ");
         assert!(e.select(1, index_of(&before, "幹事")));
         assert_eq!(e.convert(2, "かんじ"), before);
+    }
+
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn spy_judge(context: &str, _texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        SEEN.with(|s| s.borrow_mut().push(context.to_string()));
+        None
+    }
+
+    #[test]
+    fn 設定した文脈が審判に渡り_空にすると文脈なしに戻る() {
+        let core = Rc::new(KkcCore::open().unwrap());
+        let mut e = RustEngine::with_core(core).with_judge(spy_judge);
+        e.convert(1, "かんじ");
+        e.set_context("机の");
+        e.convert(2, "かんじ");
+        e.set_context("");
+        e.convert(3, "かんじ");
+        assert_eq!(SEEN.with(|s| s.borrow().clone()), ["", "机の", ""]);
     }
 }

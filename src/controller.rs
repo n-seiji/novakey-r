@@ -148,17 +148,28 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             self.sync_conversion_mode();
         }
         match route {
-            Route::PassThrough => false,
+            Route::PassThrough => {
+                // Cmd / Ctrl / Option のショートカット (貼り付け・取り消し・全選択など) は、何が入ったか分からない。
+                self.clear_context(Some(&client));
+                false
+            }
             Route::Translit(form) => self.dispatch(Key::Translit(form), "", &client),
-            Route::Keys(keys) => keys.iter().fold(false, |handled, (key, text)| {
-                self.dispatch(*key, text, &client) || handled
-            }),
+            Route::Keys(keys) => {
+                let handled = keys.iter().fold(false, |handled, (key, text)| self.dispatch(*key, text, &client) || handled);
+                if !handled {
+                    keys.iter().for_each(|(key, text)| self.remember_pass_through(*key, text, &client));
+                }
+                handled
+            }
             Route::Navigation => {
                 let has_pending = self.session.borrow().has_pending();
                 self.env.trace(
                     "handleEvent",
                     &format!("id={} mode={:?} key=Navigation phase={:?} handled={has_pending}", self.id, self.mode(), self.phase()),
                 );
+                if !has_pending {
+                    self.clear_context(Some(&client));
+                }
                 has_pending
             }
         }
@@ -193,6 +204,8 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         let gates = self.gates(client.as_ref());
         let effects = self.session.borrow_mut().commit_composition(&gates);
         self.run(effects, client.as_ref());
+        // クリックやフォーカスの移動でカーソルが動いたかもしれない。
+        self.clear_context(client.as_ref());
         self.sync_activity();
     }
 
@@ -240,11 +253,55 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.bundle_id.get().map(String::as_str)
     }
 
+    /// 文脈を覚えて使ってよいアプリの bundle id。取れない・学習が許されない・素通し (セキュア入力・パスワード管理アプリ) のときは None。
+    fn context_app(&self, client: Option<&C>) -> Option<String> {
+        let gates = self.gates(client);
+        let allowed = gates.learning && !gates.direct;
+        self.bundle_id(client).filter(|_| allowed).map(str::to_string)
+    }
+
+    /// このアプリの文脈を捨てる (カーソルが動いたか、入った文字が分からなくなった)。
+    fn clear_context(&self, client: Option<&C>) {
+        if let Some(app) = self.context_app(client) {
+            crate::context::with(|store| store.clear(&app));
+        }
+    }
+
+    /// このアプリで直前に確定した文字列 (覚えていなければ空)。
+    fn context(&self, client: Option<&C>) -> String {
+        self.context_app(client).map_or_else(String::new, |app| {
+            crate::context::with(|store| store.get(&app, std::time::Instant::now()).to_string())
+        })
+    }
+
+    /// アプリに入った文字列を文脈に足す。
+    fn remember(&self, text: &str, client: Option<&C>) {
+        if let Some(app) = self.context_app(client) {
+            crate::context::with(|store| store.record(&app, text, std::time::Instant::now()));
+        }
+    }
+
+    /// 処理しなかったキーがアプリへ素通しになった。入る文字は文脈に足し、カーソルが動くキーは文脈を捨てる。
+    fn remember_pass_through(&self, key: Key, text: &str, client: &C) {
+        let Some(app) = self.context_app(Some(client)) else { return };
+        match key {
+            Key::Enter | Key::Up | Key::Down | Key::Control => crate::context::with(|store| store.clear(&app)),
+            Key::Backspace => crate::context::with(|store| store.pop(&app)),
+            Key::Translit(_) | Key::Escape => {}
+            _ => self.remember(text, Some(client)),
+        }
+    }
+
     /// session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
         let gates = self.gates(Some(client));
+        let context = self.context(Some(client));
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
-        let outcome = self.session.borrow_mut().handle(&gates, key, text);
+        let outcome = {
+            let mut session = self.session.borrow_mut();
+            session.set_context(&context);
+            session.handle(&gates, key, text)
+        };
         let Outcome { handled, action, phase, effects } = outcome;
         self.run(effects, Some(client));
         match action {
@@ -279,6 +336,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                     if let Some(client) = client {
                         client.insert(&text);
                     }
+                    self.remember(&text, client);
                 }
                 Effect::ShowCandidates { selected } => self.show_candidates(selected),
                 Effect::HideCandidates => self.panel.hide(),
@@ -883,5 +941,129 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert!(!flag.get());
+    }
+
+    /// bundle id を持つクライアントで確定した文字列が、そのアプリの文脈に入る。
+    fn context_of(app: &str) -> String {
+        crate::context::with(|store| store.get(app, std::time::Instant::now()).to_string())
+    }
+
+    fn type_hello_and_commit(f: &Fixture) {
+        assert!(press(f, Key::Letter { upper: true }, "H"));
+        type_letters(f, "ello");
+        assert!(press(f, Key::Enter, "\r"));
+        assert_eq!(f.1.committed(), "Hello");
+    }
+
+    #[test]
+    fn 確定した文字列はそのアプリの文脈にだけ入る() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert_eq!(context_of("app.one"), "Hello");
+        assert_eq!(context_of("app.two"), "");
+    }
+
+    #[test]
+    fn 学習が許されないアプリと_bundle_id_が取れないクライアントでは覚えない() {
+        let f = fixture();
+        f.1.set_bundle("com.1password.1password");
+        // パスワード管理アプリでは素通しになり、何も入らない (覚える文字も無い)。
+        assert!(!press(&f, Key::Letter { upper: true }, "H"));
+        assert_eq!(context_of("com.1password.1password"), "");
+        // bundle id が取れないクライアントでは、確定しても誰の文脈にも入らない。
+        let g = fixture();
+        type_hello_and_commit(&g);
+        assert!(crate::context::with(|store| store.is_empty()), "何も記録されない");
+    }
+
+    #[test]
+    fn 直接入力では文脈を覚えず_使わない() {
+        let (c, client, _panel, env) = rec_fixture();
+        client.set_bundle(Some("app.one"));
+        assert!(rec_press(&c, &client, Key::Symbol, "@"));
+        assert_eq!(context_of("app.one"), "@");
+        env.secure.set(true);
+        assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
+        assert!(!rec_press(&c, &client, Key::Backspace, "\u{7f}"));
+        assert_eq!(context_of("app.one"), "@", "セキュア入力中は記録も削除もしない");
+        assert_eq!(c.context(Some(&client)), "", "セキュア入力中は文脈を使わない");
+        assert!(!c.on_key(Route::PassThrough, client.clone()));
+        assert_eq!(context_of("app.one"), "@", "セキュア入力中は捨てもしない");
+    }
+
+    #[test]
+    fn 直接入れた文字は覚え_バックスペースで消え_改行とナビゲーションで捨てる() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        assert!(press(&f, Key::Symbol, "@"));
+        assert!(press(&f, Key::Symbol, "&"));
+        assert_eq!(context_of("app.one"), "@&");
+        assert!(!press(&f, Key::Backspace, "\u{7f}"));
+        assert_eq!(context_of("app.one"), "@");
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert_eq!(context_of("app.one"), "");
+        assert!(press(&f, Key::Symbol, "@"));
+        assert_eq!(context_of("app.one"), "@");
+        assert!(!f.0.on_key(Route::Navigation, f.1.clone()));
+        assert_eq!(context_of("app.one"), "");
+    }
+
+    #[test]
+    fn 修飾キー付きの素通しと_tab_は文脈を捨てる() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        assert!(press(&f, Key::Symbol, "@"));
+        // Cmd+V / Cmd+Z / Cmd+Backspace / Cmd+A など (Cmd / Ctrl / Option が付くと Route::PassThrough)。
+        assert!(!f.0.on_key(Route::PassThrough, f.1.clone()));
+        assert_eq!(context_of("app.one"), "");
+        assert!(press(&f, Key::Symbol, "@"));
+        assert!(!press(&f, Key::Control, ""));
+        assert_eq!(context_of("app.one"), "");
+    }
+
+    #[test]
+    fn commit_composition_のあとは文脈を捨てる() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        type_letters(&f, "a");
+        f.0.on_commit_composition(Some(f.1.clone()));
+        assert_eq!(f.1.committed(), "Helloあ");
+        assert_eq!(context_of("app.one"), "");
+    }
+
+    #[test]
+    fn 英語を確定したあとの_感嘆符は半角のまま入る() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.committed(), "Hello!");
+        assert_eq!(f.1.marked(), "");
+        assert_eq!(f.0.phase(), Phase::Empty);
+    }
+
+    #[test]
+    fn 日本語を確定したあとと文脈が無いときの_感嘆符は全角の組成になる() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.marked(), "！", "文脈なし");
+        assert!(press(&f, Key::Escape, "\u{1b}"));
+        type_letters(&f, "a");
+        assert!(press(&f, Key::Enter, "\r"));
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.marked(), "！", "日本語のあと");
+        assert_eq!(f.1.committed(), "あ");
+    }
+
+    #[test]
+    fn 英語を確定したあとでも_かぎ括弧は日本語のまま() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert!(press(&f, Key::Punct, "["));
+        assert_eq!(f.1.marked(), "「");
     }
 }
