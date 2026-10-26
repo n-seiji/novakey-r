@@ -26,11 +26,21 @@ pkg=dist/Shizuku-$version.pkg
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/root" "$tmp/packages" "$tmp/resources"
+mkdir -p "$tmp/root" "$tmp/packages" "$tmp/resources" "$tmp/scripts"
 # The payload root stands for ~/Library/Input Methods; keep it 0755 whatever the umask.
 chmod 755 "$tmp/root"
 # ditto keeps the signature, the stapled ticket and extended attributes.
 ditto "$APP" "$tmp/root/Shizuku.app"
+
+# After the files are replaced, stop this user's running Shizuku so the next key launches the new
+# binary (macOS starts an input method on demand). The bundle is only overwritten, never deleted,
+# so Shizuku stays in Input Sources. Never fails the install.
+cat > "$tmp/scripts/postinstall" <<'SH'
+#!/bin/sh
+/usr/bin/pkill -x -u "$(/usr/bin/id -u)" shizuku || true
+exit 0
+SH
+chmod 755 "$tmp/scripts/postinstall"
 
 # Install exactly where the package says, even if another Shizuku.app exists elsewhere.
 pkgbuild --analyze --root "$tmp/root" "$tmp/component.plist" >/dev/null
@@ -42,6 +52,7 @@ pkgbuild --root "$tmp/root" \
   --identifier "$PKG_ID" \
   --version "$version" \
   --install-location "/Library/Input Methods" \
+  --scripts "$tmp/scripts" \
   "$tmp/packages/Shizuku.pkg"
 
 cat > "$tmp/resources/conclusion.txt" <<'TXT'
@@ -49,14 +60,14 @@ Shizuku is installed in ~/Library/Input Methods.
 
 Add Shizuku in System Settings > Keyboard > Input Sources. If it is not listed yet, log out and back in first.
 
-To update later, open the newer Shizuku package over this one.
+To update later, open the newer Shizuku package over this one. The running Shizuku is restarted, so the new version is used from the next key.
 TXT
 
 cat > "$tmp/Distribution" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
     <title>Shizuku</title>
-    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="false"/>
     <allowed-os-versions>
         <os-version min="26.0"/>
