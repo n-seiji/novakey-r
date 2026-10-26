@@ -45,7 +45,7 @@ iPhone<enter>	いPhone
 iPhone<space><enter>	いPhone
 google<S-space><enter>	google
 desukutoppu<space><space><enter>	desktop
-desukutoppu<space><space><space><enter>	desukutoppu
+desukutoppu<space><up><enter>	desukutoppu
 uxinndou<space><enter>	ウィンドウ
 uxinndou<space><space><enter>	window
 123<enter>	123\n
@@ -95,7 +95,7 @@ kyou<space><space><esc><enter>	きょう
 kyou<space><esc><esc><enter>	\n
 kyou<esc><enter>	\n
 kyou<esc><esc>
-kyou<space><S-space><S-space><enter>	興
+kyou<space><S-space><S-space><enter>	巨
 kyou<S-space><enter>	強
 <S-space>	 
 <space>	 
@@ -106,11 +106,11 @@ kyou<S-space><enter>	強
 a<tab>	あ\t
 kyou<tab>x
 kyou<space><tab>	強\t
-kyou<space><up><enter>	巨
-kyou<space><down><enter>	kyou
+kyou<space><up><enter>	kyou
+kyou<space><down><enter>	今日
 kyou<up><enter>	きょう
-kyou<space><space>3	今日
-kyou<space><space>9	興
+kyou<space><space>3	きょう
+kyou<space><space>9	巨
 kyou<space><space>0
 kyou<space><space>1	強
 kyou<space>a
@@ -169,15 +169,15 @@ kyonn<enter>	きょん
 kyon<enter>	きょん
 kyon<space><enter>	きょん
 nihongo<space><enter>	日本語
-nihongo<space><space><enter>	nihongo
+nihongo<space><up><enter>	nihongo
 githubwo<S-space><enter>	githubを
 githubwo<enter>	githubを
-githubwo<S-space><space><enter>	githubwo
+githubwo<S-space><up><enter>	githubwo
 git<S-space><space><enter>	義t
 git<S-space><space><space><enter>	魏t
 git<bs><space><enter>	偽
 gi<space><enter>	偽
-gi<space><space><enter>	gi
+gi<space><up><enter>	gi
 test<S-space><enter>	test
 test<S-space><space><enter>	手st
 test<S-space><space><space><enter>	てst
@@ -186,7 +186,7 @@ google<S-space><space><enter>	ごおgぇ
 chrome<S-space><enter>	chrome
 Chrome<space><enter>	Chrome \n
 kyouhaiitenkidesune<space><enter>	強はいい天気ですね
-kyouhaiitenkidesune<space><space><space><enter>	今日はいい天気ですね
+kyouhaiitenkidesune<space><space><enter>	今日はいい天気ですね
 bokuhasushiwotabetai<space><enter>	僕は寿司を食べたい
 oosaka<space><enter>	大阪
 oosakajou<space><enter>	大坂城
@@ -194,13 +194,13 @@ puroguramingu<space><enter>	プログラミング
 puroguramingu<space><space><enter>	programming
 konpyu-ta<space><enter>	コンピュータ
 konpyu-ta<space><space><enter>	computer
-kompyu-ta<space><space><enter>	kompyu-ta
+kompyu-ta<space><up><enter>	kompyu-ta
 sa-ba-<space><space><enter>	server
 meiru<space><space><enter>	email
-sofutowea<space><space><enter>	sofutowea
-appuru<space><space><enter>	appuru
-kiibo-do<space><space><enter>	kiibo-do
-masu<space><space><space><enter>	masu
+sofutowea<space><up><enter>	sofutowea
+appuru<space><up><enter>	appuru
+kiibo-do<space><up><enter>	kiibo-do
+masu<space><up><enter>	masu
 sukurin<space><enter>	スクリん
 ie<enter>	いえ
 wo<enter>	を
@@ -240,7 +240,7 @@ kyou1<enter>	きょう1
 kyou1<space><enter>	今日1
 kyou1gatsu<space><enter>	今日1ガツ
 2024nen<space><enter>	2024念
-2024nen<space><space><enter>	2024nen
+2024nen<space><up><enter>	2024nen
 sen<space><enter>	戦
 iti<space><enter>	一
 ichi<space><enter>	一
@@ -286,7 +286,7 @@ enter(<enter>	enter(\n
 enter<space>1
 enter<S-space>x<enter>	enterx
 enter<S-space><space>1	enter
-kyou<space><space>2	kyou
+kyou<space><space>2	今日
 git<space>1
 git<S-space><space>2	義t
 (<space><space><space><space><space><space><space><space><space><space><space><space><enter>	『
@@ -307,7 +307,7 @@ git<S-space><space>2	義t
 kyou[<space><enter>	強「
 kyou[<enter>	きょう「
 kyou,<space><enter>	今日、
-kyou,<space><space><enter>	kyou,
+kyou,<space><up><enter>	kyou,
 kyou,a<enter>	きょう、あ
 kyou.<space>
 kyou!<bs><enter>	きょう
@@ -316,7 +316,7 @@ kyou?<space><enter>	強？
 ,,<space><enter>	、、
 ..<space><enter>	。。
 ...<enter>	。。。
-...<space><space><enter>	...
+...<space><up><enter>	...
 !?<enter>	！？
 !?<space><enter>	！？
 kyou<C-k>a<enter>	キョウあ
@@ -328,7 +328,7 @@ kyou<F10><F10><F10><enter>	Kyou
 kyou<F10><space><enter>	強
 kyou<F9><space><enter>	強
 kyou<F7><F6><enter>	きょう
-kyou<F7><space><space><enter>	kyou
+kyou<F7><space><up><enter>	kyou
 kyou<F7><S-space><enter>	強
 kyou<F7><tab>	キョウ\t
 kyou<F7>1<enter>	キョウ1\n
@@ -368,7 +368,7 @@ kyo<esc><enter>	\n
 kyou<space>k<bs><enter>	強\n
 kyou<space>k<enter>	強k
 kyou<space>k<S-space><enter>	強k
-kyou<space><space>k<esc><enter>	kyou\n
+kyou<space><up>k<esc><enter>	kyou\n
 kyou<space>k<esc><enter>	強\n
 kyou<space>n<enter>	強ん
 ky<bs><enter>	k
@@ -404,7 +404,7 @@ kyou<space>1<enter>	強1\n
 kyou<space>,<enter>	強、
 kyou<space>A<enter>	強A
 kyou<space><space>1	強
-kyou<space><space>a<enter>	kyouあ
+kyou<space><up>a<enter>	kyouあ
 kyou<F7>a<enter>	キョウあ
 kyou<F9>1<enter>	ｋｙｏｕ1\n
 kyou<space>ka<enter>	強か
@@ -452,15 +452,15 @@ Tokyo<F9><F9><enter>	ｔｏｋｙｏ
 kyouTokyo<F10><enter>	kyouTokyo
 kyouTokyo<F10><F10><enter>	kyoutokyo
 kyou<F10><F10><enter>	KYOU
-# 絵文字候補 (resources/emoji.tsv): 読み全体が一致したときだけ、上位のエンジン候補と英単語・raw の後ろに最大 5 件入り、数字キーで選べる。学習しない。
+# 絵文字候補 (resources/emoji.tsv): 読み全体が一致したときだけ、上位のエンジン候補と英単語の後ろ (raw は英単語でなければ末尾) に最大 5 件入り、数字キーで選べる。学習しない。
 neko<space>
-neko<space><space>5	🐈
-kanpai<space><space>5	🍻
-kanpai<space><space>6	🥂
-egao<space><space>5	☺️
-inu<space><space>5	🐕
-bi-ru<space><space>6	🍻
-ha-to<space><space>5	🧡
+neko<space><space>4	🐈
+kanpai<space><space>4	🍻
+kanpai<space><space>5	🥂
+egao<space><space>4	☺️
+inu<space><space>4	🐕
+bi-ru<space><space>5	🍻
+ha-to<space><space>4	🧡
 mergeshite<enter>	mergeして
 mergesite<enter>	mergeして
 commitshite<enter>	commitして

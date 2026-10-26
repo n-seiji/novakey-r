@@ -489,15 +489,17 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 打鍵列全体が英語として確定したことのある語 (git) か 4 文字以上の英単語 (enter) になっている。
     /// 表の短い語は日本語の打ちかけ (in, den) と紛れるので外す。
     pub fn is_typing_english(&self) -> bool {
-        const MIN_LEN: usize = 4;
         let raw = self.raw();
-        let word = || {
-            !self.romaji.buffer().is_empty()
-                && (self.lexicon.knows_english(&raw) || (raw.len() >= MIN_LEN && self.lexicon.is_english_word(&raw)))
-        };
+        let word = || !self.romaji.buffer().is_empty() && self.is_english_word_raw(&raw);
         self.is_kana_editing()
             && raw.bytes().all(|b| b.is_ascii_lowercase())
             && (self.has_ascii_kana() || word())
+    }
+
+    /// 打鍵列全体が英語として確定したことのある語か 4 文字以上の英単語か。
+    fn is_english_word_raw(&self, raw: &str) -> bool {
+        const MIN_LEN: usize = 4;
+        self.lexicon.knows_english(raw) || (raw.len() >= MIN_LEN && self.lexicon.is_english_word(raw))
     }
 
     /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。英字の区切りは数えない。
@@ -688,9 +690,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         self.insert_kana_fallback(&mut list, phase);
         // 英単語は raw より前に並べたいので、先に raw を入れてから第 1 候補の直後へ割り込ませる。
-        self.insert_raw_candidate(&mut list, phase);
+        self.insert_raw_candidate(&mut list, phase, true);
         self.insert_english_candidates(&mut list, phase);
         self.insert_emoji_candidates(&mut list, phase);
+        // 英単語でない raw は絵文字の位置に影響しないよう、最後に末尾へ足す。
+        self.insert_raw_candidate(&mut list, phase, false);
         if list.is_empty() {
             return false;
         }
@@ -868,14 +872,21 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
     }
 
-    fn insert_raw_candidate(&self, list: &mut Vec<Candidate>, phase: Phase) {
+    /// raw を入れる。Dangling は先頭、英単語なら第 2 候補 (`early` の回)、それ以外は末尾 (`!early` の回)。
+    /// 英単語でない raw (kazu, dei) は候補としてはノイズなので末尾に回す (消さない)。
+    fn insert_raw_candidate(&self, list: &mut Vec<Candidate>, phase: Phase, early: bool) {
         let raw = self.raw();
         if raw.is_empty() || self.is_symbol() || list.iter().any(|c| c.text == raw) {
             return;
         }
+        let is_early = phase == Phase::Dangling || self.is_english_word_raw(&raw);
+        if is_early != early {
+            return;
+        }
         let position = match phase {
             Phase::Dangling => 0,
-            _ => list.len().min(1),
+            _ if early => list.len().min(1),
+            _ => list.len(),
         };
         list.insert(
             position,
@@ -956,7 +967,9 @@ mod tests {
                 vec!["今日".to_string(), "京".to_string(), "教".to_string()],
             )],
         };
-        (Composer::new(engine, FakeLexicon::default()), log)
+        // kyou は raw が第 2 候補に残る英単語として扱う (非英単語の raw は末尾になるため)。
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "kyou");
+        (Composer::new(engine, lexicon), log)
     }
 
     fn type_kyou(c: &mut Composer<MockEngine, FakeLexicon>) {
@@ -1105,10 +1118,35 @@ mod tests {
         c.push_input("gi", "ぎ", "");
         assert!(c.begin_conversion());
         assert_eq!(c.display(), "ぎ");
-        assert_eq!(texts(&c), vec!["ぎ", "gi", "ギ"]);
+        assert_eq!(texts(&c), vec!["ぎ", "ギ", "gi"]);
         assert!(c.candidates().iter().all(|cand| cand.engine_rank().is_none()));
         assert_eq!(commit_learning(&mut c), "ぎ");
         assert_eq!(*c.engine_cancels(), 1, "学習しない");
+    }
+
+    #[test]
+    fn 英単語でないrawは末尾に回り消えない() {
+        let engine = MockEngine {
+            log: Log::default(),
+            table: vec![("かず".to_string(), vec!["数".to_string(), "和".to_string()])],
+        };
+        let mut c = Composer::new(engine, FakeLexicon::default().with_english_word(|w| w == "kyou"));
+        c.push_input("kazu", "かず", "");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["数", "和", "kazu"]);
+        assert_eq!(c.candidates()[2].source, Source::Raw);
+    }
+
+    #[test]
+    fn 英単語のrawは第2候補に残る() {
+        let engine = MockEngine {
+            log: Log::default(),
+            table: vec![("かず".to_string(), vec!["数".to_string(), "和".to_string()])],
+        };
+        let mut c = Composer::new(engine, FakeLexicon::default().with_english_word(|w| w == "kazu"));
+        c.push_input("kazu", "かず", "");
+        assert!(c.begin_conversion());
+        assert_eq!(texts(&c), vec!["数", "kazu", "和"]);
     }
 
     #[test]
@@ -1456,7 +1494,7 @@ mod tests {
         assert_eq!(log.converts.borrow().last().map(|(_, h)| h.as_str()), Some("「かぎ」"));
         assert!(c.begin_conversion());
         assert_eq!(c.candidates()[0].text, "「かぎ」K1");
-        assert_eq!(texts(&c)[1], "[kagi]");
+        assert_eq!(texts(&c).last().copied(), Some("[kagi]"), "英単語でない raw は末尾");
     }
 
     #[test]
@@ -1714,13 +1752,13 @@ mod tests {
     }
 
     #[test]
-    fn カタカナ語は英単語が第1候補とrawの間に入る() {
+    fn カタカナ語は英単語が第1候補の直後に入り英単語でないrawは末尾() {
         let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ"]);
         c.push_input("desukutoppu", "ですくとっぷ", "");
         c.begin_conversion();
         assert_eq!(
             texts(&c),
-            vec!["デスクトップ", "desktop", "desukutoppu", "デス区トップ"]
+            vec!["デスクトップ", "desktop", "デス区トップ", "desukutoppu"]
         );
         assert_eq!(c.candidates()[1].engine_rank(), None);
     }
@@ -1815,15 +1853,15 @@ mod tests {
     }
 
     #[test]
-    fn 絵文字は上位3件のエンジン候補とrawの後ろに入り最大5件() {
+    fn 絵文字は上位3件のエンジン候補の後ろに入り最大5件で末尾のrawを押し出さない() {
         let mut c = emoji_composer("ねこ", &["猫", "ネコ", "根子", "寝こ", "値こ"]);
         c.push_input("neko", "ねこ", "");
         c.begin_conversion();
         assert_eq!(
             texts(&c),
-            vec!["猫", "neko", "ネコ", "根子", "😺", "😸", "😹", "😻", "😼", "寝こ", "値こ"]
+            vec!["猫", "ネコ", "根子", "😺", "😸", "😹", "😻", "😼", "寝こ", "値こ", "neko"]
         );
-        assert_eq!(c.candidates()[4].engine_rank(), None);
+        assert_eq!(c.candidates()[3].engine_rank(), None);
     }
 
     #[test]
@@ -1831,11 +1869,11 @@ mod tests {
         let mut c = emoji_composer("いぬ", &["犬"]);
         c.push_input("inu", "いぬ", "");
         c.begin_conversion();
-        assert_eq!(texts(&c), vec!["犬", "inu", "🐶"]);
+        assert_eq!(texts(&c), vec!["犬", "🐶", "inu"]);
         let mut c = emoji_composer("いぬ", &[]);
         c.push_input("inu", "いぬ", "");
         c.begin_conversion();
-        assert_eq!(texts(&c), vec!["いぬ", "inu", "イヌ", "🐶"]);
+        assert_eq!(texts(&c), vec!["いぬ", "イヌ", "🐶", "inu"]);
     }
 
     #[test]

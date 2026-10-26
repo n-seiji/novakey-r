@@ -2,7 +2,7 @@
 # 行は上から順に 1 つの記憶へ積み上がるので、並びを変えると結果が変わる。形式は scenarios.txt と同じ。
 # 学習前: 感じ / kanji / 漢字 / 幹事 の順
 kanji<space><enter>	感じ
-kanji<space><space><space><space><enter>	幹事
+kanji<space><space><space><enter>	幹事
 kanji<space><enter>	幹事
 # 別の読みには影響しない
 kankei<space><enter>	関係
