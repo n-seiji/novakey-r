@@ -3,9 +3,6 @@
 // session.rs - 1 キーぶんの判断。ローマ字バッファと composer を持ち、キーを受けて状態を進め、
 // Cocoa に対して行うべきこと (Effect) の列を返す。imk.rs は Effect を実行するだけで、ここは headless で動く。
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
-
 use crate::composer::{CandidateEngine, Committed, Composer, Phase};
 use crate::deps::{EnglishMemory, Lexicon};
 use crate::keymap::{self, Action, Key};
@@ -48,8 +45,6 @@ pub struct Gates {
 pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     composer: Composer<E, L>,
     memory: M,
-    /// 未確定文が無いときの記号・数字の「遊び」変換。テストでは決定的なものに差し替える。
-    playful: fn(&str) -> Option<String>,
 }
 
 impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
@@ -58,7 +53,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         Self {
             composer,
             memory,
-            playful: playful_convert,
         }
     }
 
@@ -72,10 +66,6 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         } else {
             ConversionMode::Space
         }
-    }
-
-    pub fn set_playful(&mut self, playful: fn(&str) -> Option<String>) {
-        self.playful = playful;
     }
 
     /// 未確定のローマ字か組成中の文がある。
@@ -256,9 +246,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 fx.push(Effect::Insert(" ".to_string()));
                 true
             }
-            Action::InsertDirect => (self.playful)(text)
-                .map(|converted| fx.push(Effect::Insert(converted)))
-                .is_some(),
+            Action::InsertDirect => {
+                fx.push(Effect::Insert(text.to_string()));
+                true
+            }
             Action::TypeRomaji => {
                 self.composer.type_romaji(text);
                 self.show_typing(fx)
@@ -330,40 +321,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     }
 }
 
-static PLAYFUL_MAP: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
-    let mut outs = HashMap::new();
-    outs.insert("l", vec!["l", "I", "|"]);
-    outs.insert("1", vec!["l", "1", "I"]);
-    outs.insert("I", vec!["l", "I", "|"]);
-    outs.insert("O", vec!["O", "0"]);
-    outs.insert("0", vec!["O", "0"]);
-    outs
-});
-
-pub fn playful_convert(text: &str) -> Option<String> {
-    let list = PLAYFUL_MAP.get(text)?;
-    Some(list[random_index(list.len())].to_string())
-}
-
-// RandomState は生成のたびに別のキーを持つので、呼び出しごとに新しく作ると毎回違う値になる
-fn random_index(len: usize) -> usize {
-    use std::hash::{BuildHasher, Hasher};
-    let hash = std::collections::hash_map::RandomState::new().build_hasher().finish();
-    (hash % len as u64) as usize
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn random_index_stays_within_len() {
-        for len in [1usize, 2, 3, 1000] {
-            for _ in 0..2000 {
-                assert!(random_index(len) < len);
-            }
-        }
-    }
     use crate::deps::{FakeLexicon, FakeMemory};
     use crate::keymap::classify;
 
@@ -544,7 +505,6 @@ mod tests {
     /// 打鍵列を流し、(アプリへ確定済みの文字列, 下線付きの未確定文字列) を返す。Enter は付けない。
     fn after(keys: &str) -> (String, String) {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        session.set_playful(|text| Some(text.to_string()));
         let (mut committed, mut marked) = (String::new(), String::new());
         for ch in keys.chars() {
             let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());

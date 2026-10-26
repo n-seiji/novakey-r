@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Shizuku is a macOS Input Method Engine (IME) written entirely in Rust (no Swift). It converts romaji to kana, converts kana to kanji with a Rust port of azooKey's conversion engine, re-ranks full-sentence candidates with a small on-device language model (the judge), and learns the candidates you commit. It also intentionally turns some typed characters into "typos" (`l` -> `I` / `|`, `O` -> `0`, ...) for a playful typing experience.
+Shizuku is a macOS Input Method Engine (IME) written entirely in Rust (no Swift). It converts romaji to kana, converts kana to kanji with a Rust port of azooKey's conversion engine, re-ranks full-sentence candidates with a small on-device language model (the judge), and learns the candidates you commit.
 
 ## Development Commands
 

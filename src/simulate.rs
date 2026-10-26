@@ -276,9 +276,7 @@ struct Sim {
 
 impl Sim {
     fn new() -> Self {
-        let mut session = new_session(ConversionMode::Space);
-        // 記号・数字の「遊び」変換は乱数なので、シナリオが再現するよう恒等にする。
-        session.set_playful(|text| matches!(text, "l" | "1" | "I" | "O" | "0").then(|| text.to_string()));
+        let session = new_session(ConversionMode::Space);
         let panel = FakePanel::default();
         Self {
             controller: Controller::new(0, session, panel.clone(), FakeEnv::default()),
