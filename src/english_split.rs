@@ -87,12 +87,8 @@ pub fn split(
     }
     let (whole, _) = convert(raw, true);
     let foreign = has_ascii(&whole);
-    (2..raw.len()).rev().find_map(|i| {
+    let split_at = |i: usize| {
         let (head, rest) = raw.split_at(i);
-        let consonant_end = !head.ends_with(['a', 'i', 'u', 'e', 'o']);
-        if !(consonant_end && foreign || knows(head) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading)) {
-            return None;
-        }
         let (tail, pending) = convert(rest, finished);
         if has_ascii(&tail) || (finished && !pending.is_empty()) {
             return None;
@@ -103,7 +99,19 @@ pub fn split(
             TAILS.contains(&prefix.as_str())
         });
         starts_with_tail.then(|| Split { head: head.to_string(), tail, pending })
-    })
+    };
+    let is_word = |head: &str| knows(head) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
+    // 語と分かる頭を先に、長い順で試す。語でない頭 (子音で終わる外来の綴り) は短い順で試す。長い順だと
+    // artifactwokousinnsite を artifactwokousinn + して と切ってしまうため。
+    (2..raw.len())
+        .rev()
+        .find_map(|i| is_word(&raw[..i]).then(|| split_at(i)).flatten())
+        .or_else(|| {
+            (2..raw.len()).find_map(|i| {
+                let consonant_end = !raw[..i].ends_with(['a', 'i', 'u', 'e', 'o']);
+                (consonant_end && foreign).then(|| split_at(i)).flatten()
+            })
+        })
 }
 
 #[cfg(test)]
@@ -119,6 +127,13 @@ mod tests {
         assert_eq!(shown("artifactni").as_deref(), Some("artifactに"));
         assert_eq!(shown("artifactwotsukau").as_deref(), Some("artifactをつかう"));
         assert_eq!(shown("artifactnisuru").as_deref(), Some("artifactにする"));
+    }
+
+    #[test]
+    fn 助詞のあとに長い日本語が続いても英単語の直後で分ける() {
+        assert_eq!(shown("artifactwokousinnsite").as_deref(), Some("artifactをこうしんして"));
+        assert_eq!(dict_split("artifactwokousinnsite", &["artifact"], &[]).as_deref(), Some("artifactをこうしんして"));
+        assert_eq!(shown("githubwokousinnsite").as_deref(), Some("githubをこうしんして"));
     }
 
     #[test]
