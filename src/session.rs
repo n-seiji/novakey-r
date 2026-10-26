@@ -43,6 +43,8 @@ pub enum ConversionMode {
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
     pub learning: bool,
+    /// 変換せず打鍵をそのまま素通しする (セキュア入力中・パスワード管理アプリでは true)。
+    pub direct: bool,
 }
 
 pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
@@ -124,6 +126,14 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
+        if gates.direct {
+            // 直接入力: 作文中だった分 (未確定ローマ字を含む) は表示どおり確定し、キーは素通しにする。
+            self.composer.flush_romaji();
+            if !self.composer.is_empty() {
+                self.commit_and_insert(&Gates { learning: false, ..*gates }, "", &mut fx);
+            }
+            return Outcome { handled: false, action: Some(Action::PassThrough), phase, effects: fx };
+        }
         // `n'` のように、ローマ字表が記号を含む打鍵列は記号キーでも表を優先する。
         let key = match text.chars().collect::<Vec<_>>()[..] {
             [ch] if !ch.is_ascii_alphabetic() && self.composer.accepts_romaji(ch) => {
@@ -367,7 +377,7 @@ mod tests {
     use crate::deps::{FakeLexicon, FakeMemory};
     use crate::keymap::classify;
 
-    const ALLOW: Gates = Gates { learning: true };
+    const ALLOW: Gates = Gates { learning: true, direct: false };
 
     struct NullEngine;
     impl CandidateEngine for NullEngine {
@@ -790,7 +800,7 @@ mod tests {
 
     #[test]
     fn 学習が許されなければengineの保留を取り消して学習しない() {
-        let denied = Gates { learning: false };
+        let denied = Gates { learning: false, direct: false };
         let (engine, memory) = commit_with(&denied, "kyou ");
         assert!(engine.selects.borrow().is_empty());
         assert_eq!(engine.cancels.get(), 1);
@@ -807,7 +817,7 @@ mod tests {
     #[test]
     fn 英字で確定した語は学習が許されるときだけ覚える() {
         assert_eq!(commit_with(&ALLOW, "G").1.learned(), ["G"]);
-        let denied = Gates { learning: false };
+        let denied = Gates { learning: false, direct: false };
         assert!(commit_with(&denied, "G").1.learned().is_empty());
     }
 }

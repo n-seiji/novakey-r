@@ -219,7 +219,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
     fn gates(&self, client: Option<&C>) -> Gates {
         let bundle_id = self.bundle_id(client);
-        Gates { learning: outbound::learning_allowed(self.env.secure_input(), bundle_id) }
+        let secure = self.env.secure_input();
+        Gates {
+            learning: outbound::learning_allowed(secure, bundle_id),
+            direct: outbound::direct_input(secure, bundle_id),
+        }
     }
 
     /// クライアントの bundle id (学習判定に使う)。最初に取れたものを使い回す。
@@ -474,6 +478,7 @@ mod tests {
         bundle: Rc<RefCell<Option<String>>>,
         bundle_calls: Rc<Cell<usize>>,
         marked: Rc<RefCell<String>>,
+        inserted: Rc<RefCell<Vec<String>>>,
     }
 
     impl RecClient {
@@ -483,8 +488,9 @@ mod tests {
     }
 
     impl TextClient for RecClient {
-        fn insert(&self, _text: &str) {
+        fn insert(&self, text: &str) {
             self.marked.borrow_mut().clear();
+            self.inserted.borrow_mut().push(text.to_string());
         }
         fn set_marked(&self, text: &str) {
             *self.marked.borrow_mut() = text.to_string();
@@ -578,45 +584,115 @@ mod tests {
         (Controller::new(1, session, HookPanel::default(), env), memory)
     }
 
-    /// 大文字 1 字を打って Enter で確定し、記憶に書かれた語を返す。
-    fn learned_after_commit(env: RecEnv, bundle: Option<&str>) -> Vec<String> {
+    /// 大文字 1 字を打ち、`secure_before_enter` にしてから Enter で確定し、記憶に書かれた語を返す。
+    /// (セキュア入力中は打鍵が素通しになるので、作文は先に済ませておく。)
+    fn learned_after_commit(env: RecEnv, bundle: Option<&str>, secure_before_enter: bool) -> Vec<String> {
         let client = RecClient::default();
         client.set_bundle(bundle);
-        let (c, memory) = recording_controller(env);
-        assert!(rec_press(&c, &client, Key::Letter { upper: true }, "G"));
-        assert!(rec_press(&c, &client, Key::Enter, "\r"));
+        let (c, memory) = recording_controller(env.clone());
+        rec_press(&c, &client, Key::Letter { upper: true }, "G");
+        env.secure.set(secure_before_enter);
+        rec_press(&c, &client, Key::Enter, "\r");
         memory.learned()
     }
 
     #[test]
     fn a_commit_is_learned_when_the_bundle_id_is_unknown() {
-        assert_eq!(learned_after_commit(RecEnv::default(), None), vec!["G".to_string()]);
+        assert_eq!(learned_after_commit(RecEnv::default(), None, false), vec!["G".to_string()]);
     }
 
     #[test]
     fn a_commit_is_learned_in_an_ordinary_app() {
-        assert_eq!(learned_after_commit(RecEnv::default(), Some("com.apple.TextEdit")).len(), 1);
+        assert_eq!(learned_after_commit(RecEnv::default(), Some("com.apple.TextEdit"), false).len(), 1);
     }
 
     #[test]
     fn a_commit_is_not_learned_under_secure_input() {
-        let env = RecEnv::default();
-        env.secure.set(true);
-        assert!(learned_after_commit(env, Some("com.apple.TextEdit")).is_empty());
+        assert!(learned_after_commit(RecEnv::default(), Some("com.apple.TextEdit"), true).is_empty());
     }
 
     #[test]
     fn a_commit_is_not_learned_in_a_password_manager() {
-        assert!(learned_after_commit(RecEnv::default(), Some("com.1password.1password")).is_empty());
+        assert!(learned_after_commit(RecEnv::default(), Some("com.1password.1password"), false).is_empty());
+    }
+
+    /// 直接入力のとき、いくつかのキーを打って「処理した」と返ったものを集める。
+    fn handled_in_direct_mode(env: RecEnv, bundle: Option<&str>) -> (Vec<bool>, RecClient, FakeMemory) {
+        let client = RecClient::default();
+        client.set_bundle(bundle);
+        let (c, memory) = recording_controller(env);
+        let mut handled = Vec::new();
+        for ch in "kyou".chars() {
+            handled.push(rec_press(&c, &client, Key::Letter { upper: false }, &ch.to_string()));
+        }
+        for (key, text) in [(Key::Symbol, "!"), (Key::Mark, "["), (Key::Hyphen, "-"), (Key::Space, " "), (Key::Enter, "\r")] {
+            handled.push(rec_press(&c, &client, key, text));
+        }
+        (handled, client, memory)
+    }
+
+    #[test]
+    fn keys_pass_through_uncomposed_under_secure_input() {
+        let env = RecEnv::default();
+        env.secure.set(true);
+        let (handled, client, memory) = handled_in_direct_mode(env, Some("com.apple.TextEdit"));
+        assert!(handled.iter().all(|h| !h), "{handled:?}");
+        assert_eq!(*client.marked.borrow(), "");
+        assert!(client.inserted.borrow().is_empty());
+        assert!(memory.learned().is_empty());
+    }
+
+    #[test]
+    fn keys_pass_through_uncomposed_in_a_password_manager() {
+        let (handled, client, _) = handled_in_direct_mode(RecEnv::default(), Some("com.1password.1password"));
+        assert!(handled.iter().all(|h| !h), "{handled:?}");
+        assert_eq!(*client.marked.borrow(), "");
+        assert!(client.inserted.borrow().is_empty());
+    }
+
+    #[test]
+    fn keys_are_composed_as_usual_in_an_ordinary_app() {
+        let (handled, client, _) = handled_in_direct_mode(RecEnv::default(), Some("com.apple.TextEdit"));
+        assert!(handled[..4].iter().all(|h| *h), "{handled:?}");
+        assert!(!client.inserted.borrow().is_empty() || !client.marked.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_composition_in_progress_is_committed_unlearned_when_secure_input_turns_on() {
+        let env = RecEnv::default();
+        let client = RecClient::default();
+        let (c, memory) = recording_controller(env.clone());
+        rec_press(&c, &client, Key::Letter { upper: true }, "G");
+        rec_type(&c, &client, "n");
+        assert_ne!(*client.marked.borrow(), "");
+        env.secure.set(true);
+        assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"), "次のキーは素通し");
+        assert_eq!(*client.marked.borrow(), "");
+        assert_eq!(client.inserted.borrow().len(), 1, "作文中の分が 1 回だけ確定される");
+        assert!(memory.learned().is_empty());
+        assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "b"));
+        assert_eq!(client.inserted.borrow().len(), 1);
+    }
+
+    #[test]
+    fn pending_romaji_is_committed_when_secure_input_turns_on() {
+        let env = RecEnv::default();
+        let client = RecClient::default();
+        let (c, _) = recording_controller(env.clone());
+        rec_type(&c, &client, "n");
+        env.secure.set(true);
+        assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
+        assert_eq!(client.inserted.borrow().len(), 1);
+        assert_eq!(*client.marked.borrow(), "");
     }
 
     #[test]
     fn commit_composition_respects_the_learning_gate() {
         let env = RecEnv::default();
-        env.secure.set(true);
         let client = RecClient::default();
         let (c, memory) = recording_controller(env.clone());
         rec_press(&c, &client, Key::Letter { upper: true }, "G");
+        env.secure.set(true);
         c.on_commit_composition(Some(client.clone()));
         assert!(memory.learned().is_empty(), "commit-all under secure input");
 
@@ -650,10 +726,10 @@ mod tests {
 
     fn candidate_click_learns(secure: bool) -> bool {
         let env = RecEnv::default();
-        env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core, _) = observing_controller(env);
+        let (c, core, _) = observing_controller(env.clone());
         open_candidate_window(&c, &client);
+        env.secure.set(secure);
         c.on_candidate_selected("幹事");
         engine_learned(&core)
     }
@@ -670,11 +746,12 @@ mod tests {
 
     fn picking_by_digit_learns(secure: bool) -> bool {
         let env = RecEnv::default();
-        env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core, _) = observing_controller(env);
+        let (c, core, _) = observing_controller(env.clone());
         open_candidate_window(&c, &client);
-        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        env.secure.set(secure);
+        // 通常は数字キーで選択・確定する。セキュア入力中は作文中の分を確定してから数字が素通しになる。
+        assert_eq!(rec_press(&c, &client, Key::Digit(3), "3"), !secure);
         assert_eq!(c.phase(), Phase::Empty);
         engine_learned(&core)
     }
@@ -691,10 +768,10 @@ mod tests {
 
     fn english_commit_is_remembered(secure: bool) -> bool {
         let env = RecEnv::default();
-        env.secure.set(secure);
         let client = RecClient::default();
-        let (c, core, memory) = observing_controller(env);
+        let (c, core, memory) = observing_controller(env.clone());
         rec_type(&c, &client, "git");
+        env.secure.set(secure);
         rec_press(&c, &client, Key::Enter, "\r");
         assert!(!engine_learned(&core));
         memory.learned().iter().any(|w| w == "git")
