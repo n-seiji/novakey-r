@@ -86,6 +86,11 @@ impl Tokenizer {
         Ok(Self { charsmap, vocab, max_piece, unk_id, unk_score: min_score - UNK_PENALTY, added })
     }
 
+    /// 未知文字に当たる id。
+    pub fn unk_id(&self) -> u32 {
+        self.unk_id
+    }
+
     /// 特殊トークンを足さずに id 列にする (`encode(text, false)` 相当)。
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
@@ -360,6 +365,13 @@ mod tests {
         assert_eq!(t.encode("ab<s>ab"), [5, 6, 5]);
         assert_eq!(t.encode("   "), Vec::<u32>::new());
         assert_eq!(t.encode(""), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn 語彙にない文字は_unk_id_として見分けられる() {
+        let t = Tokenizer::from_json(&small_json()).unwrap();
+        assert!(t.encode("xyab").contains(&t.unk_id()));
+        assert!(!t.encode("ab ab").contains(&t.unk_id()));
     }
 
     #[test]

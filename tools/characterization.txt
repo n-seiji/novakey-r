@@ -6,10 +6,10 @@ kyou<space>2	強2
 l<enter>	l
 kyou<esc><esc>	
 kyou<tab>x<enter>	きょう\tx
-kyou<space><space>0	kyou0
+kyou<space><space>0	今日0
 kyou<space>a<enter>	強あ
 kyou<space>A<enter>	強A
-kyou<space><space>a<enter>	kyouあ
+kyou<space><space>a<enter>	今日あ
 hello<bs><bs><enter>	へ
 kyou<left><enter>	きょう
 kyou<C-a><enter>	きょう
@@ -38,17 +38,17 @@ iPhone<space><bs><enter>	いPhone
 neko<space><enter>	猫
 # IMK 側のイベントのトークン (<pick:N> <highlight:N> <live> <space-mode> <commit-all>) を使う行。番号は 1 起点。
 kyou<space><space><pick:1>	強
-kyou<space><space><pick:3>	今日
-kyou<space><space><highlight:3><enter>	今日
+kyou<space><space><pick:3>	きょう
+kyou<space><space><highlight:3><enter>	きょう
 kyou<space><space><down><highlight:1><enter>	強
-kyou<space><highlight:2><enter>	kyou
+kyou<space><highlight:2><enter>	今日
 kyou<live><enter>	強
 kyou<live>a<enter>	強あ
 kyou<space><live><enter>	強
-kyou<space><space><live><enter>	kyou
+kyou<space><space><live><enter>	今日
 kyou<live><space-mode><enter>	きょう
 kyou<commit-all>	きょう
-kyou<space><space><down><commit-all>	今日
+kyou<space><space><down><commit-all>	きょう
 <commit-all>l<enter>	l
 # 英語と見なして英字で表示している間に大文字を打つと、表示どおりの英字を確定する (かなに戻さない)。
 enterX<enter>	enterX

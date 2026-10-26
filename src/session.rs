@@ -631,7 +631,7 @@ mod tests {
         effects_of(&mut session, "ky");
         assert!(session.has_pending(), "未変換のローマ字だけでも保留中");
         effects_of(&mut session, "ou ");
-        assert_eq!(session.candidate_texts().last().map(String::as_str), Some("x"));
+        assert_eq!(session.candidate_texts().last().map(String::as_str), Some("kyou"), "英単語でない raw は末尾");
     }
 
     #[test]
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn engine候補でない確定ではengineを取り消す() {
-        let (engine, _) = commit_with(&ALLOW, "kyou  ");
+        let (engine, _) = commit_with(&ALLOW, "kyou   ");
         assert!(engine.selects.borrow().is_empty(), "raw 候補は学習しない");
         assert_eq!(engine.cancels.get(), 1);
     }
