@@ -4,8 +4,11 @@
 // 候補は {text, source} で持ち、リランキング後も学習には Source::Engine の元の順位を渡す。
 // ローマ字そのまま(raw)など engine 以外の候補は順位を持たず、確定しても学習しない。
 
+use std::borrow::Cow;
+
 use crate::deps::Lexicon;
 use crate::english_split;
+use crate::kkc::live_backspace;
 use crate::romaji_converter::{Flush, RomajiConverter};
 use crate::symbols;
 use crate::translit::{self, Form};
@@ -61,6 +64,15 @@ pub trait CandidateEngine {
     fn cancel(&mut self);
     /// ひらがなの読みがそのまま辞書の見出しにあるか (made → まで)。英単語として切り分ける前の衝突確認に使う。
     fn has_reading(&self, _hiragana: &str) -> bool {
+        false
+    }
+    /// 直近の `convert` の候補 `index` の語列 ((表記, カタカナの読み))。読むだけで、学習用の状態は取り出さない。
+    /// 語の情報を持たない engine や、世代の合わない呼び出しは None。
+    fn words(&self, _revision: u64, _index: usize) -> Option<Vec<(String, String)>> {
+        None
+    }
+    /// カタカナの読みで、表記が漢字 1 字の見出しが辞書にあるか。live 変換の Backspace が読みを切り分けるのに使う。
+    fn has_kanji_reading(&self, _katakana: &str, _kanji: char) -> bool {
         false
     }
 }
@@ -136,6 +148,27 @@ enum Stage {
     },
 }
 
+/// live 変換の Backspace で残した、見えているとおりに固定する読みの先頭部分。
+/// 読み (ひらがな) の先頭から順に並ぶ (表記, カタカナの読み)。固定した読みの長さは語の読みの合計。
+#[derive(Debug, Clone)]
+struct Pin {
+    words: Vec<(String, String)>,
+}
+
+impl Pin {
+    fn reading_len(&self) -> usize {
+        self.words.iter().map(|(_, ruby)| ruby.chars().count()).sum()
+    }
+
+    fn surface(&self) -> String {
+        self.words.iter().map(|(surface, _)| surface.as_str()).collect()
+    }
+
+    fn ruby(&self) -> String {
+        self.words.iter().map(|(_, ruby)| ruby.as_str()).collect()
+    }
+}
+
 /// 組成の 1 区切り。
 #[derive(Debug, Clone)]
 enum Segment {
@@ -184,6 +217,8 @@ pub struct Composer<E: CandidateEngine, L: Lexicon> {
     reading: ReadingCands,
     stage: Stage,
     live: bool,
+    /// 固定中の先頭部分。あるあいだ `reading` の候補は残りの読み (固定した分のあと) の変換結果。
+    pin: Option<Pin>,
     lexicon: L,
 }
 
@@ -200,12 +235,16 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             reading: ReadingCands { generation: 0, list: Vec::new() },
             stage: Stage::Editing,
             live: false,
+            pin: None,
             lexicon,
         }
     }
 
     pub fn set_live(&mut self, live: bool) {
-        self.live = live;
+        if self.live != live {
+            self.live = live;
+            self.unpin();
+        }
     }
 
     pub fn is_live(&self) -> bool {
@@ -236,6 +275,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         match &self.stage {
             Stage::Selecting(s) => &s.list,
             Stage::Reverted { kept: Some(list) } | Stage::Transliterated { kept: Some(list), .. } => list,
+            // 固定中の reading.list は残りの読みだけの候補で、見えている文字列 (固定 + 残り) と食い違う。
+            _ if self.pin.is_some() => &[],
             _ => &self.reading.list,
         }
     }
@@ -249,16 +290,18 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             .collect()
     }
 
-    pub fn display(&self) -> &str {
+    pub fn display(&self) -> Cow<'_, str> {
         match &self.stage {
-            Stage::Selecting(s) => &s.list[s.cursor].text,
-            Stage::Editing if self.typing == Typing::Kana && self.live => self
-                .reading
-                .list
-                .first()
-                .map_or(self.hiragana.as_str(), |c| c.text.as_str()),
-            Stage::Transliterated { text, .. } => text,
-            _ => &self.hiragana,
+            Stage::Selecting(s) => Cow::Borrowed(&s.list[s.cursor].text),
+            Stage::Editing if self.typing == Typing::Kana && self.live => match &self.pin {
+                None => Cow::Borrowed(self.reading.list.first().map_or(self.hiragana.as_str(), |c| c.text.as_str())),
+                Some(pin) => {
+                    let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some());
+                    Cow::Owned(pin.surface() + converted.map_or(self.rest(), |c| c.text.as_str()))
+                }
+            },
+            Stage::Transliterated { text, .. } => Cow::Borrowed(text),
+            _ => Cow::Borrowed(&self.hiragana),
         }
     }
 
@@ -280,7 +323,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Settle::Mixed(split) => split.head + &split.tail.iter().map(|(_, kana)| kana.as_str()).collect::<String>(),
             Settle::Dangling => self.raw(),
             Settle::Unchanged if self.phase() == Phase::Dangling => self.raw(),
-            Settle::Unchanged => self.display().to_string(),
+            Settle::Unchanged => self.display().into_owned(),
         }
     }
 
@@ -289,6 +332,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if self.hiragana.is_empty() {
             return false;
         }
+        self.unpin();
         let current = match &self.stage {
             Stage::Transliterated { form, .. } => Some(*form),
             _ => None,
@@ -333,16 +377,19 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.sync_hiragana();
         self.stage = Stage::Editing;
         if self.hiragana.is_empty() {
+            self.pin = None;
             self.typing = Typing::Empty;
             return;
         }
         self.typing = Typing::Kana;
         if self.is_typing_english() {
+            self.pin = None;
             self.typing = Typing::English;
             self.english_shown = true;
             return;
         }
         if let Some(forms) = self.symbol_variants() {
+            self.pin = None;
             self.reading.list = forms
                 .iter()
                 .map(|form| Candidate {
@@ -352,12 +399,42 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 .collect();
             return;
         }
+        if !self.pin_matches_reading() {
+            self.pin = None;
+        }
         self.reading.list = self.convert_reading();
+    }
+
+    /// 固定した先頭部分が、いまの読みの先頭と合っているか。固定が無ければ true。
+    fn pin_matches_reading(&self) -> bool {
+        self.pin.as_ref().is_none_or(|pin| {
+            let head: String = self.hiragana.chars().take(pin.reading_len()).collect();
+            head.chars().count() == pin.reading_len() && translit::to_katakana(&head) == pin.ruby()
+        })
+    }
+
+    /// 固定した先頭部分のあとの読み。固定が無ければ読み全体。
+    fn rest(&self) -> &str {
+        let skip = self.pin.as_ref().map_or(0, Pin::reading_len);
+        let at = self.hiragana.char_indices().nth(skip).map_or(self.hiragana.len(), |(i, _)| i);
+        &self.hiragana[at..]
+    }
+
+    /// 固定を外して読み全体を変換し直す。読みはそのまま。
+    fn unpin(&mut self) {
+        if self.pin.take().is_none() {
+            return;
+        }
+        self.reset_candidates();
+        if matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana {
+            self.reading.list = self.convert_reading();
+        }
     }
 
     fn convert_reading(&mut self) -> Vec<Candidate> {
         let mut list: Vec<Candidate> = Vec::new();
-        for (engine_index, text) in self.engine.convert(self.reading.generation, &self.hiragana).into_iter().enumerate() {
+        let rest = self.rest().to_string();
+        for (engine_index, text) in self.engine.convert(self.reading.generation, &rest).into_iter().enumerate() {
             if !list.iter().any(|c| c.text == text) {
                 list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
             }
@@ -394,7 +471,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         match self.settle(english) {
             Settle::Mixed(split) => self.fix_english_split(split),
-            Settle::Dangling => self.typing = Typing::English,
+            Settle::Dangling => {
+                self.pin = None;
+                self.typing = Typing::English;
+            }
             Settle::Unchanged => {}
         }
         if self.typing == Typing::English {
@@ -425,6 +505,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         match (self.is_typing_english(), self.typing == Typing::English) {
             (true, false) => {
+                self.pin = None;
                 self.reset_candidates();
                 self.typing = Typing::English;
                 self.english_shown = true;
@@ -464,6 +545,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn fix_english_split(&mut self, split: english_split::Split) {
         let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
         let origin = (self.segments.clone(), self.romaji.buffer().to_string());
+        self.pin = None;
         let head = Segment::Literal(split.head.clone());
         let tail = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
         self.segments = std::iter::once(head).chain(tail).collect();
@@ -591,6 +673,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 英単語としてそのまま追加する。かな変換も候補生成もしない。
     pub fn push_literal(&mut self, text: &str) {
+        self.pin = None;
         if !self.candidates().is_empty() {
             self.engine.cancel();
         }
@@ -623,11 +706,51 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
     }
 
-    pub fn backspace(&mut self) -> bool {
+    /// live 変換で、underline に出ている (preedit と同じ) 第 1 候補の engine 順位。
+    fn live_rank(&self) -> Option<EngineRank> {
+        if !self.is_live_kana() {
+            return None;
+        }
+        self.reading.list.first().and_then(Candidate::engine_rank)
+    }
+
+    /// live 変換でかなを入力中で、英語としては扱われていない。
+    fn is_live_kana(&self) -> bool {
+        matches!(self.stage, Stage::Editing)
+            && self.typing == Typing::Kana
+            && self.live
+            && self.english_split(false).is_none()
+            && !self.is_typing_english()
+    }
+
+    /// live 変換の Backspace が消す読みの文字数と、消したあとに固定する語列。
+    /// 見えている最後の 1 文字に当たる読みを、固定した語と残りの第 1 候補の語列から決める。当てはまらなければ None。
+    fn live_drop(&self) -> Option<(usize, Vec<(String, String)>)> {
+        if !self.is_live_kana() {
+            return None;
+        }
+        let mut words = self.pin.as_ref().map_or_else(Vec::new, |pin| pin.words.clone());
+        let mut displayed = self.pin.as_ref().map_or_else(String::new, Pin::surface);
+        if !self.rest().is_empty() {
+            let first = self.reading.list.first()?;
+            let rank = first.engine_rank()?;
+            let rest_words = self.engine.words(self.reading.generation, rank.0)?;
+            words.extend(rest_words.into_iter().map(|(surface, ruby)| (surface.replace('\u{1F}', ""), ruby)));
+            displayed.push_str(&first.text);
+        }
+        let refs: Vec<(&str, &str)> = words.iter().map(|(surface, ruby)| (surface.as_str(), ruby.as_str())).collect();
+        let dropped =
+            live_backspace::drop_len(&refs, &self.hiragana, &displayed, |suffix, kanji| self.engine.has_kanji_reading(suffix, kanji))?;
+        words.pop();
+        words.extend(dropped.kept);
+        Some((dropped.len, words))
+    }
+
+    /// 末尾の読みを 1 文字消す。区切りが空になったら外す。
+    fn pop_reading_char(&mut self) {
         let Some(last) = self.segments.last_mut() else {
-            return false;
+            return;
         };
-        self.split_origin = None;
         let emptied = match last {
             Segment::Kana { keys, kana } => {
                 kana.pop();
@@ -642,9 +765,29 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if emptied {
             self.segments.pop();
         }
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if self.segments.is_empty() {
+            return false;
+        }
+        self.split_origin = None;
+        // live 変換中は、見えている最後の 1 文字に当たる読みを消し、残りは見えているまま固定する。分からなければ 1 文字。
+        let dropped = self.live_drop();
+        let rest_was_empty = self.rest().is_empty();
+        for _ in 0..dropped.as_ref().map_or(1, |(count, _)| *count) {
+            self.pop_reading_char();
+        }
+        match dropped {
+            Some((_, words)) => self.pin = (!words.is_empty()).then_some(Pin { words }),
+            // 固定した語どうしが合わないときは固定を外す。残りの変換が合わないときは固定を保つ。
+            None if rest_was_empty => self.pin = None,
+            None => {}
+        }
         let was_literal = matches!(self.typing, Typing::Literal | Typing::Mixed);
         // 英単語の部分を消しきったら、残ったかなは通常の組成に戻す。
         if was_literal && self.segments.iter().any(Segment::is_literal) {
+            self.pin = None;
             self.sync_hiragana();
             self.reset_candidates();
             self.typing = if self.segments.iter().all(Segment::is_literal) {
@@ -660,6 +803,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 最初の変換。保留中のリランキングを反映し、raw 候補を第 1 候補の直後に入れて先頭を選ぶ。
     pub fn begin_conversion(&mut self) -> bool {
+        self.unpin();
         let mut kept = None;
         if matches!(self.stage, Stage::Transliterated { .. }) {
             if let Stage::Transliterated { kept: k, .. } = std::mem::replace(&mut self.stage, Stage::Editing) {
@@ -746,6 +890,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 組成を捨てて空に戻す(何も確定しない)。
     pub fn discard(&mut self) {
         self.engine.cancel();
+        self.pin = None;
         self.segments.clear();
         self.split_origin = None;
         self.romaji.clear();
@@ -764,6 +909,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Stage::Reverted { kept } | Stage::Transliterated { kept, .. } => kept,
             Stage::Editing => None,
         };
+        self.unpin();
         // 英語分割でできた Mixed は、打った英字ではないので、分割前のかなの打鍵中に戻す (続きを打てば分割し直す)。
         if let Some((segments, pending)) = self.split_origin.take() {
             self.segments = segments;
@@ -788,14 +934,14 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             english.push(text.clone());
         }
         english.extend(self.segments.iter().filter(|s| s.is_literal()).map(|s| s.keys().to_string()));
+        // 固定した先頭部分を含む確定は、1 つの候補の順位では表せないので学習しない。
         let engine = match &self.stage {
+            _ if self.pin.is_some() => None,
             Stage::Selecting(s) => s.list[s.cursor].engine_rank(),
-            Stage::Editing if self.typing == Typing::Kana && self.live => {
-                self.reading.list.first().and_then(Candidate::engine_rank)
-            }
-            _ => None,
+            _ => self.live_rank(),
         }
         .map(|rank| (self.reading.generation, rank));
+        self.pin = None;
         self.segments.clear();
         self.split_origin = None;
         self.romaji.clear();
@@ -1224,6 +1370,358 @@ mod tests {
         c.push_input("n", "ん", "");
         c.backspace();
         assert_eq!(c.raw(), "ka");
+    }
+
+    /// 語の情報を持つ engine のつもり。表にある読みはその語列を、無い読みは「変」を付けた 1 語を返す。
+    #[derive(Default)]
+    struct WordsEngine {
+        last: Option<(u64, Vec<Vec<(String, String)>>)>,
+        /// `words` を呼ばれた回数。
+        asked: Rc<RefCell<usize>>,
+        /// false なら `words` は常に None (語の情報を持たない engine)。
+        has_words: bool,
+        /// `convert` に渡された読み。
+        converted: Rc<RefCell<Vec<String>>>,
+        /// `cancel` が呼ばれた回数。
+        cancels: Rc<RefCell<usize>>,
+    }
+
+    fn pairs(words: &[(&str, &str)]) -> Vec<(String, String)> {
+        words.iter().map(|(surface, ruby)| (surface.to_string(), ruby.to_string())).collect()
+    }
+
+    fn words_table(hiragana: &str) -> Vec<Vec<(String, String)>> {
+        match hiragana {
+            "せんせい" => vec![pairs(&[("先生", "センセイ")]), pairs(&[("戦", "セン"), ("世以", "セイ")])],
+            "せん" => vec![pairs(&[("戦", "セン")])],
+            "こう" => vec![pairs(&[("後", "コウ")])],
+            "くぎをうつ" => vec![pairs(&[("釘", "クギ"), ("を", "ヲ"), ("打つ", "ウツ")])],
+            "かいしゃのけん" => vec![pairs(&[("会社", "カイシャ"), ("の件", "ノケン")])],
+            // 語列が読みと合わない engine (学習・補正などで組み立てが違う)。
+            "ほ" | "ほげ" => vec![pairs(&[("保", "ホホ")])],
+            _ => vec![pairs(&[(&format!("変{hiragana}"), &translit::to_katakana(hiragana))])],
+        }
+    }
+
+    impl CandidateEngine for WordsEngine {
+        fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+            self.converted.borrow_mut().push(hiragana.to_string());
+            if hiragana.is_empty() {
+                return Vec::new();
+            }
+            let table = words_table(hiragana);
+            let texts = table.iter().map(|words| words.iter().map(|(surface, _)| surface.as_str()).collect()).collect();
+            self.last = Some((revision, table));
+            texts
+        }
+        fn select(&mut self, _revision: u64, _engine_index: usize) -> bool {
+            true
+        }
+        fn cancel(&mut self) {
+            *self.cancels.borrow_mut() += 1;
+        }
+        fn words(&self, revision: u64, index: usize) -> Option<Vec<(String, String)>> {
+            *self.asked.borrow_mut() += 1;
+            let (r, table) = self.last.as_ref()?;
+            (self.has_words && *r == revision).then(|| table.get(index).cloned()).flatten()
+        }
+        fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
+            matches!((katakana, kanji), ("シャ", '社') | ("セイ", '生') | ("ケン", '件'))
+        }
+    }
+
+    type WordsComposer = Composer<WordsEngine, FakeLexicon>;
+
+    fn words_composer() -> WordsComposer {
+        let mut c = Composer::new(WordsEngine { has_words: true, ..WordsEngine::default() }, FakeLexicon::default());
+        c.set_live(true);
+        c
+    }
+
+    fn type_units(c: &mut WordsComposer, units: &[(&str, &str)]) {
+        for (raw, kana) in units {
+            c.push_input(raw, kana, "");
+        }
+    }
+
+    fn type_sensei(c: &mut WordsComposer) {
+        type_units(c, &[("se", "せ"), ("n", "ん"), ("se", "せ"), ("i", "い")]);
+    }
+
+    fn type_kaisha(c: &mut WordsComposer) {
+        type_units(c, &[("ka", "か"), ("i", "い"), ("sha", "しゃ")]);
+    }
+
+    fn type_kou(c: &mut WordsComposer) {
+        type_units(c, &[("ko", "こ"), ("u", "う")]);
+    }
+
+    /// 先生 を打って Backspace で 先 (読みはせん) を固定した状態。
+    fn pinned_sen() -> WordsComposer {
+        let mut c = words_composer();
+        type_sensei(&mut c);
+        assert!(c.backspace());
+        c
+    }
+
+    fn assert_wysiwyg(c: &WordsComposer) {
+        assert_eq!(c.preedit(), c.commit_preview());
+    }
+
+    #[test]
+    fn live中のbackspaceは見えている最後の文字に当たる読みを消し残りを固定する() {
+        let mut c = pinned_sen();
+        assert_eq!(c.hiragana, "せん");
+        assert_eq!(c.raw(), "sen");
+        assert_eq!(c.display(), "先");
+        assert_eq!(c.preedit(), "先");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 固定した先のbackspaceでさらに消すと空になる() {
+        let mut c = pinned_sen();
+        assert!(c.backspace());
+        assert_eq!(c.phase(), Phase::Empty);
+        assert!(c.is_empty());
+        assert_eq!(c.display(), "");
+        assert!(c.pin.is_none());
+    }
+
+    #[test]
+    fn 釘を打つのbackspaceは打を残して固定する() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("ku", "く"), ("gi", "ぎ"), ("wo", "を"), ("u", "う"), ("tu", "つ")]);
+        assert_eq!(c.display(), "釘を打つ");
+        assert!(c.backspace());
+        assert_eq!(c.hiragana, "くぎをう");
+        assert_eq!(c.display(), "釘を打");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 会社の件をbackspaceで3回消すと会だけが残る() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("ka", "か"), ("i", "い"), ("sha", "しゃ"), ("no", "の"), ("ke", "け"), ("n", "ん")]);
+        assert_eq!(c.display(), "会社の件");
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            assert!(c.backspace());
+            shown.push(c.display().into_owned());
+            assert_wysiwyg(&c);
+        }
+        assert_eq!(shown, ["会社の", "会社", "会"]);
+        assert_eq!(c.hiragana, "かい");
+    }
+
+    #[test]
+    fn 固定したあとにかなを打つと残りの読みだけを変換して後ろに付ける() {
+        let mut c = pinned_sen();
+        c.engine.converted.borrow_mut().clear();
+        type_kou(&mut c);
+        assert_eq!(c.hiragana, "せんこう");
+        assert_eq!(c.engine.converted.borrow().as_slice(), ["こ", "こう"]);
+        assert_eq!(c.display(), "先後");
+        assert_eq!(c.preedit(), "先後");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 固定中に未確定のローマ字があれば固定と残りの後ろに出る() {
+        let mut c = pinned_sen();
+        c.type_romaji("k");
+        assert_eq!(c.preedit(), "先k");
+        assert!(c.has_romaji());
+    }
+
+    #[test]
+    fn 固定した後の残りがあるときのbackspaceは固定を保ち残りを固定に足す() {
+        let mut c = pinned_sen();
+        type_kou(&mut c);
+        assert!(c.backspace());
+        // 後 (こう) は 1 字なので読みごと消え、固定は 先 のまま。
+        assert_eq!(c.hiragana, "せん");
+        assert_eq!(c.display(), "先");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 残りの語列が合わないbackspaceは残りを1文字だけ消して固定を保つ() {
+        let mut c = pinned_sen();
+        type_units(&mut c, &[("ho", "ほ"), ("ge", "げ")]);
+        assert_eq!(c.display(), "先保");
+        assert!(c.backspace());
+        assert_eq!(c.hiragana, "せんほ");
+        assert_eq!(c.display(), "先保");
+        assert_eq!(c.pin.as_ref().map(Pin::surface).as_deref(), Some("先"));
+    }
+
+    #[test]
+    fn 固定中の確定は表示のまま学習しない() {
+        let mut c = pinned_sen();
+        let committed = c.commit();
+        assert_eq!(committed.text, "先");
+        assert_eq!(committed.engine, None);
+        assert!(c.pin.is_none());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn 固定と残りを含む確定は表示のまま学習しない() {
+        let mut c = pinned_sen();
+        type_kou(&mut c);
+        let preview = c.commit_preview();
+        let committed = c.commit();
+        assert_eq!(committed.text, "先後");
+        assert_eq!(preview, "先後");
+        assert_eq!(committed.engine, None);
+    }
+
+    #[test]
+    fn 固定中のスペースは固定を外して読み全体を変換し直す() {
+        let mut c = pinned_sen();
+        assert!(c.begin_conversion());
+        assert!(c.pin.is_none());
+        assert_eq!(c.hiragana, "せん");
+        assert_eq!(c.display(), "戦");
+        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("戦"));
+        assert_eq!(c.engine.converted.borrow().last().map(String::as_str), Some("せん"));
+    }
+
+    #[test]
+    fn 固定中のescapeは読みごと捨てる() {
+        let mut c = pinned_sen();
+        c.discard();
+        assert!(c.is_empty());
+        assert!(c.pin.is_none());
+        assert_eq!(c.display(), "");
+    }
+
+    #[test]
+    fn 固定中に読みへ戻すと固定が外れて読みが残る() {
+        let mut c = pinned_sen();
+        c.revert();
+        assert!(c.pin.is_none());
+        assert_eq!(c.phase(), Phase::Reverted);
+        assert_eq!(c.display(), "せん");
+        assert!(c.begin_conversion());
+        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("戦"));
+    }
+
+    #[test]
+    fn 固定中の字種変換は読み全体を変換し固定を外す() {
+        let mut c = pinned_sen();
+        assert!(c.transliterate(Form::Katakana));
+        assert!(c.pin.is_none());
+        assert_eq!(c.display(), "セン");
+        assert_eq!(c.commit_preview(), "セン");
+    }
+
+    #[test]
+    fn 固定中に大文字を打つと固定が外れてかな混じりになる() {
+        let mut c = pinned_sen();
+        c.push_literal("A");
+        assert!(c.pin.is_none());
+        assert_eq!(c.phase(), Phase::Mixed);
+        assert_eq!(c.hiragana, "せんA");
+        assert_eq!(c.preedit(), "せんA");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 固定中にliveを切ると固定が外れて読みが残る() {
+        let mut c = pinned_sen();
+        c.set_live(false);
+        assert!(c.pin.is_none());
+        assert_eq!(c.display(), "せん");
+        assert_eq!(c.preedit(), "せん");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 固定中は候補を出さず選択もできない() {
+        let mut c = pinned_sen();
+        assert!(c.candidates().is_empty());
+        assert!(!c.select_candidate(0));
+        assert!(!c.select_candidate_text("戦"));
+        assert!(c.pin.is_some());
+        assert_eq!(c.display(), "先");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 固定中のliveではbackspaceのたびに表示と確定が一致する() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("ka", "か"), ("i", "い"), ("sha", "しゃ"), ("no", "の"), ("ke", "け"), ("n", "ん")]);
+        while !c.is_empty() {
+            assert!(c.backspace());
+            assert_wysiwyg(&c);
+        }
+    }
+
+    #[test]
+    fn live中のbackspaceが単位の途中で切れても残りの打鍵はrawに反映され英語判定にならない() {
+        let mut c = words_composer();
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(c.hiragana, "かいし");
+        assert_eq!(c.display(), "変かいし");
+        assert_eq!(c.raw(), "kaiし");
+        assert!(!c.is_typing_english());
+        assert_eq!(c.phase(), Phase::Composing);
+        assert!(c.begin_conversion());
+        let raw: Vec<&str> = c.candidates().iter().filter(|cand| cand.source == Source::Raw).map(|cand| cand.text.as_str()).collect();
+        assert_eq!(raw, ["kaiし"]);
+    }
+
+    #[test]
+    fn engineが語を返さなければ1文字だけ消して固定しない() {
+        let mut c = Composer::new(WordsEngine::default(), FakeLexicon::default());
+        c.set_live(true);
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(*c.engine.asked.borrow(), 1);
+        assert_eq!(c.hiragana, "かいし");
+        assert!(c.pin.is_none());
+    }
+
+    #[test]
+    fn 非liveのbackspaceはengineに聞かず1文字だけ消す() {
+        let mut c = words_composer();
+        c.set_live(false);
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(*c.engine.asked.borrow(), 0);
+        assert_eq!(c.hiragana, "かいし");
+    }
+
+    #[test]
+    fn 読みに戻した後のbackspaceはengineに聞かず1文字だけ消す() {
+        let mut c = words_composer();
+        type_kaisha(&mut c);
+        c.revert();
+        assert!(c.backspace());
+        assert_eq!(*c.engine.asked.borrow(), 0);
+        assert_eq!(c.hiragana, "かいし");
+    }
+
+    #[test]
+    fn liveでも記号1つの読みは1文字だけ消してengineに聞かない() {
+        let mut c = words_composer();
+        c.push_input("[", "「", "");
+        assert!(c.is_symbol());
+        assert!(c.backspace());
+        assert_eq!(*c.engine.asked.borrow(), 0);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn 固定していないlive中の確定は第1候補を学習対象にできる() {
+        let mut c = words_composer();
+        type_kaisha(&mut c);
+        let committed = c.commit();
+        assert_eq!(committed.text, "変かいしゃ");
+        assert_eq!(committed.engine.map(|(_, rank)| rank), Some(EngineRank(0)));
     }
 
     #[test]

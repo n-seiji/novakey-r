@@ -11,6 +11,7 @@ pub mod dict;
 pub mod elem;
 pub mod lattice;
 pub mod learning;
+pub mod live_backspace;
 pub mod louds;
 pub mod result;
 pub mod wise;
@@ -64,6 +65,17 @@ impl KkcCore {
         let katakana = dict::to_katakana(hiragana);
         !katakana.is_empty()
             && self.dict.prefix_entries(&katakana).is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana))
+    }
+
+    /// カタカナの読み `katakana` で、表記が漢字 `kanji` 1 字の見出しが辞書にあるか。live 変換の Backspace が読みを切り分けるのに使う。
+    pub fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
+        let mut buf = [0u8; 4];
+        let kanji: &str = kanji.encode_utf8(&mut buf);
+        !katakana.is_empty()
+            && self
+                .dict
+                .prefix_entries(katakana)
+                .is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana && e.word == kanji))
     }
 
     /// 読み全体を変換する。結果の全件 (`mainResults` / `firstClauseResults`)。毎回ラティスを作り直す。
@@ -239,6 +251,19 @@ impl CandidateEngine for RustEngine {
     fn has_reading(&self, hiragana: &str) -> bool {
         self.core.as_ref().is_some_and(|core| core.has_reading(hiragana))
     }
+
+    /// `last` を読むだけで取り出さない (`select` が学習に使う)。
+    fn words(&self, revision: u64, index: usize) -> Option<Vec<(String, String)>> {
+        let (r, candidates) = self.last.as_ref()?;
+        if *r != revision {
+            return None;
+        }
+        Some(candidates.get(index)?.iter().map(|e| (e.word.clone(), e.ruby.clone())).collect())
+    }
+
+    fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
+        self.core.as_ref().is_some_and(|core| core.has_kanji_reading(katakana, kanji))
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +346,49 @@ mod tests {
         assert!(!e.has_reading("こっみと"));
         assert!(!e.has_reading("まで\u{3042}\u{3042}\u{3042}x"));
         assert!(!e.has_reading(""));
+    }
+
+    #[test]
+    fn live_backspace_drops_only_the_reading_of_the_last_displayed_character() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let cases = [
+            ("せんせい", "先生", 2),
+            ("がくせい", "学生", 2),
+            ("じんせい", "人生", 2),
+            ("かいしゃ", "会社", 2),
+            ("じかん", "時間", 2),
+            ("とうきょう", "東京", 3),
+            ("かいしゃのけん", "会社の件", 2),
+        ];
+        for (reading, word, want) in cases {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+            let cands = e.convert(1, reading);
+            let words = e.words(1, index_of(&cands, word)).unwrap();
+            let words: Vec<(&str, &str)> = words.iter().map(|(w, r)| (w.as_str(), r.as_str())).collect();
+            let dropped = live_backspace::drop_len(&words, reading, word, |s, k| e.has_kanji_reading(s, k));
+            assert_eq!(dropped.map(|d| d.len), Some(want), "{word}");
+        }
+    }
+
+    #[test]
+    fn words_does_not_consume_the_learning_data() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_judge(no_judge);
+        let cands = e.convert(1, "かいしゃ");
+        let i = index_of(&cands, "会社");
+        assert!(e.words(1, i).is_some());
+        assert!(e.select(1, i), "words の後も select できる");
+    }
+
+    #[test]
+    fn words_is_none_for_a_stale_revision_or_an_unknown_index() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_judge(no_judge);
+        let cands = e.convert(1, "かいしゃ");
+        let i = index_of(&cands, "会社");
+        assert_eq!(e.words(2, i), None);
+        assert_eq!(e.words(1, 99), None);
+        assert_eq!(e.words(1, i), Some(vec![("会社".to_string(), "カイシャ".to_string())]));
     }
 
     #[test]
