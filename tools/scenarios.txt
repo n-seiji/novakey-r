@@ -470,3 +470,9 @@ madeni<enter>	までに
 sameni<enter>	さめに
 kaneshite<enter>	かねして
 cachega<enter>	cacheが
+# live 変換の Backspace は、見えている最後の 1 文字に当たる読みを消す (Space 変換と未確定ローマ字は従来どおり 1 文字)。
+<live>sonokenn<bs><enter>	その
+<live>kaisyanokenn<bs><bs><enter>	会社
+<live>kaisyanokenn<bs><bs><bs><enter>	会
+<live>sonok<bs><enter>	その
+sonokenn<bs><enter>	そのけ

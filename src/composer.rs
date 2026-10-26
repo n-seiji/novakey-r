@@ -63,6 +63,11 @@ pub trait CandidateEngine {
     fn has_reading(&self, _hiragana: &str) -> bool {
         false
     }
+    /// live 変換で表示中の候補 (`index`) の最後の 1 文字に当たる、ひらがなの読みの文字数。
+    /// 語の情報を持たない engine や、表示と合わない候補は None (呼び出し側は 1 文字だけ消す)。
+    fn live_backspace_len(&self, _revision: u64, _index: usize, _hiragana: &str, _displayed: &str) -> Option<usize> {
+        None
+    }
 }
 
 /// 未確定文の局面。Empty は未確定文が無い状態。
@@ -623,11 +628,22 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
     }
 
-    pub fn backspace(&mut self) -> bool {
+    /// live 変換で、underline に出ている (preedit と同じ) 第 1 候補の engine 順位。
+    fn live_rank(&self) -> Option<EngineRank> {
+        if !(matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana && self.live) {
+            return None;
+        }
+        if self.english_split(false).is_some() || self.is_typing_english() {
+            return None;
+        }
+        self.reading.list.first().and_then(Candidate::engine_rank)
+    }
+
+    /// 末尾の読みを 1 文字消す。区切りが空になったら外す。
+    fn pop_reading_char(&mut self) {
         let Some(last) = self.segments.last_mut() else {
-            return false;
+            return;
         };
-        self.split_origin = None;
         let emptied = match last {
             Segment::Kana { keys, kana } => {
                 kana.pop();
@@ -641,6 +657,21 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
         if emptied {
             self.segments.pop();
+        }
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if self.segments.is_empty() {
+            return false;
+        }
+        self.split_origin = None;
+        // live 変換中は、見えている最後の 1 文字に当たる読みを消す。分からなければ 1 文字。
+        let count = self
+            .live_rank()
+            .and_then(|rank| self.engine.live_backspace_len(self.reading.generation, rank.0, &self.hiragana, &self.preedit()))
+            .unwrap_or(1);
+        for _ in 0..count {
+            self.pop_reading_char();
         }
         let was_literal = matches!(self.typing, Typing::Literal | Typing::Mixed);
         // 英単語の部分を消しきったら、残ったかなは通常の組成に戻す。
@@ -790,10 +821,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         english.extend(self.segments.iter().filter(|s| s.is_literal()).map(|s| s.keys().to_string()));
         let engine = match &self.stage {
             Stage::Selecting(s) => s.list[s.cursor].engine_rank(),
-            Stage::Editing if self.typing == Typing::Kana && self.live => {
-                self.reading.list.first().and_then(Candidate::engine_rank)
-            }
-            _ => None,
+            _ => self.live_rank(),
         }
         .map(|rank| (self.reading.generation, rank));
         self.segments.clear();
@@ -1224,6 +1252,132 @@ mod tests {
         c.push_input("n", "ん", "");
         c.backspace();
         assert_eq!(c.raw(), "ka");
+    }
+
+    /// 語の情報を持つ engine のつもり。Backspace が消す読みの長さ (drop) と、渡された引数を記録する。
+    struct WordsEngine {
+        drop: Option<usize>,
+        asked: std::rc::Rc<std::cell::RefCell<Vec<(u64, usize, String, String)>>>,
+    }
+
+    impl CandidateEngine for WordsEngine {
+        fn convert(&mut self, _revision: u64, hiragana: &str) -> Vec<String> {
+            vec![format!("変{hiragana}"), format!("別{hiragana}")]
+        }
+        fn select(&mut self, _revision: u64, _engine_index: usize) -> bool {
+            true
+        }
+        fn cancel(&mut self) {}
+        fn live_backspace_len(&self, revision: u64, index: usize, hiragana: &str, displayed: &str) -> Option<usize> {
+            self.asked.borrow_mut().push((revision, index, hiragana.to_string(), displayed.to_string()));
+            self.drop
+        }
+    }
+
+    type Asked = std::rc::Rc<std::cell::RefCell<Vec<(u64, usize, String, String)>>>;
+
+    fn words_composer(drop: Option<usize>) -> (Composer<WordsEngine, FakeLexicon>, Asked) {
+        let asked = Asked::default();
+        let c = Composer::new(WordsEngine { drop, asked: asked.clone() }, FakeLexicon::default());
+        (c, asked)
+    }
+
+    fn type_kaisha(c: &mut Composer<WordsEngine, FakeLexicon>) {
+        c.push_input("ka", "か", "");
+        c.push_input("i", "い", "");
+        c.push_input("sha", "しゃ", "");
+    }
+
+    #[test]
+    fn live中のbackspaceは見えている最後の文字に当たる読みを消す() {
+        let (mut c, asked) = words_composer(Some(2));
+        c.set_live(true);
+        type_kaisha(&mut c);
+        let generation = c.reading.generation;
+        assert_eq!(c.display(), "変かいしゃ");
+        assert!(c.backspace());
+        assert_eq!(asked.borrow().as_slice(), [(generation, 0, "かいしゃ".to_string(), "変かいしゃ".to_string())]);
+        assert_eq!(c.hiragana, "かい");
+        assert_eq!(c.raw(), "kai");
+        assert_eq!(c.display(), "変かい");
+    }
+
+    #[test]
+    fn live中のbackspaceが単位の途中で切れても残りの打鍵はrawに反映され英語判定にならない() {
+        let (mut c, _) = words_composer(Some(1));
+        c.set_live(true);
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(c.hiragana, "かいし");
+        assert_eq!(c.raw(), "kaiし");
+        assert!(!c.is_typing_english());
+        assert_eq!(c.phase(), Phase::Composing);
+        assert!(c.begin_conversion());
+        let raw: Vec<&str> = c.candidates().iter().filter(|cand| cand.source == Source::Raw).map(|cand| cand.text.as_str()).collect();
+        assert_eq!(raw, ["kaiし"]);
+    }
+
+    #[test]
+    fn engineが長さを返さなければ1文字だけ消す() {
+        let (mut c, asked) = words_composer(None);
+        c.set_live(true);
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(asked.borrow().len(), 1);
+        assert_eq!(c.hiragana, "かいし");
+    }
+
+    #[test]
+    fn 長さが読みより長くても全部消えて空になる() {
+        let (mut c, _) = words_composer(Some(9));
+        c.set_live(true);
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert_eq!(c.phase(), Phase::Empty);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn 非liveのbackspaceはengineに聞かず1文字だけ消す() {
+        let (mut c, asked) = words_composer(Some(2));
+        type_kaisha(&mut c);
+        assert!(c.backspace());
+        assert!(asked.borrow().is_empty());
+        assert_eq!(c.hiragana, "かいし");
+    }
+
+    #[test]
+    fn 読みに戻した後のbackspaceはengineに聞かず1文字だけ消す() {
+        let (mut c, asked) = words_composer(Some(2));
+        c.set_live(true);
+        type_kaisha(&mut c);
+        c.revert();
+        asked.borrow_mut().clear();
+        assert!(c.backspace());
+        assert!(asked.borrow().is_empty());
+        assert_eq!(c.hiragana, "かいし");
+    }
+
+    #[test]
+    fn liveでも記号1つの読みは1文字だけ消してengineに聞かない() {
+        let (mut c, asked) = words_composer(Some(2));
+        c.set_live(true);
+        c.push_input("[", "「", "");
+        assert!(c.is_symbol());
+        assert!(c.backspace());
+        assert!(asked.borrow().is_empty());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn live中のbackspaceのあとも第1候補を学習対象にできる() {
+        let (mut c, _) = words_composer(Some(2));
+        c.set_live(true);
+        type_kaisha(&mut c);
+        c.backspace();
+        let committed = c.commit();
+        assert_eq!(committed.text, "変かい");
+        assert_eq!(committed.engine.map(|(_, rank)| rank), Some(EngineRank(0)));
     }
 
     #[test]
