@@ -240,8 +240,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          # The tag does not exist yet; GitHub creates it at --target when the draft is published.
-          gh release create "$TAG" dist/*.pkg dist/*.pkg.sha256 dist/*.app.zip dist/*.app.zip.sha256 --draft --target "$GITHUB_SHA" --generate-notes
+          files=(dist/*.pkg dist/*.pkg.sha256 dist/*.app.zip dist/*.app.zip.sha256)
+          # Retried: a transient API error (HTTP 500) here should not cost a full rebuild and notarization.
+          # If an earlier attempt left a draft, finish its uploads; never touch a published release.
+          for attempt in 1 2 3; do
+            draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+            case "$draft" in
+              # The tag does not exist yet; GitHub creates it at --target when the draft is published.
+              missing) gh release create "$TAG" "${files[@]}" --draft --target "$GITHUB_SHA" --generate-notes && exit 0 ;;
+              true) gh release upload "$TAG" "${files[@]}" --clobber && exit 0 ;;
+              *) echo "release $TAG is already published" >&2; exit 1 ;;
+            esac
+            echo "draft release attempt $attempt failed" >&2
+            sleep $((attempt * 20))
+          done
+          exit 1
       - name: Remove signing keychain and keys
         if: always()
         run: |
