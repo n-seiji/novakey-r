@@ -216,6 +216,11 @@ pub struct Composer<E: CandidateEngine, L: Lexicon> {
     english_shown: bool,
     /// 英語分割で英単語にまとめる前の区切りと未確定の打鍵。取り消しで分割前の打鍵中に戻すために持つ。
     split_origin: Option<(Vec<Segment>, String)>,
+    /// live 変換で英語分割を表示している間の、(英単語, かな部分, 英単語 + 変換したかなの候補列)。
+    /// 見えている分割と、Enter で確定される分割 (未確定のローマ字を確定かなとした分割) が違えば両方持つ。
+    /// 打鍵が英単語とかな部分を変えなければ変換し直さない。`reading` とは別に持つ。
+    /// 分割を表示している間は読み全体を変換しない (engine の直前の変換と `candidates()` を食い違わせない)。
+    live_split: Vec<(String, String, Vec<Candidate>)>,
     reading: ReadingCands,
     stage: Stage,
     live: bool,
@@ -234,6 +239,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             typing: Typing::Empty,
             english_shown: false,
             split_origin: None,
+            live_split: Vec::new(),
             reading: ReadingCands { generation: 0, list: Vec::new() },
             stage: Stage::Editing,
             live: false,
@@ -246,6 +252,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if self.live != live {
             self.live = live;
             self.unpin();
+            self.sync_live_split();
         }
     }
 
@@ -279,6 +286,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Stage::Reverted { kept: Some(list) } | Stage::Transliterated { kept: Some(list), .. } => list,
             // 固定中の reading.list は残りの読みだけの候補で、見えている文字列 (固定 + 残り) と食い違う。
             _ if self.pin.is_some() => &[],
+            // 英語分割を表示している間は、読み全体の候補を見せない (見えている文字列と食い違う)。
+            _ if !self.live_split.is_empty() => &[],
             _ => &self.reading.list,
         }
     }
@@ -302,6 +311,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                     Cow::Owned(pin.surface() + converted.map_or(self.rest(), |c| c.text.as_str()))
                 }
             },
+            Stage::Editing if self.typing == Typing::Mixed && self.live => {
+                let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some());
+                Cow::Borrowed(converted.map_or(self.hiragana.as_str(), |c| c.text.as_str()))
+            }
             Stage::Transliterated { text, .. } => Cow::Borrowed(text),
             _ => Cow::Borrowed(&self.hiragana),
         }
@@ -309,8 +322,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 下線付きで見せる文字列。表示の決定はここだけ。
     pub fn preedit(&self) -> String {
-        if let Some(split) = self.english_split(false) {
-            return split.display();
+        if let Some(split) = self.shown_split() {
+            return match self.live_split_text(&split) {
+                Some(text) => text.to_string() + &split.pending,
+                None => split.display(),
+            };
         }
         if (self.typing == Typing::English && self.is_kana_editing()) || self.is_typing_english() {
             return self.raw();
@@ -322,7 +338,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// かな入力中は、確定の前に行う flush が局面を英語に変える分 (merge, artifactni) も見込む。
     pub fn commit_preview(&self) -> String {
         match self.settle(self.is_typing_english()) {
-            Settle::Mixed(split) => split.head + &split.tail.iter().map(|(_, kana)| kana.as_str()).collect::<String>(),
+            Settle::Mixed(split) => match self.live_split_text(&split) {
+                Some(text) => text.to_string(),
+                None => format!("{}{}", split.head, split.tail_kana()),
+            },
             Settle::Dangling => self.raw(),
             Settle::Unchanged if self.phase() == Phase::Dangling => self.raw(),
             Settle::Unchanged => self.display().into_owned(),
@@ -369,6 +388,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn reset_candidates(&mut self) {
         self.reading.generation += 1;
         self.reading.list.clear();
+        self.live_split.clear();
         if let Stage::Reverted { kept } | Stage::Transliterated { kept, .. } = &mut self.stage {
             *kept = None;
         }
@@ -388,6 +408,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.pin = None;
             self.typing = Typing::English;
             self.english_shown = true;
+            self.sync_live_split();
             return;
         }
         if let Some(forms) = self.symbol_variants() {
@@ -404,7 +425,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if !self.pin_matches_reading() {
             self.pin = None;
         }
-        self.reading.list = self.convert_reading();
+        self.sync_live_split();
+        if self.live_split.is_empty() {
+            self.reading.list = self.convert_reading();
+        }
     }
 
     /// 固定した先頭部分が、いまの読みの先頭と合っているか。固定が無ければ true。
@@ -512,9 +536,74 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 self.typing = Typing::English;
                 self.english_shown = true;
             }
-            (false, true) => self.refresh(),
+            (false, true) => {
+                self.refresh();
+                return;
+            }
             _ => {}
         }
+        self.sync_live_split();
+    }
+
+    /// live 変換で英語分割を表示している間、英単語 + かな部分の変換を保つ。
+    /// 英単語とかな部分が変わらない打鍵 (未確定のローマ字だけが動く) では変換し直さない。
+    fn sync_live_split(&mut self) {
+        let shown = if self.live { self.shown_split() } else { None };
+        let settled = shown.as_ref().and_then(|_| self.english_split(true));
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for split in shown.into_iter().chain(settled) {
+            let key = (split.head.clone(), split.tail_kana());
+            if !wanted.contains(&key) {
+                wanted.push(key);
+            }
+        }
+        let unchanged = wanted.len() == self.live_split.len()
+            && wanted.iter().zip(&self.live_split).all(|((head, tail), (h, t, _))| head == h && tail == t);
+        if unchanged {
+            return;
+        }
+        let was_split = !self.live_split.is_empty();
+        if !wanted.is_empty() {
+            self.pin = None;
+        }
+        self.live_split = wanted
+            .into_iter()
+            .map(|(head, tail)| {
+                let list = self.convert_mixed(&head, &tail);
+                (head, tail, list)
+            })
+            .collect();
+        // 分割が消えたら、飛ばしていた読み全体の変換を戻す。
+        if was_split && self.live_split.is_empty() && self.typing == Typing::Kana && matches!(self.stage, Stage::Editing) {
+            self.reading.list = self.convert_reading();
+        }
+    }
+
+    /// 下線付きで見せている英語分割。未確定のローマ字が無ければ、Enter で確定される分割と同じ。
+    fn shown_split(&self) -> Option<english_split::Split> {
+        self.english_split(self.live && self.romaji.buffer().is_empty())
+    }
+
+    /// いま見えている英語分割の、変換済みの表示 (英単語 + 変換したかな)。変換が無い・分割が違うなら None。
+    fn live_split_text(&self, split: &english_split::Split) -> Option<&str> {
+        if !self.live {
+            return None;
+        }
+        let tail = split.tail_kana();
+        let (_, _, list) = self.live_split.iter().find(|(head, kana, _)| *head == split.head && *kana == tail)?;
+        list.first().filter(|c| c.engine_rank().is_some()).map(|c| c.text.as_str())
+    }
+
+    /// 英単語 head のあとに、かな tail をエンジンで変換したものを付けた候補列。
+    fn convert_mixed(&mut self, head: &str, tail: &str) -> Vec<Candidate> {
+        let mut list: Vec<Candidate> = Vec::new();
+        for (engine_index, text) in self.engine.convert(self.reading.generation, tail).into_iter().enumerate() {
+            let text = format!("{head}{text}");
+            if !list.iter().any(|c| c.text == text) {
+                list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
+            }
+        }
+        list
     }
 
     /// 取り消しや字種変換で読みに戻るとき、英語の判定は持ち越さない。
@@ -545,27 +634,20 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 英単語を 1 つの単位にまとめ、かな混じり (Mixed) として確定・変換できるようにする。
     /// 変換候補は、かなの部分をエンジンで変換したものに英単語を前に付けたもの (artifactを使う)。
     fn fix_english_split(&mut self, split: english_split::Split) {
-        let tail_kana: String = split.tail.iter().map(|(_, kana)| kana.as_str()).collect();
+        let tail = split.tail_kana();
         let origin = (self.segments.clone(), self.romaji.buffer().to_string());
         self.pin = None;
-        let head = Segment::Literal(split.head.clone());
-        let tail = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
-        self.segments = std::iter::once(head).chain(tail).collect();
+        let head_text = split.head.clone();
+        let head = Segment::Literal(split.head);
+        let tail_segments = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
+        self.segments = std::iter::once(head).chain(tail_segments).collect();
         self.romaji.clear();
         self.sync_hiragana();
         self.reset_candidates();
         self.stage = Stage::Editing;
         self.typing = Typing::Mixed;
         self.split_origin = Some(origin);
-        let texts = self.engine.convert(self.reading.generation, &tail_kana);
-        for (engine_index, text) in texts.into_iter().enumerate() {
-            let text = format!("{}{text}", split.head);
-            if !self.reading.list.iter().any(|c| c.text == text) {
-                self.reading
-                    .list
-                    .push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
-            }
-        }
+        self.reading.list = self.convert_mixed(&head_text, &tail);
     }
 
     /// 英語を打っていると見なせる局面。英字のまま表示し、確定も英字にする。
@@ -710,7 +792,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// live 変換で、underline に出ている (preedit と同じ) 第 1 候補の engine 順位。
     fn live_rank(&self) -> Option<EngineRank> {
-        if !self.is_live_kana() {
+        let live_mixed = matches!(self.stage, Stage::Editing) && self.typing == Typing::Mixed && self.live;
+        if !self.is_live_kana() && !live_mixed {
             return None;
         }
         self.reading.list.first().and_then(Candidate::engine_rank)
@@ -721,7 +804,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         matches!(self.stage, Stage::Editing)
             && self.typing == Typing::Kana
             && self.live
-            && self.english_split(false).is_none()
+            && self.shown_split().is_none()
             && !self.is_typing_english()
     }
 
@@ -1746,9 +1829,10 @@ mod tests {
         c.revert();
         assert_eq!(c.phase(), Phase::Reverted);
         assert_eq!(c.display(), "きょう");
-        c.push_input("ha", "は", "");
+        // 「は」は助詞なので、mock の語彙だと kyou + は の英語分割になる。分割にならない「き」を使う。
+        c.push_input("ki", "き", "");
         assert_eq!(c.phase(), Phase::Composing);
-        assert_eq!(c.display(), "きょうはK1");
+        assert_eq!(c.display(), "きょうきK1");
     }
 
     #[test]
@@ -2196,6 +2280,88 @@ mod tests {
         assert_eq!(c.display(), "きょう");
         assert_eq!(c.phase(), Phase::Composing);
         assert_eq!(texts(&c), vec!["今日", "京", "教"]);
+    }
+
+    fn live_split_composer() -> (Composer<MockEngine, FakeLexicon>, Log) {
+        let log = Log::default();
+        let engine = MockEngine { log: log.clone(), table: vec![("を".to_string(), vec!["を".to_string()])] };
+        let mut c = Composer::new(engine, FakeLexicon::default().with_english_word(|w| w == "artifact"));
+        c.set_live(true);
+        (c, log)
+    }
+
+    fn type_keys(c: &mut Composer<MockEngine, FakeLexicon>, keys: &str) {
+        for ch in keys.chars() {
+            c.type_romaji(&ch.to_string());
+        }
+    }
+
+    #[test]
+    fn live中の英語分割はかな部分を変換して英単語に続けて表示する() {
+        let (mut c, _) = live_split_composer();
+        type_keys(&mut c, "artifactwo");
+        assert_eq!(c.preedit(), "artifactを");
+        type_keys(&mut c, "ko");
+        assert_eq!(c.preedit(), "artifactをこK1");
+        assert_eq!(c.preedit(), c.commit_preview());
+    }
+
+    #[test]
+    fn live中の英語分割は未確定のローマ字だけが動く打鍵では変換し直さない() {
+        let (mut c, log) = live_split_composer();
+        type_keys(&mut c, "artifactwok");
+        let converts = log.converts.borrow().len();
+        assert_eq!(c.preedit(), "artifactをk");
+        type_keys(&mut c, "y");
+        assert_eq!(c.preedit(), "artifactをky");
+        assert_eq!(log.converts.borrow().len(), converts);
+    }
+
+    #[test]
+    fn live中の英語分割はenterで表示どおりに確定し学習する() {
+        let (mut c, log) = live_split_composer();
+        type_keys(&mut c, "artifactwoko");
+        let shown = c.preedit();
+        c.flush_romaji();
+        assert_eq!(c.phase(), Phase::Mixed);
+        assert_eq!(commit_learning(&mut c), shown);
+        assert_eq!(shown, "artifactをこK1");
+        assert_eq!(log.selects.borrow().len(), 1);
+    }
+
+    #[test]
+    fn live中の英語分割はbackspaceで読みを1文字ずつ戻す() {
+        let (mut c, _) = live_split_composer();
+        type_keys(&mut c, "artifactwoko");
+        assert!(c.backspace());
+        assert_eq!(c.preedit(), "artifactを");
+    }
+
+    #[test]
+    fn live中の英語分割を表示している間は候補を選んでも確定も学習もしない() {
+        let (mut c, log) = live_split_composer();
+        type_keys(&mut c, "artifactwoko");
+        assert!(c.candidates().is_empty());
+        assert!(!c.select_candidate(0));
+        assert!(log.selects.borrow().is_empty());
+    }
+
+    #[test]
+    fn live中でも英語分割に戻れない末尾の子音はrawのまま確定する() {
+        let (mut c, _) = live_split_composer();
+        type_keys(&mut c, "artifactwok");
+        c.flush_romaji();
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(commit_learning(&mut c), "artifactwok");
+    }
+
+    #[test]
+    fn スペース変換の英語分割は変換せずに英単語とかなを表示する() {
+        let (mut c, log) = live_split_composer();
+        c.set_live(false);
+        type_keys(&mut c, "artifactwo");
+        assert_eq!(c.preedit(), "artifactを");
+        assert!(log.converts.borrow().iter().all(|(_, reading)| reading != "を"));
     }
 
     #[test]

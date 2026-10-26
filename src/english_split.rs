@@ -24,6 +24,11 @@ pub struct Split {
 }
 
 impl Split {
+    /// かなの部分の読み (未確定のローマ字は含めない)。
+    pub fn tail_kana(&self) -> String {
+        self.tail.iter().map(|(_, kana)| kana.as_str()).collect()
+    }
+
     pub fn display(&self) -> String {
         std::iter::once(self.head.as_str())
             .chain(self.tail.iter().map(|(_, kana)| kana.as_str()))

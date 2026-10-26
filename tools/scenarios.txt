@@ -27,6 +27,11 @@ merge<enter>	merge
 artifactni<enter>	artifactに
 artifactni<space><enter>	artifactに
 artifactwotsukau<space><enter>	artifactを使う
+<live>artifactwokousinnsite<enter>	artifactを更新して
+<live>mergewosite<enter>	mergeをして
+<live>artifactni<enter>	artifactに
+<live>artifactwok<enter>	artifactwok
+<live>artifactwokousinsite<bs><bs><enter>	artifactを更新
 include<enter>	include
 git<space>merge<enter>	git merge
 enter<space>	enter 
