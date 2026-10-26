@@ -38,7 +38,7 @@
 
 動作環境: macOS 26 以降、Apple Silicon (M1 以降)。Intel Mac には対応していません。
 
-Releases から `Shizuku-<version>.pkg` をダウンロードして開きます。インストーラが Shizuku を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
+[Shizuku.pkg](https://github.com/n-seiji/shizuku-ime/releases/latest/download/Shizuku.pkg) (最新版) をダウンロードして開きます。版ごとのファイルは Releases にあります。インストーラが Shizuku を `~/Library/Input Methods` に入れます (自分のユーザーだけに入れるので、パスワードは求められません)。パッケージは Developer ID で署名され、Apple の公証を受けています。
 
 初回は、システム設定 > キーボード > 入力ソース で Shizuku を追加してください。まだ一覧に出ないときは、先にログインし直します。
 

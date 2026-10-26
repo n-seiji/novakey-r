@@ -17,7 +17,7 @@
    3. リリースを有効にするリポジトリ変数を設定します: `gh variable set RELEASE_ENABLED --body true`。`true` になるまでワークフローは「release disabled」と報告するだけで何もビルドしないので、main へのマージは安全です。
 
    シークレットは `signing` 環境に紐づき、この環境を使えるのは main で動くジョブだけなので、他のブランチのワークフローからは読めません。公証には、このリポジトリ専用の App Store Connect API キー (Developer ロール) を使ってください。
-2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `Shizuku-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
+2. `Cargo.toml` の `version` を上げて main にマージします。ワークフローがアプリをビルドして署名し、公証と staple を行って zip にします。続いて staple 済みのアプリから `Shizuku-<version>.pkg` を作り (`scripts/build-pkg.sh`)、Developer ID Installer で署名し、公証と staple を行い、`spctl --assess --type install` で確かめます。版なしの `Shizuku.pkg` にも同じものをコピーします (`releases/latest/download/Shizuku.pkg` が常に最新版を指すように)。最後に `.pkg`、`.app.zip` (副) とそれぞれの `.sha256` を載せた下書きリリースを作ります。
 3. 承認する前に下書きを試します。
    - 下書きの `.pkg` を **Safari で** ダウンロードします (quarantine 属性を付けるため)。開いてパスワードを求められないことを確かめ、ログインし直して入力ソースを追加し、実際に打ちます。
    - 同じ `.pkg` をもう一度、入っている版の上から開き、Shizuku が入力ソースに残っていることを確かめます。

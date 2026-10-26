@@ -216,6 +216,9 @@ jobs:
           xcrun stapler staple "$pkg"
           # Stapling rewrites the package, so the checksum is taken again.
           (cd dist && shasum -a 256 "Shizuku-${TAG#v}.pkg" > "Shizuku-${TAG#v}.pkg.sha256")
+          # The same bytes under a fixed name, so releases/latest/download/Shizuku.pkg always serves the newest.
+          cp "$pkg" dist/Shizuku.pkg
+          (cd dist && shasum -a 256 Shizuku.pkg > Shizuku.pkg.sha256)
       - name: Verify the final package
         run: |
           set -eu
