@@ -253,14 +253,16 @@ impl CandidateEngine for RustEngine {
     }
 
     /// `last` を読むだけで取り出さない (`select` が学習に使う)。
-    fn live_backspace_len(&self, revision: u64, index: usize, hiragana: &str, displayed: &str) -> Option<usize> {
-        let core = self.core.as_ref()?;
+    fn words(&self, revision: u64, index: usize) -> Option<Vec<(String, String)>> {
         let (r, candidates) = self.last.as_ref()?;
         if *r != revision {
             return None;
         }
-        let words: Vec<(&str, &str)> = candidates.get(index)?.iter().map(|e| (e.word.as_str(), e.ruby.as_str())).collect();
-        live_backspace::drop_len(&words, hiragana, displayed, |suffix, kanji| core.has_kanji_reading(suffix, kanji))
+        Some(candidates.get(index)?.iter().map(|e| (e.word.clone(), e.ruby.clone())).collect())
+    }
+
+    fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
+        self.core.as_ref().is_some_and(|core| core.has_kanji_reading(katakana, kanji))
     }
 }
 
@@ -361,31 +363,32 @@ mod tests {
         for (reading, word, want) in cases {
             let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
             let cands = e.convert(1, reading);
-            let i = index_of(&cands, word);
-            assert_eq!(e.live_backspace_len(1, i, reading, word), Some(want), "{word}");
+            let words = e.words(1, index_of(&cands, word)).unwrap();
+            let words: Vec<(&str, &str)> = words.iter().map(|(w, r)| (w.as_str(), r.as_str())).collect();
+            let dropped = live_backspace::drop_len(&words, reading, word, |s, k| e.has_kanji_reading(s, k));
+            assert_eq!(dropped.map(|d| d.len), Some(want), "{word}");
         }
     }
 
     #[test]
-    fn live_backspace_len_does_not_consume_the_learning_data() {
+    fn words_does_not_consume_the_learning_data() {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let mut e = RustEngine::with_core(core).with_judge(no_judge);
         let cands = e.convert(1, "かいしゃ");
         let i = index_of(&cands, "会社");
-        assert!(e.live_backspace_len(1, i, "かいしゃ", "会社").is_some());
-        assert!(e.select(1, i), "bs の後も select できる");
+        assert!(e.words(1, i).is_some());
+        assert!(e.select(1, i), "words の後も select できる");
     }
 
     #[test]
-    fn live_backspace_len_is_none_for_a_stale_revision_or_a_different_display() {
+    fn words_is_none_for_a_stale_revision_or_an_unknown_index() {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let mut e = RustEngine::with_core(core).with_judge(no_judge);
         let cands = e.convert(1, "かいしゃ");
         let i = index_of(&cands, "会社");
-        assert_eq!(e.live_backspace_len(2, i, "かいしゃ", "会社"), None);
-        assert_eq!(e.live_backspace_len(1, i, "かいしゃ", "回社"), None);
-        assert_eq!(e.live_backspace_len(1, i, "かいし", "会社"), None);
-        assert_eq!(e.live_backspace_len(1, 99, "かいしゃ", "会社"), None);
+        assert_eq!(e.words(2, i), None);
+        assert_eq!(e.words(1, 99), None);
+        assert_eq!(e.words(1, i), Some(vec![("会社".to_string(), "カイシャ".to_string())]));
     }
 
     #[test]
