@@ -813,13 +813,15 @@ impl Judge {
         Ok(self.tok.encode(&text.to_lowercase()))
     }
 
-    /// 各文の対数尤度 (BOS から EOS まで) と、今回新しく計算したトークン数。
-    fn score(&self, texts: &[&str]) -> R<(Vec<f64>, usize)> {
+    /// 各文の対数尤度 (BOS から EOS まで)、未知トークンを含むか、今回新しく計算したトークン数。
+    fn score(&self, texts: &[&str]) -> R<(Vec<f64>, Vec<bool>, usize)> {
         let seqs = texts.iter().map(|t| self.sequence(t)).collect::<R<Vec<_>>>()?;
         if seqs.iter().any(|s| s.len() + 2 > MAX_TOKENS) {
             return Err("too long");
         }
-        self.model.score(&seqs)
+        let unknown = seqs.iter().map(|s| s.contains(&self.tok.unk_id())).collect();
+        let (scores, rows) = self.model.score(&seqs)?;
+        Ok((scores, unknown, rows))
     }
 }
 
@@ -907,6 +909,14 @@ pub fn take_last_ms() -> Option<f64> {
     LAST_MS.with(Cell::take)
 }
 
+/// 未知トークンを含む文の審判スコアを、含まない文の最小値に下げる (審判は未知トークンに高い確率を付けるので、
+/// 語彙にない文字を含む稀な漢字の候補が押し上げられるのを防ぐ。engine のスコアはそのまま効く)。
+/// 全文が未知なら比べる相手がないので `None`。
+fn floor_unknown(scores: &[f64], unknown: &[bool]) -> Option<Vec<f64>> {
+    let floor = scores.iter().zip(unknown).filter(|&(_, &u)| !u).map(|(&s, _)| s).reduce(f64::min)?;
+    Some(scores.iter().zip(unknown).map(|(&s, &u)| if u { floor } else { s }).collect())
+}
+
 /// engine のスコアと審判の対数尤度の合計が大きい順の添字。どれかが有限でなければ `None`
 /// (NaN が混じると並べ替えが全順序にならず、順番が不定になるため)。
 fn order_by_total(engine_scores: &[f32], judge_scores: &[f64]) -> Option<Vec<usize>> {
@@ -943,7 +953,7 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
         judge()?
     };
     let t0 = Instant::now();
-    let (scores, rows) = match judge.score(texts) {
+    let (scores, unknown, rows) = match judge.score(texts) {
         Ok(s) => s,
         Err(err) => {
             log_once(&SCORE_LOGGED, &format!("judge: scoring failed; this key keeps the engine order ({err})"));
@@ -952,8 +962,9 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
     };
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     LAST_MS.with(|c| c.set(Some(ms)));
-    crate::trace::record("judge", &format!("ms={ms:.1} n={} rows={rows}", texts.len()));
-    order_by_total(engine_scores, &scores)
+    let unk = unknown.iter().filter(|&&u| u).count();
+    crate::trace::record("judge", &format!("ms={ms:.1} n={} rows={rows} unk={unk}", texts.len()));
+    order_by_total(engine_scores, &floor_unknown(&scores, &unknown)?)
 }
 
 /// `--judge-bench <testset.tsv>`: 読み (1 列目) と正解 (2 列目、`|` 区切り) の表を、
@@ -1102,6 +1113,17 @@ mod tests {
         assert!(m.work.is_poisoned());
         let got = m.score(&seqs).unwrap().0;
         assert!((got[0] - want[0]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn 未知トークンを含む文は_含まない文の最小スコアに下げる() {
+        assert_eq!(floor_unknown(&[-20.0, -11.0, -15.0], &[false, true, false]), Some(vec![-20.0, -20.0, -15.0]));
+        assert_eq!(floor_unknown(&[-3.0, -1.0], &[false, false]), Some(vec![-3.0, -1.0]));
+        assert_eq!(floor_unknown(&[-3.0, -1.0], &[true, true]), None);
+        // 未知の文が審判の最良でも、既知の最小まで下がる。
+        let floored = floor_unknown(&[-20.07, -11.32], &[false, true]).unwrap();
+        assert_eq!(floored, vec![-20.07, -20.07]);
+        assert_eq!(order_by_total(&[-8.75, -16.90], &floored), Some(vec![0, 1]));
     }
 
     #[test]
