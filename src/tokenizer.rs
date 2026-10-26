@@ -91,16 +91,30 @@ impl Tokenizer {
         self.unk_id
     }
 
+    /// 追加トークン (`<s>` / `</s>` など、本文中の文字列から切り出される id) か。
+    pub fn is_added(&self, id: u32) -> bool {
+        self.added.iter().any(|(_, a)| *a == id)
+    }
+
     /// 特殊トークンを足さずに id 列にする (`encode(text, false)` 相当)。
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_from(text, true)
+    }
+
+    /// `encode` と同じだが、先頭に `▁` を足さない。直前の文字列に続く語として、つなげて符号化するときに使う。
+    pub fn encode_continuation(&self, text: &str) -> Vec<u32> {
+        self.encode_from(text, false)
+    }
+
+    fn encode_from(&self, text: &str, prepend: bool) -> Vec<u32> {
         let mut out = Vec::new();
         let mut pos = 0;
         while let Some((start, len, id)) = self.next_added(text, pos) {
-            self.encode_segment(&text[pos..start], &mut out);
+            self.encode_segment(&text[pos..start], prepend || pos > 0, &mut out);
             out.push(id);
             pos = start + len;
         }
-        self.encode_segment(&text[pos..], &mut out);
+        self.encode_segment(&text[pos..], prepend || pos > 0, &mut out);
         out
     }
 
@@ -116,7 +130,7 @@ impl Tokenizer {
         })
     }
 
-    fn encode_segment(&self, segment: &str, out: &mut Vec<u32>) {
+    fn encode_segment(&self, segment: &str, prepend: bool, out: &mut Vec<u32>) {
         let normalized = self.charsmap.normalize(segment);
         let trimmed = normalized.trim_end_matches(char::is_whitespace);
         // Replace(" {2,}" → "▁") のあと Metaspace が残りの空白を `▁` にするので、空白の並びはどれも `▁` 1 個になる。
@@ -136,7 +150,7 @@ impl Tokenizer {
         if s.is_empty() {
             return;
         }
-        if !s.starts_with(META) {
+        if prepend && !s.starts_with(META) {
             s.insert(0, META);
         }
         let mut start = 0;
@@ -365,6 +379,16 @@ mod tests {
         assert_eq!(t.encode("ab<s>ab"), [5, 6, 5]);
         assert_eq!(t.encode("   "), Vec::<u32>::new());
         assert_eq!(t.encode(""), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn 続きとして符号化すると先頭に_メタ空白_を足さない() {
+        let t = Tokenizer::from_json(&small_json()).unwrap();
+        assert_eq!(t.encode_continuation("ab"), [4]);
+        assert_eq!(t.encode_continuation("ab ab"), [4, 5]);
+        assert_eq!(t.encode_continuation(" ab"), [5]);
+        assert_eq!(t.encode_continuation("ab<s>ab"), [4, 6, 5]);
+        assert_eq!(t.encode_continuation(""), Vec::<u32>::new());
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub trait CandidateEngine {
     fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String>;
     fn select(&mut self, revision: u64, engine_index: usize) -> bool;
     fn cancel(&mut self);
+    /// 変換の文脈 (アプリで直前に確定した文字列。空なら文脈なし)。キーごとに、変換する前に渡される。
+    fn set_context(&mut self, _context: &str) {}
     /// ひらがなの読みがそのまま辞書の見出しにあるか (made → まで)。英単語として切り分ける前の衝突確認に使う。
     fn has_reading(&self, _hiragana: &str) -> bool {
         false

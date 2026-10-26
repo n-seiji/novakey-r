@@ -31,6 +31,8 @@ const EOS: u32 = 2;
 const WEIGHT: f64 = 1.0;
 /// これより長い系列 (トークン数) は審判にかけない。
 const MAX_TOKENS: usize = 200;
+/// 文脈 (直前に確定した文字列) として使うトークン数の上限。後ろ側を残す。
+const CONTEXT_TOKENS: usize = 32;
 /// CPU の並列に使うスレッド数 (IME が全コアを占有しないように)。
 const THREADS: usize = 3;
 /// 重みを f32 に戻す作業領域の大きさ (要素数)。層の重みはこの大きさの塊に分けて流す。
@@ -809,20 +811,41 @@ impl Judge {
         Ok(judge)
     }
 
-    fn sequence(&self, text: &str) -> R<Vec<u32>> {
-        Ok(self.tok.encode(&text.to_lowercase()))
-    }
-
-    /// 各文の対数尤度 (BOS から EOS まで)、未知トークンを含むか、今回新しく計算したトークン数。
-    fn score(&self, texts: &[&str]) -> R<(Vec<f64>, Vec<bool>, usize)> {
-        let seqs = texts.iter().map(|t| self.sequence(t)).collect::<R<Vec<_>>>()?;
-        if seqs.iter().any(|s| s.len() + 2 > MAX_TOKENS) {
-            return Err("too long");
-        }
-        let unknown = seqs.iter().map(|s| s.contains(&self.tok.unk_id())).collect();
+    /// 各文の対数尤度 (BOS から EOS まで)、候補部分に未知トークンを含むか、今回新しく計算したトークン数。
+    /// `context` は全候補の前に置く共通の接頭辞なので、候補の並びは P(候補 | 文脈) の順と同じになる。
+    fn score(&self, context: &str, texts: &[&str]) -> R<(Vec<f64>, Vec<bool>, usize)> {
+        let (seqs, unknown) = build_sequences(&self.tok, context, texts)?;
         let (scores, rows) = self.model.score(&seqs)?;
         Ok((scores, unknown, rows))
     }
+}
+
+/// 審判に流す系列と、候補部分に未知トークンを含むか。
+/// 文脈が空なら、各候補を従来どおり単独で符号化する。文脈があれば `文脈 + 候補` を 1 本にする:
+/// 文脈の後ろが空白でなければ候補の先頭に `▁` を足さず (文脈に続けて書いたときの分割に合わせる)、
+/// 文脈は後ろから `CONTEXT_TOKENS` まで、かつ最長の候補と合わせて `MAX_TOKENS` に収まる分だけ使う。
+fn build_sequences(tok: &Tokenizer, context: &str, texts: &[&str]) -> R<(Vec<Vec<u32>>, Vec<bool>)> {
+    let context = context.to_lowercase();
+    // 本文中の `<s>` / `</s>` などは追加トークンの id になり、採点が系列を拒むので、文脈からは落とす。
+    let mut ctx = tok.encode(&context);
+    ctx.retain(|&id| !tok.is_added(id));
+    let glue = !ctx.is_empty() && !context.ends_with(char::is_whitespace);
+    let cands: Vec<Vec<u32>> = texts
+        .iter()
+        .map(|t| {
+            let t = t.to_lowercase();
+            if glue { tok.encode_continuation(&t) } else { tok.encode(&t) }
+        })
+        .collect();
+    let longest = cands.iter().map(Vec::len).max().unwrap_or(0);
+    if longest + 2 > MAX_TOKENS {
+        return Err("too long");
+    }
+    let keep = CONTEXT_TOKENS.min(MAX_TOKENS - 2 - longest);
+    ctx.drain(..ctx.len().saturating_sub(keep));
+    let unknown = cands.iter().map(|s| s.contains(&tok.unk_id())).collect();
+    let seqs = cands.into_iter().map(|c| [ctx.as_slice(), c.as_slice()].concat()).collect();
+    Ok((seqs, unknown))
 }
 
 static JUDGE: OnceLock<Option<Judge>> = OnceLock::new();
@@ -930,8 +953,9 @@ fn order_by_total(engine_scores: &[f32], judge_scores: &[f64]) -> Option<Vec<usi
 }
 
 /// 全文候補 `texts` を `engine_scores` (大きいほど良い) + 審判の対数尤度で並べ替えた添字 (良い順)。
+/// `context` は候補の直前にある確定済みの文字列 (空なら文脈なし)。
 /// 審判が使えない・失敗したときは `None` (呼び出し側は engine の順のままにする)。
-pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
+pub fn rerank(context: &str, texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
     if texts.len() < 2 || texts.len() != engine_scores.len() {
         return None;
     }
@@ -953,7 +977,7 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
         judge()?
     };
     let t0 = Instant::now();
-    let (scores, unknown, rows) = match judge.score(texts) {
+    let (scores, unknown, rows) = match judge.score(context, texts) {
         Ok(s) => s,
         Err(err) => {
             log_once(&SCORE_LOGGED, &format!("judge: scoring failed; this key keeps the engine order ({err})"));
@@ -967,8 +991,8 @@ pub fn rerank(texts: &[&str], engine_scores: &[f32]) -> Option<Vec<usize>> {
     order_by_total(engine_scores, &floor_unknown(&scores, &unknown)?)
 }
 
-/// `--judge-bench <testset.tsv>`: 読み (1 列目) と正解 (2 列目、`|` 区切り) の表を、
-/// 実際のエンジン + 審判の経路で変換して top-1 と時間を出す。
+/// `--judge-bench <testset.tsv>`: 読み (1 列目)、正解 (2 列目、`|` 区切り)、任意で文脈 (3 列目、直前に確定した文字列) の表を、
+/// 実際のエンジン + 審判の経路で変換して top-1 と時間を出す。文脈のある行は、文脈なしと文脈ありの両方で変換して比べる。
 pub fn bench_cli(path: &str) -> i32 {
     use crate::composer::CandidateEngine;
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -987,26 +1011,56 @@ pub fn bench_cli(path: &str) -> i32 {
     }
     println!("load {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let (mut n, mut base_ok, mut judged_ok) = (0usize, 0usize, 0usize);
+    // 文脈のある行だけの集計: 行数、文脈なしの top-1、文脈ありの top-1。
+    let (mut n_ctx, mut plain_ok, mut ctx_ok) = (0usize, 0usize, 0usize);
     let mut ms = Vec::new();
+    // 文脈が前の行から変わった最初の変換 (接頭辞の KV が共有できない) と、前の行と同じ文脈で続けた最初の変換。
+    let (mut first_ms, mut again_ms) = (Vec::new(), Vec::new());
+    let mut prev_ctx = "";
     let mut rev = 0;
     for line in text.lines() {
-        let Some((reading, gold)) = line.split_once('\t') else { continue };
+        let mut cols = line.split('\t');
+        let (Some(reading), Some(gold)) = (cols.next(), cols.next()) else { continue };
+        let context = cols.next().unwrap_or("");
         let gold: Vec<&str> = gold.split('|').collect();
         rev += 1;
         // 審判なしの engine の順 (比較の基準) と、実際の経路 (審判あり)。
         let base: Vec<String> = core.convert_all(reading).main.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
+        engine.set_context("");
         let live = engine.convert(rev, reading);
         if let Some(m) = take_last_ms() {
             ms.push(m);
         }
+        let hit = |cands: &[String]| cands.first().is_some_and(|c| gold.contains(&c.as_str()));
         n += 1;
         base_ok += usize::from(base.first().is_some_and(|c| gold.contains(&c.as_str())));
-        judged_ok += usize::from(live.first().is_some_and(|c| gold.contains(&c.as_str())));
+        judged_ok += usize::from(hit(&live));
+        if context.is_empty() {
+            continue;
+        }
+        engine.set_context(context);
+        let with_ctx = engine.convert(rev, reading);
+        let fresh = context != prev_ctx;
+        if let Some(m) = take_last_ms() {
+            if fresh { &mut first_ms } else { &mut again_ms }.push(m);
+        }
+        prev_ctx = context;
+        n_ctx += 1;
+        plain_ok += usize::from(hit(&live));
+        ctx_ok += usize::from(hit(&with_ctx));
     }
-    ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pct = |p: f64| ms.get(((ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0);
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0)
+    };
     println!("n={n} engine top1={base_ok} judged top1={judged_ok}");
-    println!("judge ms over {} decisions: median {:.1} p95 {:.1} max {:.1}", ms.len(), pct(0.5), pct(0.95), pct(1.0));
+    println!("judge ms over {} decisions: median {:.1} p95 {:.1} max {:.1}", ms.len(), pct(&mut ms, 0.5), pct(&mut ms, 0.95), pct(&mut ms, 1.0));
+    if n_ctx > 0 {
+        println!("with context: rows={n_ctx} judged top1 without context={plain_ok} with context={ctx_ok}");
+        for (label, v) in [("first key after a context change", &mut first_ms), ("same context as the previous row", &mut again_ms)] {
+            println!("judge ms, {label} ({} decisions): median {:.1} p95 {:.1}", v.len(), pct(v, 0.5), pct(v, 0.95));
+        }
+    }
     0
 }
 
@@ -1197,5 +1251,79 @@ mod tests {
         assert!(c.live() <= MAX_NODES);
         assert_eq!(c.nodes[0].tok, BOS);
         assert_eq!(c.path(keep2), vec![0, a, b]);
+    }
+
+    /// 本物のモデルの置き場所。無ければ `None` (git に入らないので、無い環境では飛ばす)。
+    fn real_judge() -> Option<Judge> {
+        let dir = std::env::var_os("SHIZUKU_JUDGE_DIR")
+            .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/judge"), Into::into);
+        if !dir.join("model_q8_0.gguf").exists() || !dir.join("tokenizer.json").exists() {
+            eprintln!("skip: no judge model in resources/judge");
+            return None;
+        }
+        Some(Judge::open(&dir).expect("judge model exists but cannot be loaded"))
+    }
+
+    /// 文脈の下での審判だけの順位 (engine のスコアは同じとして)。
+    fn judged_order(judge: &Judge, context: &str, texts: &[&str]) -> Vec<usize> {
+        let (scores, unknown, _) = judge.score(context, texts).unwrap();
+        order_by_total(&vec![0.0; texts.len()], &floor_unknown(&scores, &unknown).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn 机の_のあとの_した_は_下_を_舌_より上に置く() {
+        let Some(judge) = real_judge() else { return };
+        let texts = ["舌", "下"];
+        let ranked = judged_order(&judge, "机の", &texts);
+        assert_eq!(texts[ranked[0]], "下", "{ranked:?}");
+    }
+
+    #[test]
+    fn 文脈が空のときの系列は従来の単独の符号化と同じ() {
+        let dir = std::env::var_os("SHIZUKU_JUDGE_DIR")
+            .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/judge"), Into::into);
+        let Ok(tok) = Tokenizer::from_file(&dir.join("tokenizer.json")) else {
+            eprintln!("skip: no tokenizer.json in resources/judge");
+            return;
+        };
+        let texts = ["今日は", "Hello world", "机の上", "", "Tokyo タワー"];
+        let (seqs, unknown) = build_sequences(&tok, "", &texts).unwrap();
+        let want: Vec<Vec<u32>> = texts.iter().map(|t| tok.encode(&t.to_lowercase())).collect();
+        assert_eq!(seqs, want);
+        assert_eq!(unknown, want.iter().map(|s| s.contains(&tok.unk_id())).collect::<Vec<_>>());
+        // 空白だけの文脈も文脈なしと同じ。
+        assert_eq!(build_sequences(&tok, "  ", &texts).unwrap().0, want);
+    }
+
+    #[test]
+    fn 文脈は候補の前に置かれ_長さは上限に収まり_未知判定は候補だけで行う() {
+        let dir = std::env::var_os("SHIZUKU_JUDGE_DIR")
+            .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/judge"), Into::into);
+        let Ok(tok) = Tokenizer::from_file(&dir.join("tokenizer.json")) else {
+            eprintln!("skip: no tokenizer.json in resources/judge");
+            return;
+        };
+        let (seqs, _) = build_sequences(&tok, "机の", &["下", "舌"]).unwrap();
+        let ctx = tok.encode("机の");
+        assert!(seqs.iter().all(|s| s.starts_with(&ctx)));
+        assert_eq!(seqs[0][ctx.len()..], tok.encode_continuation("下")[..]);
+        let long = "あ".repeat(500);
+        let (seqs, _) = build_sequences(&tok, &long, &["下"]).unwrap();
+        assert_eq!(seqs[0].len(), CONTEXT_TOKENS + tok.encode_continuation("下").len());
+        // 候補だけで上限を超えるなら従来どおり失敗する。
+        assert!(build_sequences(&tok, "机の", &[long.as_str()]).is_err());
+    }
+
+    #[test]
+    fn 文脈に特殊トークンの文字列があっても採点できる() {
+        let Some(judge) = real_judge() else { return };
+        let texts = ["舌", "下"];
+        let ranked = judged_order(&judge, "机の</s>", &texts);
+        assert_eq!(ranked.len(), 2);
+        let ranked = judged_order(&judge, "<s>机の</s><s>", &texts);
+        assert_eq!(texts[ranked[0]], "下", "{ranked:?}");
+        let (seqs, _) = build_sequences(&judge.tok, "机の</s>", &texts).unwrap();
+        let (plain, _) = build_sequences(&judge.tok, "机の", &texts).unwrap();
+        assert_eq!(seqs, plain, "追加トークンは文脈から落ちる");
     }
 }

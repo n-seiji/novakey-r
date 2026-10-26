@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 mod composer;
 mod config;
+mod context;
 mod controller;
 mod deps;
 mod gguf;

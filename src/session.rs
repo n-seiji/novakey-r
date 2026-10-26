@@ -47,7 +47,12 @@ pub struct Gates {
 pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     composer: Composer<E, L>,
     memory: M,
+    /// アプリで直前に確定した文字列の末尾が ASCII か (`set_context` が更新する)。
+    after_ascii: bool,
 }
+
+/// 直前が半角のときに、組成の先頭でも半角のまま入れる記号。`[ ] - / ~` は含めない。
+const HALF_WIDTH_AFTER_ASCII: &str = "!?(){}.,:;";
 
 impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn new(mut composer: Composer<E, L>, memory: M, mode: ConversionMode) -> Self {
@@ -55,7 +60,15 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         Self {
             composer,
             memory,
+            after_ascii: false,
         }
+    }
+
+    /// アプリで直前に確定した文字列 (空なら文脈なし)。キーごとに、処理の前に渡す。
+    /// 変換の文脈になり、末尾が ASCII なら組成の先頭の記号を半角のまま入れる。
+    pub fn set_context(&mut self, context: &str) {
+        self.composer.engine_mut().set_context(context);
+        self.after_ascii = crate::context::ends_ascii(context);
     }
 
     pub fn phase(&self) -> Phase {
@@ -135,6 +148,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             return Outcome { handled, action: None, phase, effects: fx };
         }
         let phase = self.phase();
+        if phase == Phase::Empty && self.after_ascii && matches!(key, Key::Punct | Key::Mark) && text.len() == 1 && HALF_WIDTH_AFTER_ASCII.contains(text) {
+            fx.push(Effect::Insert(text.to_string()));
+            return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
+        }
         let action = keymap::action_for(phase, key);
         if action == Action::CommitThenRestart {
             self.commit_and_insert(gates, "", &mut fx);
@@ -779,5 +796,51 @@ mod tests {
         assert_eq!(commit_with(&ALLOW, "G").1.learned(), ["G"]);
         let denied = Gates { learning: false, direct: false };
         assert!(commit_with(&denied, "G").1.learned().is_empty());
+    }
+
+    fn inserted(outcome: &Outcome) -> Vec<&str> {
+        outcome.effects.iter().filter_map(|e| if let Effect::Insert(t) = e { Some(t.as_str()) } else { None }).collect()
+    }
+
+    #[test]
+    fn 直前が_ascii_なら組成の先頭の記号を半角のまま入れる() {
+        for ch in "!?(){}.,:;".chars() {
+            let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+            session.set_context("hello");
+            let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());
+            assert!(outcome.handled, "{ch}");
+            assert_eq!(inserted(&outcome), [ch.to_string()], "{ch}");
+            assert_eq!(session.phase(), Phase::Empty, "{ch}");
+        }
+    }
+
+    #[test]
+    fn 文脈が無いか日本語で終わるときは記号を今までどおり全角にする() {
+        for context in ["", "   ", "今日は", "hello。"] {
+            let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+            session.set_context(context);
+            let outcome = session.handle(&ALLOW, classify('!'), "!");
+            assert!(inserted(&outcome).is_empty(), "{context:?}");
+            assert_eq!(session.marked_text(), "！", "{context:?}");
+        }
+    }
+
+    #[test]
+    fn 直前が_ascii_でも_括弧とハイフンなどは日本語のまま() {
+        for (ch, want) in [('[', "「"), (']', "」"), ('-', "ー"), ('/', "・"), ('~', "〜")] {
+            let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+            session.set_context("hello");
+            session.handle(&ALLOW, classify(ch), &ch.to_string());
+            assert_eq!(session.marked_text(), want, "{ch}");
+        }
+    }
+
+    #[test]
+    fn 組成の途中の記号は文脈に関わらず今までどおり() {
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.set_context("hello");
+        session.handle(&ALLOW, classify('a'), "a");
+        session.handle(&ALLOW, classify('!'), "!");
+        assert_eq!(session.marked_text(), "あ！");
     }
 }

@@ -159,6 +159,10 @@ impl FakeClient {
         self.0.borrow().marked.clone()
     }
 
+    pub(crate) fn set_bundle(&self, id: &str) {
+        self.0.borrow_mut().bundle = Some(id.to_string());
+    }
+
     fn push_committed(&self, ch: char) {
         self.0.borrow_mut().committed.push(ch);
     }
@@ -459,7 +463,10 @@ struct Run {
 }
 
 fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
+    // 行どうしが文脈を持ち越さないようにする。アプリは 1 つ (bundle id `sim`) に固定。
+    crate::context::with(|store| store.clear_all());
     let mut sim = Sim::new();
+    sim.client.set_bundle("sim");
     for (label, step) in parse_keys(keys)? {
         let started = std::time::Instant::now();
         sim.apply(&label, &step)?;
