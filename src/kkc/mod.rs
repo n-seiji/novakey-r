@@ -14,9 +14,11 @@ pub mod learning;
 pub mod live_backspace;
 pub mod louds;
 pub mod result;
+pub mod variants;
 pub mod wise;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::composer::CandidateEngine;
@@ -76,6 +78,11 @@ impl KkcCore {
                 .dict
                 .prefix_entries(katakana)
                 .is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana && e.word == kanji))
+    }
+
+    /// カタカナの読みがちょうど一致する辞書の見出し (派生候補の連濁の語探し用)。学習・動的な語は見ない。辞書が読めなければ空。
+    fn headwords(&self, katakana: &str) -> Vec<dict::Entry> {
+        self.dict.prefix_entries(katakana).map(|v| v.into_iter().filter(|e| e.ruby == katakana).collect()).unwrap_or_default()
     }
 
     /// 読み全体を変換する。結果の全件 (`mainResults` / `firstClauseResults`)。毎回ラティスを作り直す。
@@ -197,6 +204,27 @@ fn is_permutation(order: &[usize], n: usize) -> bool {
     order.len() == n && order.iter().all(|&k| k < n && !std::mem::replace(&mut seen[k], true))
 }
 
+/// 上位の全文候補から派生候補 (`variants`) を作り、最後の全文候補の直後に全文候補として足す。
+/// 先頭の `top` (打ち切り済み) は動かさない。スコアは元の候補から `PENALTY` 引く。審判がなければ元の全文候補の後ろに並ぶ。
+fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
+    let full: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
+    let Some(&last_full) = full.last() else {
+        return;
+    };
+    let origins: Vec<&[Rc<elem::Elem>]> = full.iter().take(variants::ORIGINS).map(|&i| top[i].data.as_slice()).collect();
+    let exclude: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
+    let made = variants::generate(&origins, &exclude, &|ruby| core.headwords(ruby));
+    let cands: Vec<result::Cand> = made
+        .into_iter()
+        .map(|(k, v)| {
+            let value = top[full[k]].value - variants::PENALTY;
+            let ruby_count = v.data.iter().map(|e| e.ruby_len).sum();
+            result::Cand { text: v.text, value, ruby_count, data: v.data, source: result::Source::Full }
+        })
+        .collect();
+    top.splice(last_full + 1..last_full + 1, cands);
+}
+
 impl Default for RustEngine {
     fn default() -> Self {
         Self::new()
@@ -214,7 +242,8 @@ impl CandidateEngine for RustEngine {
             return Vec::new();
         }
         let converted = core.convert_all(hiragana);
-        let top = &converted.main[..converted.main.len().min(TOP_N)];
+        let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
+        add_variants(core, &mut top);
         let mut order: Vec<usize> = (0..top.len()).collect();
         let slots: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
         let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
@@ -559,5 +588,70 @@ mod tests {
         e.set_context("");
         e.convert(3, "かんじ");
         assert_eq!(SEEN.with(|s| s.borrow().clone()), ["", "机の", ""]);
+    }
+
+    /// 派生候補 (一棟貸し) を後ろに置く審判。`want` を先頭に、残りは元の順。
+    fn prefer_variant_judge(_context: &str, texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        let k = texts.iter().position(|t| *t == "一棟貸し")?;
+        let mut order: Vec<usize> = (0..texts.len()).filter(|&i| i != k).collect();
+        order.insert(0, k);
+        Some(order)
+    }
+
+    #[test]
+    fn 派生候補は全文候補の後ろに足され_審判なしでは元の全文候補が先に並ぶ() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let base = core.convert_all("いっとうがし");
+        let n_full = base.main.iter().take(TOP_N).filter(|c| c.source == result::Source::Full).count();
+        let mut e = RustEngine::with_core(core).with_judge(no_judge);
+        let cands = e.convert(1, "いっとうがし");
+        let shown_base: Vec<String> = base.main.iter().take(TOP_N).map(|c| c.text.replace('\u{1F}', "")).collect();
+        let i = index_of(&cands, "一棟貸し");
+        assert!(i >= n_full, "派生候補は元の全文候補より前に出ない");
+        assert_eq!(cands[..n_full], shown_base[..n_full]);
+        let added = cands.len() - shown_base.len();
+        assert!(added >= 1 && added <= variants::MAX_VARIANTS, "{added}");
+        assert_eq!(cands[n_full + added..], shown_base[n_full..], "全文以外の候補は押し出されない");
+    }
+
+    #[test]
+    fn 派生候補の語列は表記も読みも表示と読みに一致する() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_judge(no_judge);
+        let cands = e.convert(1, "べっそうのいっとうがし");
+        let i = index_of(&cands, "別荘の一棟貸し");
+        let words = e.words(1, i).unwrap();
+        assert_eq!(words.iter().map(|(w, _)| w.as_str()).collect::<String>(), cands[i]);
+        assert_eq!(words.iter().map(|(_, r)| r.as_str()).collect::<String>(), "ベッソウノイットウガシ");
+        assert!(words.contains(&("一棟".to_string(), "イットウ".to_string())));
+        assert!(words.contains(&("貸し".to_string(), "ガシ".to_string())));
+        assert_eq!(e.words(2, i), None, "古い revision は None");
+    }
+
+    #[test]
+    fn 数詞と助数詞の派生はライブのbackspaceで末尾の字の読みだけを落とす() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let cases = [("いっとうがし", "一棟貸し", 1), ("いっとう", "一棟", 2)];
+        for (reading, word, want) in cases {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+            let cands = e.convert(1, reading);
+            let words = e.words(1, index_of(&cands, word)).unwrap();
+            let words: Vec<(&str, &str)> = words.iter().map(|(w, r)| (w.as_str(), r.as_str())).collect();
+            let dropped = live_backspace::drop_len(&words, reading, word, |s, k| e.has_kanji_reading(s, k));
+            assert_eq!(dropped.map(|d| d.len), Some(want), "{word}");
+        }
+    }
+
+    #[test]
+    fn 審判が選んだ派生候補を確定すると学習され_審判なしでも次は先頭に出る() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core.clone()).with_judge(prefer_variant_judge);
+        let shown = e.convert(1, "いっとうがし");
+        assert_eq!(shown[0], "一棟貸し");
+        let before = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(5, "いっとうがし");
+        assert_ne!(before[0], "一棟貸し");
+        assert!(e.select(1, 0));
+        let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "いっとうがし");
+        assert_eq!(after[0], "一棟貸し", "{after:?}");
     }
 }
