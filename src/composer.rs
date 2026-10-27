@@ -627,6 +627,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             finished,
             |w| self.lexicon.knows_english(w),
             |w| self.lexicon.is_english_word(w),
+            |w| self.lexicon.is_english_prefix(w),
             |kana| self.engine.has_reading(kana),
         )
     }

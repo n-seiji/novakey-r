@@ -488,3 +488,13 @@ sonokenn<bs><enter>	そのけ
 <live>sensei<bs>kou<enter>	先項
 <live>sensei<bs><space><enter>	戦
 <live>sensei<bs>Apple<enter>	せんApple
+# 英単語のあとに助詞で始まらないかなが続いても、頭に l q v x を含む語なら英単語とかなに分ける。語が打ちかけの間 (informa) や日本語として自然でない続きは分けない。
+# 漢字はエンジン順 (judge なし) のもの。
+<live>loginjinihiraku<enter>	login耳に開く
+loginjinihiraku<space><enter>	login耳に開く
+<live>lineni<enter>	lineに
+<live>linksite<enter>	linkして
+<live>playtime<enter>	playtime
+<live>lockfile<enter>	lockfile
+<live>filetype<enter>	filetype
+<live>timei<enter>	地名
