@@ -498,3 +498,5 @@ loginjinihiraku<space><enter>	login耳に開く
 <live>lockfile<enter>	lockfile
 <live>filetype<enter>	filetype
 <live>timei<enter>	地名
+leann<enter>	ぇあん
+evenness<enter>	evenness

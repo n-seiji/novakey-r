@@ -106,6 +106,7 @@ fn natural_kana(tail: &[(String, String)]) -> bool {
 /// ただし辞書の英単語は、そのかな読みが日本語の語なら見なさない (made → まで)。確定済みの語 (knows) にこの除外は掛けない。
 /// 上の分け方で見つからず、全体がかなにしきれて、頭に l q v x を含む語 (login) のときに限り、助詞で始まらない続きでも分ける (loginjinihiraku → login + じに…)。
 /// 全体がまだ英単語の途中 (informa) なら分けない。
+/// 「全体がかなにしきれる」は、打ちかけ (finished でない) なら末尾の未確定ローマ字 (loginj の j) を含んでよい。
 /// finished は Enter などで打ち終えたとき。途中なら末尾の未確定ローマ字を許す。
 pub fn split(
     raw: &str,
@@ -136,12 +137,15 @@ pub fn split(
     let is_word = |head: &str| knows(head) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
     // 助詞で始まらない続きを許す分け方。外来語の綴りらしい頭と、日本語として自然な続きだけに絞る。
     // 打ちかけの未確定ローマ字 (loginj の j) は、かなにしきれない印にしない。
-    let kana_only = !has_ascii(&convert(raw, finished).0);
-    let relaxed_at = |i: usize| {
+    // 全体の変換で かな 1 つ分の途中 (leann の lean|n は ん=nn の内側) になる位置では切らない。
+    let relaxed_at = |boundaries: &[usize], i: usize| {
         let (head, rest) = raw.split_at(i);
+        if !boundaries.contains(&i) || !head.contains(FOREIGN_LETTERS) || rest.contains(FOREIGN_TAIL_LETTERS) {
+            return None;
+        }
         let word = (knows(head) && head.len() >= DICTIONARY_MIN_LEN)
             || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
-        if !kana_only || !word || !head.contains(FOREIGN_LETTERS) || rest.contains(FOREIGN_TAIL_LETTERS) || is_word_prefix(raw) {
+        if !word {
             return None;
         }
         let (tail, pending) = convert(rest, finished);
@@ -150,6 +154,23 @@ pub fn split(
             return None;
         }
         Some(Split { head: head.to_string(), tail, pending })
+    };
+    let relaxed = || {
+        if !raw.contains(FOREIGN_LETTERS) || is_word_prefix(raw) || knows(raw) {
+            return None;
+        }
+        let (units, _) = convert(raw, finished);
+        if has_ascii(&units) {
+            return None;
+        }
+        let boundaries: Vec<usize> = units
+            .iter()
+            .scan(0, |end, (typed, _)| {
+                *end += typed.len();
+                Some(*end)
+            })
+            .collect();
+        (2..raw.len()).rev().find_map(|i| relaxed_at(&boundaries, i))
     };
     // 語と分かる頭を先に、長い順で試す。語でない頭 (子音で終わる外来の綴り) は短い順で試す。長い順だと
     // artifactwokousinnsite を artifactwokousinn + して と切ってしまうため。
@@ -162,7 +183,7 @@ pub fn split(
                 (consonant_end && foreign).then(|| split_at(i)).flatten()
             })
         })
-        .or_else(|| (2..raw.len()).rev().find_map(relaxed_at))
+        .or_else(relaxed)
 }
 
 #[cfg(test)]
@@ -284,6 +305,18 @@ mod tests {
     fn 頭に続く打ちかけのローマ字は残して表示する() {
         assert_eq!(relaxed("loginj", false, &["login"], &["login"]).as_deref(), Some("loginj"));
         assert_eq!(relaxed("loginj", true, &["login"], &["login"]), None);
+    }
+
+    #[test]
+    fn かな1つ分の途中では切らない() {
+        // lean|n は ん (nn) の内側。プリエディットと確定結果がずれる。
+        assert_eq!(relaxed("leann", false, &["lean"], &["lean"]), None);
+    }
+
+    #[test]
+    fn 確定したことのある語全体は分けない() {
+        let s = split("loginji", false, |w| w == "loginji", |w| w == "login", |_| false, |_| false);
+        assert_eq!(s, None);
     }
 
     #[test]
