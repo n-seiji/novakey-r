@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::dict::Entry;
-use super::elem::Elem;
+use super::elem::{Elem, CID_NUMBER, CID_PROPER_NOUN};
 
 /// 派生候補の元にする全文候補の数 (engine の順)
 pub const ORIGINS: usize = 2;
@@ -17,8 +17,13 @@ pub const MAX_VARIANTS: usize = 3;
 pub const PENALTY: f32 = 6.0;
 /// 連濁の語として 1 つの要素から作る数 (最良のスコアから)。最良が既に候補にあるときの次点のため。
 const RENDAKU_PER_ELEM: usize = 2;
-/// 連濁の語として探す名詞の品詞 ID (辞書の `lcid`)。内容語の名詞 1283..1297 のうち、固有名詞と数詞を除く。
+/// 連濁の語として探す名詞の品詞 ID (辞書の `lcid`)。内容語の名詞 1283..1297 のうち、固有名詞 (`CID_PROPER_NOUN` 1288 から
+/// 地名・人名などの 1294 まで) と数詞 (`CID_NUMBER` 1295) を除く。
 const NOUN_LCIDS: std::ops::Range<usize> = 1283..1297;
+/// `NOUN_LCIDS` の中の、固有名詞と数詞の ID (1288..=1295)。連濁の語には使わない。
+const EXCLUDED_LCIDS: std::ops::RangeInclusive<usize> = CID_PROPER_NOUN..=CID_NUMBER;
+/// 一般名詞の品詞 ID。連濁の語はこれを先に並べる (餓死より貸し)。
+const LCID_GENERAL_NOUN: usize = 1285;
 
 /// 数詞: (漢数字, 算用数字, 読み)。読みは促音化したものも並べる。
 const NUMERALS: &[(&str, &str, &[&str])] = &[
@@ -82,15 +87,20 @@ fn is_kanji(c: char) -> bool {
     matches!(c as u32, 0x4E00..=0x9FFF | 0x3005)
 }
 
-/// 数詞として読み替えてよい表記か。数字・漢数字・何で始まるか、全部かなのときだけ (発見 → 八件 を防ぐ)。
-fn digit_style(surface: &str) -> Option<DigitStyle> {
-    let first = surface.chars().next()?;
+/// 数詞として読み替えてよい表記なら、作る数字の字種 (先頭が同じ字種、次が別の字種)。数字・漢数字・何で始まるか、
+/// 全部かなのときだけ (発見 → 八件 を防ぐ)。算用数字 ↔ 漢数字は両方作る (全角は算用数字も)。
+/// 審判が選んだ別の字種の候補 (車を3代 → 車を3台) の元が、漢数字の候補しかなくても出るように。
+fn digit_styles(surface: &str) -> Vec<DigitStyle> {
+    let Some(first) = surface.chars().next() else {
+        return Vec::new();
+    };
     match first {
-        '0'..='9' => Some(DigitStyle::Ascii),
-        '０'..='９' => Some(DigitStyle::Wide),
-        '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千' | '何' => Some(DigitStyle::Kanji),
-        _ if surface.chars().all(is_kana) => Some(DigitStyle::Kanji),
-        _ => None,
+        '0'..='9' => vec![DigitStyle::Ascii, DigitStyle::Kanji],
+        '０'..='９' => vec![DigitStyle::Wide, DigitStyle::Ascii],
+        '何' => vec![DigitStyle::Kanji],
+        '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千' => vec![DigitStyle::Kanji, DigitStyle::Ascii],
+        _ if surface.chars().all(is_kana) => vec![DigitStyle::Kanji],
+        _ => Vec::new(),
     }
 }
 
@@ -104,12 +114,9 @@ fn numeral_text(kanji: &str, digits: &str, style: DigitStyle) -> String {
 
 /// 数詞+助数詞に読み替えた要素 (B)。読みの切り方ごとに 1 つ。表記が元と同じものは除く。
 fn counter_variants(e: &Elem) -> Vec<Elem> {
-    let Some(style) = digit_style(&e.word) else {
-        return Vec::new();
-    };
+    let styles = digit_styles(&e.word);
     let mut out: Vec<Elem> = Vec::new();
     for &(kanji, digits, readings) in NUMERALS {
-        let numeral = numeral_text(kanji, digits, if kanji == "何" { DigitStyle::Kanji } else { style });
         for reading in readings {
             let Some(rest) = e.ruby.strip_prefix(reading).filter(|r| !r.is_empty()) else {
                 continue;
@@ -117,9 +124,12 @@ fn counter_variants(e: &Elem) -> Vec<Elem> {
             let Some(&(counter, _)) = COUNTERS.iter().find(|(_, rs)| rs.contains(&rest)) else {
                 continue;
             };
-            let word = format!("{numeral}{counter}");
-            if word != e.word && !out.iter().any(|v| v.word == word) {
-                out.push(Elem::new(word, e.ruby.clone(), e.lcid, e.rcid, e.mid, e.value()));
+            for &style in &styles {
+                let numeral = numeral_text(kanji, digits, if kanji == "何" { DigitStyle::Kanji } else { style });
+                let word = format!("{numeral}{counter}");
+                if word != e.word && !out.iter().any(|v| v.word == word) {
+                    out.push(Elem::new(word, e.ruby.clone(), e.lcid, e.rcid, e.mid, e.value()));
+                }
             }
         }
     }
@@ -131,7 +141,7 @@ fn is_voiced(c: char) -> bool {
 }
 
 /// 連濁した語に読み替えた要素 (F)。前の語が漢字を含み、`e` が濁音始まりのひらがな 2 字以上のとき、
-/// 同じ読みの名詞 (表記に漢字を含む) のうち辞書のスコアが良い順に `RENDAKU_PER_ELEM` 個 (貸し/ガシ)。
+/// 同じ読みの名詞 (表記に漢字を含む) のうち、一般名詞、辞書のスコアの順に `RENDAKU_PER_ELEM` 個 (貸し/ガシ)。
 fn rendaku_variants(prev: &Elem, e: &Elem, lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<Elem> {
     if e.ruby.chars().count() < 2 || !e.ruby.chars().next().is_some_and(is_voiced) {
         return Vec::new();
@@ -141,9 +151,13 @@ fn rendaku_variants(prev: &Elem, e: &Elem, lookup: &dyn Fn(&str) -> Vec<Entry>) 
     }
     let mut found: Vec<Entry> = lookup(&e.ruby)
         .into_iter()
-        .filter(|h| h.ruby == e.ruby && NOUN_LCIDS.contains(&(h.lcid as usize)) && h.word.chars().any(is_kanji))
+        .filter(|h| h.ruby == e.ruby && NOUN_LCIDS.contains(&(h.lcid as usize)) && !EXCLUDED_LCIDS.contains(&(h.lcid as usize)) && h.word.chars().any(is_kanji))
         .collect();
-    found.sort_by(|a, b| b.value.total_cmp(&a.value));
+    // 一般名詞 (1285) を先に、同じなら辞書のスコアが良い順
+    found.sort_by(|a, b| {
+        let general = |h: &Entry| h.lcid as usize == LCID_GENERAL_NOUN;
+        general(b).cmp(&general(a)).then(b.value.total_cmp(&a.value))
+    });
     let mut out: Vec<Elem> = Vec::new();
     for h in found {
         if out.len() < RENDAKU_PER_ELEM && !out.iter().any(|o| o.word == h.word) {
@@ -221,17 +235,25 @@ mod tests {
     fn 一等の読みから一棟ができる() {
         let data = [elem("一等", "イットウ", 1285)];
         let v = generate(&[&data], &HashSet::new(), &no_dict);
-        assert_eq!(texts(&v), ["一棟"]);
+        assert_eq!(texts(&v), ["一棟", "1棟"]);
         assert_eq!(v[0].1.data[0].ruby, "イットウ");
         assert_eq!(v[0].1.data[0].lcid, 1285);
     }
 
     #[test]
     fn 数字で始まる表記は同じ字種の数字で返す() {
-        assert_eq!(texts(&generate(&[&[elem("三代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["三台"]);
-        assert_eq!(texts(&generate(&[&[elem("3代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["3台"]);
-        assert_eq!(texts(&generate(&[&[elem("３代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["３台"]);
-        assert_eq!(texts(&generate(&[&[elem("10代", "ジュウダイ", 1285)]], &HashSet::new(), &no_dict)), ["10台"]);
+        assert_eq!(texts(&generate(&[&[elem("三代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["三台", "3台"]);
+        assert_eq!(texts(&generate(&[&[elem("3代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["3台", "三台"]);
+        assert_eq!(texts(&generate(&[&[elem("３代", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["３台", "3台"]);
+        assert_eq!(texts(&generate(&[&[elem("10代", "ジュウダイ", 1285)]], &HashSet::new(), &no_dict)), ["10台", "十台"]);
+    }
+
+    #[test]
+    fn 漢数字の元からも算用数字の助数詞ができる_何とかなは字種を替えない() {
+        let v = generate(&[&[elem("車", "クルマ", 1285), elem("三代", "サンダイ", 1285)]], &HashSet::new(), &no_dict);
+        assert_eq!(texts(&v), ["車三台", "車3台"]);
+        assert_eq!(texts(&generate(&[&[elem("何代", "ナンダイ", 1285)]], &HashSet::new(), &no_dict)), ["何台"]);
+        assert_eq!(texts(&generate(&[&[elem("いちまい", "イチマイ", 1285)]], &HashSet::new(), &no_dict)), ["一枚"]);
     }
 
     #[test]
@@ -251,37 +273,51 @@ mod tests {
 
     #[test]
     fn 表記が変わらない読み替えは作らない() {
-        assert!(generate(&[&[elem("三台", "サンダイ", 1285)]], &HashSet::new(), &no_dict).is_empty());
+        assert_eq!(texts(&generate(&[&[elem("三台", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["3台"]);
+        assert_eq!(texts(&generate(&[&[elem("3台", "サンダイ", 1285)]], &HashSet::new(), &no_dict)), ["三台"]);
     }
 
     #[test]
     fn 同じ読みの助数詞は表の先頭だけを使う() {
         let v = generate(&[&[elem("一頭", "イットウ", 1285)]], &HashSet::new(), &no_dict);
-        assert_eq!(texts(&v), ["一棟"]);
+        assert_eq!(texts(&v), ["一棟", "1棟"]);
         let v = generate(&[&[elem("一戸", "イッコ", 1285)]], &HashSet::new(), &no_dict);
-        assert_eq!(texts(&v), ["一個"]);
+        assert_eq!(texts(&v), ["一個", "1個"]);
     }
 
     #[test]
     fn 漢字の語に続く濁音のひらがなは同じ読みの名詞に直す() {
-        let data = [elem("一棟", "イットウ", 1285), elem("がし", "ガシ", 1285)];
+        let data = [elem("一等", "イットウ", 1285), elem("がし", "ガシ", 1285)];
         let v = generate(&[&data], &HashSet::new(), &gashi);
-        assert_eq!(texts(&v), ["一棟餓死", "一棟貸し"]);
-        assert_eq!(v[1].1.data[1].ruby, "ガシ");
-        assert_eq!(v[1].1.data[1].lcid, 1285);
+        assert_eq!(texts(&v), ["一棟貸し", "一棟賀詞", "1棟貸し"]);
+        assert_eq!(v[0].1.data[1].ruby, "ガシ");
+        assert_eq!(v[0].1.data[1].lcid, 1285);
     }
 
     #[test]
     fn 連濁は名詞の中からスコアの良い順に2つまで漢字を含む語を選ぶ() {
         let data = [elem("車", "クルマ", 1285), elem("がし", "ガシ", 1285)];
-        assert_eq!(texts(&generate(&[&data], &HashSet::new(), &gashi)), ["車餓死", "車貸し"]);
+        assert_eq!(texts(&generate(&[&data], &HashSet::new(), &gashi)), ["車貸し", "車賀詞"]);
+    }
+
+    #[test]
+    fn 連濁は一般名詞を先に_固有名詞と数詞は使わない() {
+        let entries = |ruby: &str| -> Vec<Entry> {
+            if ruby != "ガシ" {
+                return Vec::new();
+            }
+            let e = |word: &str, lcid, value| Entry { ruby: "ガシ".into(), word: word.into(), lcid, rcid: lcid, mid: 1, value };
+            vec![e("餓死", 1283, -11.6), e("賀志", 1288, -9.0), e("画紙", 1295, -9.5), e("貸し", 1285, -14.2), e("賀詞", 1285, -15.8)]
+        };
+        let data = [elem("車", "クルマ", 1285), elem("がし", "ガシ", 1285)];
+        assert_eq!(texts(&generate(&[&data], &HashSet::new(), &entries)), ["車貸し", "車賀詞"]);
     }
 
     #[test]
     fn 最良の語が既に候補にあれば次点の貸しが残る() {
-        let data = [elem("一棟", "イットウ", 1285), elem("がし", "ガシ", 1285)];
-        let exclude: HashSet<String> = ["一棟餓死".to_string()].into();
-        assert_eq!(texts(&generate(&[&data], &exclude, &gashi)), ["一棟貸し"]);
+        let data = [elem("一等", "イットウ", 1285), elem("がし", "ガシ", 1285)];
+        let exclude: HashSet<String> = ["一棟貸し".to_string()].into();
+        assert_eq!(texts(&generate(&[&data], &exclude, &gashi)), ["一棟賀詞", "1棟貸し", "1棟賀詞"]);
     }
 
     #[test]
@@ -295,9 +331,9 @@ mod tests {
     #[test]
     fn 重複と既存の候補は除く() {
         let data = [elem("一等", "イットウ", 1285)];
-        let exclude: HashSet<String> = ["一棟".to_string()].into();
+        let exclude: HashSet<String> = ["一棟".to_string(), "1棟".to_string()].into();
         assert!(generate(&[&data, &data], &exclude, &no_dict).is_empty());
-        assert_eq!(generate(&[&data, &data], &HashSet::new(), &no_dict).len(), 1);
+        assert_eq!(generate(&[&data, &data], &HashSet::new(), &no_dict).len(), 2);
     }
 
     #[test]
@@ -316,7 +352,7 @@ mod tests {
         let a = [elem("一等", "イットウ", 1285)];
         let b = [elem("三代", "サンダイ", 1285)];
         let v = generate(&[&a, &b], &HashSet::new(), &no_dict);
-        assert_eq!(texts(&v), ["一棟", "三台"]);
-        assert_eq!(v.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(texts(&v), ["一棟", "1棟", "三台"]);
+        assert_eq!(v.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [0, 0, 1]);
     }
 }
