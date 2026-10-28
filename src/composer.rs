@@ -68,6 +68,18 @@ pub trait CandidateEngine {
     fn has_reading(&self, _hiragana: &str) -> bool {
         false
     }
+    /// `text` の方が `over` より、いまの文脈で文として自然か。審判の差が余裕を超えたときだけ true。審判が使えない engine は false。
+    fn prefers_text(&mut self, _text: &str, _over: &str) -> bool {
+        false
+    }
+    /// 英字 `raw` より読み `reading` (engine の第 1 候補) の方が、はっきり文として自然か。審判が使えない engine は false。
+    fn rejects_english(&mut self, _raw: &str, _reading: &str) -> bool {
+        false
+    }
+    /// 辞書を開けているか。開けていない間は見出しの判定ができないので、英単語の自動判定をしない。
+    fn has_dictionary(&self) -> bool {
+        true
+    }
     /// 直近の `convert` の候補 `index` の語列 ((表記, カタカナの読み))。読むだけで、学習用の状態は取り出さない。
     /// 語の情報を持たない engine や、世代の合わない呼び出しは None。
     fn words(&self, _revision: u64, _index: usize) -> Option<Vec<(String, String)>> {
@@ -116,6 +128,17 @@ enum Settle {
     Mixed(english_split::Split),
     Dangling,
     Unchanged,
+}
+
+/// 組成全体が英単語のときの判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// 読みを使う。
+    Kana,
+    /// かなの読みが辞書の見出しでない語。審判が読みを選ばない限り英語。
+    Word,
+    /// かなの読みが辞書の見出しでもある語を、審判が英語と決めた。学習しない (見出しの除外を `knows_english` が素通りさせるため)。
+    Judged,
 }
 
 /// 読みが変わらない間 (= 同じ generation の間) 生き続ける、飾りなしの候補列。
@@ -226,6 +249,8 @@ pub struct Composer<E: CandidateEngine, L: Lexicon> {
     live: bool,
     /// 固定中の先頭部分。あるあいだ `reading` の候補は残りの読み (固定した分のあと) の変換結果。
     pin: Option<Pin>,
+    /// 組成全体 (raw) が英単語のときの判定。raw が違えば読まない。
+    word_verdict: Option<(String, Verdict)>,
     lexicon: L,
 }
 
@@ -244,6 +269,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             stage: Stage::Editing,
             live: false,
             pin: None,
+            word_verdict: None,
             lexicon,
         }
     }
@@ -404,11 +430,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         }
         self.typing = Typing::Kana;
+        self.word_verdict = None;
         if self.is_typing_english() {
-            self.pin = None;
-            self.typing = Typing::English;
-            self.english_shown = true;
-            self.sync_live_split();
+            self.enter_english();
             return;
         }
         if let Some(forms) = self.symbol_variants() {
@@ -428,7 +452,25 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.sync_live_split();
         if self.live_split.is_empty() {
             self.reading.list = self.convert_reading();
+            self.enter_english_if_word();
         }
+    }
+
+    /// 組成全体が英単語なら判定し、英語になったら英語を打っている局面に入る (読みの候補は捨てる)。
+    fn enter_english_if_word(&mut self) {
+        self.judge_word();
+        if self.is_typing_english() {
+            self.reset_candidates();
+            self.enter_english();
+        }
+    }
+
+    /// 英語を打っている局面に入る。読みの候補は呼び出し側で捨て済み。
+    fn enter_english(&mut self) {
+        self.pin = None;
+        self.typing = Typing::English;
+        self.english_shown = true;
+        self.sync_live_split();
     }
 
     /// 固定した先頭部分が、いまの読みの先頭と合っているか。固定が無ければ true。
@@ -454,6 +496,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reset_candidates();
         if matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana {
             self.reading.list = self.convert_reading();
+            self.enter_english_if_word();
         }
     }
 
@@ -529,6 +572,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if !self.is_kana_editing() {
             return;
         }
+        let raw = self.raw();
+        if raw.bytes().all(|b| b.is_ascii_lowercase()) && self.is_whole_word(&raw) {
+            // 打鍵を消して全体が英単語になった (mades → made)。変換と判定は refresh が 1 度で行う。
+            self.refresh();
+            return;
+        }
+        self.word_verdict = None;
         match (self.is_typing_english(), self.typing == Typing::English) {
             (true, false) => {
                 self.pin = None;
@@ -660,7 +710,51 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let word = || !self.romaji.buffer().is_empty() && self.is_english_word_raw(&raw);
         self.is_kana_editing()
             && raw.bytes().all(|b| b.is_ascii_lowercase())
-            && (self.has_ascii_kana() || word())
+            && (self.has_ascii_kana() || word() || self.is_verdict(&raw, Verdict::Word) || self.is_verdict(&raw, Verdict::Judged))
+    }
+
+    /// 打鍵列全体が、未確定のローマ字もかなにしきれない文字も残らない英単語か。
+    fn is_whole_word(&self, raw: &str) -> bool {
+        self.romaji.buffer().is_empty() && !self.has_ascii_kana() && self.is_english_word_raw(raw)
+    }
+
+    /// 組成全体が英単語なら、英語として打つかを判定して持つ。そうでなければ持たない。
+    /// かなの読みが辞書の見出しでない語 (issue → いっすえ) は、審判が読みの方をはっきり選ばない限り英語 (審判がなくても英語)。
+    /// 見出しでもある語 (made, home) は、審判が英語を選んだときだけ英語。比べる相手は engine の第 1 候補。
+    /// 固定中は表示と比べ、英語になるときだけ固定が外れる (`enter_english`)。raw が変わりうる所 (refresh / track_english / unpin) で呼ぶ。
+    fn judge_word(&mut self) {
+        let raw = self.raw();
+        let eligible = self.is_kana_editing()
+            && raw.bytes().all(|b| b.is_ascii_lowercase())
+            && self.is_whole_word(&raw)
+            && self.engine.has_dictionary();
+        if !eligible {
+            self.word_verdict = None;
+            return;
+        }
+        // 比べる相手は見えている表示。固定中は固定した分 + 残りの変換 (読みに戻すと見えている表示が変わる)。
+        let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some()).map(|c| c.text.clone());
+        let first = match &self.pin {
+            Some(pin) => Some(pin.surface() + converted.as_deref().unwrap_or_else(|| self.rest())),
+            None => converted,
+        };
+        let verdict = if self.engine.has_reading(&self.hiragana) {
+            match first {
+                Some(over) if self.engine.prefers_text(&raw, &over) => Verdict::Judged,
+                _ => Verdict::Kana,
+            }
+        } else {
+            match first {
+                Some(reading) if self.engine.rejects_english(&raw, &reading) => Verdict::Kana,
+                _ => Verdict::Word,
+            }
+        };
+        self.word_verdict = Some((raw, verdict));
+    }
+
+    /// 組成全体 (raw) の判定が `verdict` か。
+    fn is_verdict(&self, raw: &str, verdict: Verdict) -> bool {
+        matches!(&self.word_verdict, Some((r, v)) if r == raw && *v == verdict)
     }
 
     /// 打鍵列全体が英語として確定したことのある語か 4 文字以上の英単語か。
@@ -984,6 +1078,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reset_candidates();
         self.stage = Stage::Editing;
         self.typing = Typing::Empty;
+        self.word_verdict = None;
     }
 
     pub fn revert(&mut self) {
@@ -1016,7 +1111,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let phase = self.phase();
         let text = self.commit_preview();
         let mut english = Vec::new();
-        if phase == Phase::Dangling {
+        // 審判が英語と決めた分は学習しない (読みが見出しの語を、間違いごと固定しないため)。
+        if phase == Phase::Dangling && !self.is_verdict(&self.raw(), Verdict::Judged) {
             english.push(text.clone());
         }
         english.extend(self.segments.iter().filter(|s| s.is_literal()).map(|s| s.keys().to_string()));
@@ -1035,6 +1131,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reset_candidates();
         self.stage = Stage::Editing;
         self.typing = Typing::Empty;
+        self.word_verdict = None;
         Committed { text, engine, english }
     }
 
@@ -1143,6 +1240,16 @@ mod tests {
         converts: Rc<RefCell<Vec<(u64, String)>>>,
         selects: Rc<RefCell<Vec<(u64, usize)>>>,
         cancels: Rc<RefCell<usize>>,
+        /// 表の読みのほかに、辞書の見出しとして答える読み。
+        headwords: Rc<RefCell<Vec<String>>>,
+        /// `prefers_text` の答え。
+        prefers: Rc<RefCell<bool>>,
+        /// `rejects_english` の答え。
+        rejects: Rc<RefCell<bool>>,
+        /// true なら辞書を開けていない engine として答える。
+        no_dictionary: Rc<RefCell<bool>>,
+        /// `prefers_text` に渡された (text, over)。
+        asked: Rc<RefCell<Vec<(String, String)>>>,
     }
 
     struct MockEngine {
@@ -1169,6 +1276,20 @@ mod tests {
         }
         fn cancel(&mut self) {
             *self.log.cancels.borrow_mut() += 1;
+        }
+        /// 表にある読みと `Log::headwords` の読みが辞書の見出し。
+        fn has_reading(&self, hiragana: &str) -> bool {
+            self.table.iter().any(|(k, _)| k == hiragana) || self.log.headwords.borrow().iter().any(|h| h == hiragana)
+        }
+        fn rejects_english(&mut self, _raw: &str, _reading: &str) -> bool {
+            *self.log.rejects.borrow()
+        }
+        fn has_dictionary(&self) -> bool {
+            !*self.log.no_dictionary.borrow()
+        }
+        fn prefers_text(&mut self, text: &str, over: &str) -> bool {
+            self.log.asked.borrow_mut().push((text.to_string(), over.to_string()));
+            *self.log.prefers.borrow()
         }
     }
 
@@ -2653,5 +2774,147 @@ mod tests {
             let preview = c.commit_preview();
             assert_eq!(c.commit().text, preview, "{keys}");
         }
+    }
+
+    /// 英単語 issue / made を辞書の英単語とし、`headwords` を辞書の見出し、`prefers` を審判の答えにしたもの。
+    fn word_composer(headwords: &[&str], prefers: bool) -> (Composer<MockEngine, FakeLexicon>, Log) {
+        let log = Log::default();
+        *log.headwords.borrow_mut() = headwords.iter().map(ToString::to_string).collect();
+        *log.prefers.borrow_mut() = prefers;
+        let engine = MockEngine { log: log.clone(), table: vec![] };
+        let lexicon = FakeLexicon::default().with_english_word(|w| matches!(w, "issue" | "made"));
+        (Composer::new(engine, lexicon), log)
+    }
+
+    #[test]
+    fn かなの読みが見出しでない英単語は審判なしで英語として打つ() {
+        let (mut c, log) = word_composer(&[], false);
+        type_keys(&mut c, "issue");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(c.preedit(), "issue");
+        assert_eq!(c.commit_preview(), "issue");
+        assert!(log.asked.borrow().is_empty());
+        let committed = c.commit();
+        assert_eq!(committed.text, "issue");
+        assert_eq!(committed.english, vec!["issue".to_string()]);
+    }
+
+    #[test]
+    fn かなの読みが見出しでない英単語はliveでも英字のまま() {
+        let (mut c, _) = word_composer(&[], false);
+        c.set_live(true);
+        type_keys(&mut c, "issue");
+        assert_eq!(c.preedit(), "issue");
+        assert_eq!(c.commit().text, "issue");
+    }
+
+    #[test]
+    fn 見出しでない英単語は候補を求めてもrawが先頭になる() {
+        let (mut c, _) = word_composer(&[], false);
+        type_keys(&mut c, "issue");
+        assert!(c.begin_conversion());
+        assert_eq!(c.display(), "issue");
+    }
+
+    #[test]
+    fn かなの読みが見出しの英単語は審判が英語を選べば英語になる() {
+        let (mut c, log) = word_composer(&["まで"], true);
+        type_keys(&mut c, "made");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(c.preedit(), "made");
+        assert_eq!(c.commit_preview(), "made");
+        assert_eq!(*log.asked.borrow(), vec![("made".to_string(), "までK1".to_string())]);
+    }
+
+    #[test]
+    fn 審判が英語を選ばなければかなのまま() {
+        let (mut c, log) = word_composer(&["まで"], false);
+        c.set_live(true);
+        type_keys(&mut c, "made");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.preedit(), "までK1");
+        assert_eq!(log.asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn 審判が決めた英語の確定は学習しない() {
+        let (mut c, _) = word_composer(&["まで"], true);
+        type_keys(&mut c, "made");
+        let committed = c.commit();
+        assert_eq!(committed.text, "made");
+        assert!(committed.english.is_empty());
+    }
+
+    #[test]
+    fn 見出しでない英単語に審判は使わない() {
+        let (mut c, log) = word_composer(&["まで"], true);
+        type_keys(&mut c, "issue");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert!(log.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn 英単語のあとに打鍵が続いて語でなくなればかなに戻る() {
+        for (headwords, prefers) in [(&[][..], false), (&["いっすえ"][..], true)] {
+            let (mut c, _) = word_composer(headwords, prefers);
+            type_keys(&mut c, "issue");
+            assert_eq!(c.phase(), Phase::Dangling);
+            c.type_romaji("n");
+            assert_eq!(c.phase(), Phase::Composing);
+            assert_eq!(c.preedit(), "いっすえn");
+            c.backspace_romaji();
+            assert_eq!(c.phase(), Phase::Dangling, "{headwords:?}");
+            assert_eq!(c.preedit(), "issue");
+        }
+    }
+
+    #[test]
+    fn 英語のまま読みを1文字消すと同じ打鍵を直接打ったときと同じ表示になる() {
+        for (headwords, prefers, live) in [(&[][..], false, false), (&["いっすえ"][..], true, false), (&[][..], false, true)] {
+            let (mut c, _) = word_composer(headwords, prefers);
+            c.set_live(live);
+            type_keys(&mut c, "issue");
+            assert_eq!(c.phase(), Phase::Dangling);
+            c.backspace();
+            let (mut direct, _) = word_composer(headwords, prefers);
+            direct.set_live(live);
+            type_keys(&mut direct, "issu");
+            assert_eq!(c.raw(), "issu");
+            assert_eq!(c.phase(), direct.phase(), "{headwords:?} {live}");
+            assert_eq!(c.preedit(), direct.preedit(), "{headwords:?} {live}");
+            assert_eq!(c.commit_preview(), direct.commit_preview(), "{headwords:?} {live}");
+        }
+    }
+
+    #[test]
+    fn 審判が読みをはっきり選べば見出しでない英単語もかなのまま() {
+        let (mut c, log) = word_composer(&[], false);
+        *log.rejects.borrow_mut() = true;
+        type_keys(&mut c, "issue");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.preedit(), "いっすえ");
+        assert!(log.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn 辞書を開けていない間は見出しでない英単語も英語にしない() {
+        let (mut c, log) = word_composer(&[], false);
+        *log.no_dictionary.borrow_mut() = true;
+        type_keys(&mut c, "issue");
+        assert_eq!(c.phase(), Phase::Composing);
+    }
+
+    #[test]
+    fn 固定中に消して英単語に戻ると直接打ったときと同じ英語になる() {
+        let (mut c, _) = word_composer(&[], false);
+        c.set_live(true);
+        type_keys(&mut c, "issuea");
+        c.backspace();
+        let (mut direct, _) = word_composer(&[], false);
+        direct.set_live(true);
+        type_keys(&mut direct, "issue");
+        assert_eq!(c.phase(), direct.phase());
+        assert_eq!(c.preedit(), direct.preedit());
+        assert_eq!(c.commit_preview(), "issue");
     }
 }
