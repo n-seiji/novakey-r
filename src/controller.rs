@@ -147,6 +147,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             *self.last_client.borrow_mut() = Some(client.clone());
             self.sync_conversion_mode();
         }
+        if matches!(route, Route::PassThrough | Route::Navigation) {
+            if let Ok(mut session) = self.session.try_borrow_mut() {
+                session.forget_last_key();
+            }
+        }
         match route {
             // Cmd / Ctrl / Option のショートカット (貼り付け・取り消し・全選択など) は、文脈に触れない。
             Route::PassThrough => false,

@@ -532,3 +532,20 @@ issue<space>	issue
 <live>kiku1<enter>	きく1
 # 2 かなの英単語は、エンジンの第 1 候補が英語でも live ではひらがなのまま (Space なら候補に出る)。
 <live>on<enter>	おん
+# 矢印: `-` の直後の `>` は長音をやめて `->` (Space で変わらない)。`<` の直後の `-` も半角。単独の `-` は長音のまま。
+-><space><enter>	->
+a-><enter>	あ->
+<live>-><enter>	->
+hello<space>-><enter>	hello ->
+foo-><enter>	ふぉお->
+ra-men<enter>	らーめん
+-<enter>	ー
+<lt>-a<enter>	<-あ
+<lt>-<gt>a<enter>	<->あ
+a<lt>-<gt><enter>	あ<->
+kyou->asita<space><enter>	今日->明日
+<live>kyou->asita<enter>	今日->明日
+-><bs><enter>	ー
+<lt><right>-<enter>	<ー
+<lt><up>-<enter>	<ー
+<lt><esc>-<enter>	<ー

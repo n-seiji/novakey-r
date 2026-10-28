@@ -511,12 +511,46 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn convert_reading(&mut self) -> Vec<Candidate> {
         let mut list: Vec<Candidate> = Vec::new();
         let rest = self.rest().to_string();
-        for (engine_index, text) in self.engine.convert(self.reading.generation, &rest).into_iter().enumerate() {
+        for (engine_index, text) in self.convert_with_arrows(&rest).into_iter().enumerate() {
             if !list.iter().any(|c| c.text == text) {
                 list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
             }
         }
         list
+    }
+
+    /// 読みの `->` を `>` としてエンジンに渡して変換し、返った候補の同じ位置の `>` を `->` に戻す。
+    /// エンジンに `-` を見せないので、学習や順位が矢印のために崩れない。
+    fn convert_with_arrows(&mut self, reading: &str) -> Vec<String> {
+        if !reading.contains("->") {
+            return self.engine.convert(self.reading.generation, reading);
+        }
+        let plain = reading.replace("->", ">");
+        // 読みの中で、何番目の `>` が矢印だったか。
+        let mut arrow_slots = Vec::new();
+        let mut rest = reading;
+        while let Some(at) = rest.find('>') {
+            arrow_slots.push(at > 0 && rest.as_bytes()[at - 1] == b'-');
+            rest = &rest[at + 1..];
+        }
+        let mut texts = self.engine.convert(self.reading.generation, &plain);
+        for text in &mut texts {
+            if text.matches('>').count() != arrow_slots.len() {
+                continue;
+            }
+            let mut index = 0;
+            *text = text
+                .chars()
+                .map(|ch| {
+                    if ch != '>' {
+                        return ch.to_string();
+                    }
+                    index += 1;
+                    if arrow_slots[index - 1] { "->".to_string() } else { ">".to_string() }
+                })
+                .collect();
+        }
+        texts
     }
 
     /// 組成全体が記号 1 つだけのときの異体候補。かなと混ざれば None(辞書変換に任せる)。
@@ -655,7 +689,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 英単語 head のあとに、かな tail をエンジンで変換したものを付けた候補列。
     fn convert_mixed(&mut self, head: &str, tail: &str) -> Vec<Candidate> {
         let mut list: Vec<Candidate> = Vec::new();
-        for (engine_index, text) in self.engine.convert(self.reading.generation, tail).into_iter().enumerate() {
+        for (engine_index, text) in self.convert_with_arrows(tail).into_iter().enumerate() {
             let text = format!("{head}{text}");
             if !list.iter().any(|c| c.text == text) {
                 list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
@@ -804,7 +838,19 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if kana.is_empty() {
             return;
         }
-        self.push_kana(text.to_string(), kana);
+        // 矢印: `-` の直後の `>` は長音をやめて `->` にする。`<` の直後の `-` は長音にしない (`<-`)。
+        let last_keys = match self.segments.last() {
+            Some(Segment::Kana { keys, .. }) => Some(keys.as_str()),
+            _ => None,
+        };
+        match (last_keys, text) {
+            (Some("-"), ">") => {
+                self.segments.pop();
+                self.push_kana("->".to_string(), "->");
+            }
+            (Some("<"), "-") => self.push_kana(text.to_string(), text),
+            _ => self.push_kana(text.to_string(), kana),
+        }
     }
 
     fn push_kana(&mut self, keys: String, kana: &str) {
@@ -946,6 +992,12 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         };
         let emptied = match last {
+            // `->` の `>` を消したら、元の長音に戻る。
+            Segment::Kana { keys, kana } if keys == "->" && kana == "->" => {
+                *keys = "-".to_string();
+                *kana = "ー".to_string();
+                false
+            }
             Segment::Kana { keys, kana } => {
                 kana.pop();
                 *keys = kana.clone();
