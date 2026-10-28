@@ -100,7 +100,7 @@ kyou<space><space><esc><enter>	きょう
 kyou<space><esc><esc><enter>	\n
 kyou<esc><enter>	\n
 kyou<esc><esc>
-kyou<space><S-space><S-space><enter>	巨
+kyou<space><S-space><S-space><enter>	香
 kyou<S-space><enter>	強
 <S-space>	 
 <space>	 
@@ -238,6 +238,7 @@ n<enter>	ん
 nk<enter>	nk
 nka<enter>	んか
 kanji<space><enter>	感じ
+kanji<space><up><enter>	kanji
 zzz<enter>	zzz
 zz<enter>	zz
 1+1=2<enter>	1+1=2\n

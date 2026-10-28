@@ -155,7 +155,13 @@ struct Selection {
     cursor: usize,
     /// 候補ウィンドウを出している間 true。
     window: bool,
+    /// カーソルが一度でも 1 ページ目 (数字キーで選べる先頭 9 件) の外へ出たら true。パネルがスクロールして
+    /// 行の見え方が分からなくなるので、以後は数字キーで選ばない。
+    scrolled: bool,
 }
+
+/// 数字キーで選べる先頭の件数。
+const DIGIT_PICKS: usize = 9;
 
 /// 組成の段階。局面ごとにしか意味のないデータは variant の中に置く。打鍵の解釈 (Typing) は段階をまたいで Composer が持つ。
 #[derive(Debug)]
@@ -1030,7 +1036,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if list.is_empty() {
             return false;
         }
-        self.stage = Stage::Selecting(Selection { list, cursor: 0, window: false });
+        self.stage = Stage::Selecting(Selection { list, cursor: 0, window: false, scrolled: false });
         true
     }
 
@@ -1041,6 +1047,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
         s.cursor = (s.cursor + 1) % s.list.len();
         s.window = true;
+        s.scrolled |= s.cursor >= DIGIT_PICKS;
         true
     }
 
@@ -1051,7 +1058,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
         s.cursor = (s.cursor + s.list.len() - 1) % s.list.len();
         s.window = true;
+        s.scrolled |= s.cursor >= DIGIT_PICKS;
         true
+    }
+
+    /// 数字キーが画面の行番号と一致するか。パネルが一度もスクロールしていない (カーソルが先頭 9 件の中だけにいた) ときだけ true。
+    pub fn digits_pick(&self) -> bool {
+        matches!(&self.stage, Stage::Selecting(s) if !s.scrolled)
     }
 
     pub fn select_candidate(&mut self, index: usize) -> bool {
@@ -1061,10 +1074,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if let Stage::Selecting(s) = &mut self.stage {
             s.cursor = index;
             s.window = true;
+            s.scrolled |= index >= DIGIT_PICKS;
             return true;
         }
         let list = self.candidates().to_vec();
-        self.stage = Stage::Selecting(Selection { list, cursor: index, window: true });
+        self.stage = Stage::Selecting(Selection { list, cursor: index, window: true, scrolled: index >= DIGIT_PICKS });
         true
     }
 

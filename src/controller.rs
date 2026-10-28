@@ -809,6 +809,30 @@ mod tests {
         assert!(!picking_by_digit_learns(true));
     }
 
+    #[test]
+    fn digits_do_nothing_once_the_cursor_has_left_the_first_nine() {
+        let env = RecEnv::default();
+        let client = RecClient::default();
+        let (c, core, _) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        for _ in 0..13 {
+            rec_press(&c, &client, Key::Space, " ");
+        }
+        let Phase::Converting { selected, .. } = c.phase() else { panic!("not converting") };
+        assert!(selected >= 9, "{selected}");
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"), "数字キーは握りつぶす");
+        assert!(matches!(c.phase(), Phase::Converting { selected: s, window: true } if s == selected), "確定も移動もしない");
+        assert!(!engine_learned(&core));
+        // 上へ戻って先頭 9 件の中に来ても、パネルの見え方が分からないので数字は効かない。
+        for _ in 0..selected - 2 {
+            rec_press(&c, &client, Key::Up, "");
+        }
+        assert!(matches!(c.phase(), Phase::Converting { selected: 2, .. }));
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert!(matches!(c.phase(), Phase::Converting { selected: 2, window: true }));
+        assert!(!engine_learned(&core));
+    }
+
     fn english_commit_is_remembered(secure: bool) -> bool {
         let env = RecEnv::default();
         let client = RecClient::default();

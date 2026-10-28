@@ -28,8 +28,10 @@ pub use result::Converted;
 
 /// 保持する N-best の数 (本番の `ConvertRequestOptions.N_best`)
 const N_BEST: usize = 9;
-/// IME に返す候補の最大数
+/// 審判で並べ替える先頭の候補数 (派生候補はこの外に足す)
 const TOP_N: usize = 9;
+/// IME に返す engine 候補の最大数。先頭 (TOP_N + 派生候補) の後ろに、読み全体を覆う候補だけを engine の順で足す
+const MAX_SHOWN: usize = 30;
 
 /// 辞書と辞書引きのメモ。コントローラ (入力クライアント) 間で共有する。
 pub struct KkcCore {
@@ -243,6 +245,24 @@ fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
     top.splice(last_full + 1..last_full + 1, cands);
 }
 
+/// 先頭の後ろに、`rest` のうち読み全体を覆う候補 (語の読みをつないだものが `katakana` と一致) を engine の順で足す。
+/// 表示が先頭や互いに重なるもの、ASCII 以外の文字を含まない (絵文字・記号・英字だけの) ものは捨て、全体で `MAX_SHOWN` まで。先頭の一部だけを覆う候補は足さない (確定で残りの読みが消えるため)。審判にはかけない。
+fn append_tail(top: &mut Vec<result::Cand>, rest: &[result::Cand], katakana: &str) {
+    let mut seen: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
+    for cand in rest {
+        if top.len() >= MAX_SHOWN {
+            break;
+        }
+        let covers_all = cand.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana;
+        // 絵文字・記号だけ、または ASCII だけ (server など) の候補は足さない。composer が emoji.tsv / loanwords.tsv から決まった位置に入れるので、
+        // 辞書側に同じ表記が先に居ると重複扱いで入らず、位置がずれる。
+        let has_letter = cand.text.chars().any(|c| c.is_alphanumeric() && !c.is_ascii());
+        if covers_all && has_letter && seen.insert(cand.text.replace('\u{1F}', "")) {
+            top.push(cand.clone());
+        }
+    }
+}
+
 impl Default for RustEngine {
     fn default() -> Self {
         Self::new()
@@ -262,8 +282,11 @@ impl CandidateEngine for RustEngine {
         let converted = core.convert_all(hiragana);
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
         add_variants(core, &mut top);
+        let head_len = top.len();
+        let katakana: String = lattice::katakana_chars(hiragana).iter().collect();
+        append_tail(&mut top, &converted.main[converted.main.len().min(TOP_N)..], &katakana);
         let mut order: Vec<usize> = (0..top.len()).collect();
-        let slots: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
+        let slots: Vec<usize> = (0..head_len).filter(|&i| top[i].source == result::Source::Full).collect();
         let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let scores: Vec<f32> = slots.iter().map(|&i| top[i].value).collect();
@@ -699,15 +722,15 @@ mod tests {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let base = core.convert_all("いっとうがし");
         let n_full = base.main.iter().take(TOP_N).filter(|c| c.source == result::Source::Full).count();
-        let mut e = RustEngine::with_core(core).with_judge(no_judge);
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
         let cands = e.convert(1, "いっとうがし");
         let shown_base: Vec<String> = base.main.iter().take(TOP_N).map(|c| c.text.replace('\u{1F}', "")).collect();
         let i = index_of(&cands, "一棟貸し");
         assert!(i >= n_full, "派生候補は元の全文候補より前に出ない");
         assert_eq!(cands[..n_full], shown_base[..n_full]);
-        let added = cands.len() - shown_base.len();
+        let added = head_len(&core, "いっとうがし") - shown_base.len();
         assert!(added >= 1 && added <= variants::MAX_VARIANTS, "{added}");
-        assert_eq!(cands[n_full + added..], shown_base[n_full..], "全文以外の候補は押し出されない");
+        assert_eq!(cands[n_full + added..shown_base.len() + added], shown_base[n_full..], "全文以外の候補は押し出されない");
     }
 
     #[test]
@@ -749,5 +772,91 @@ mod tests {
         assert!(e.select(1, 0));
         let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "いっとうがし");
         assert_eq!(after[0], "一棟貸し", "{after:?}");
+    }
+    fn katakana_of(reading: &str) -> String {
+        lattice::katakana_chars(reading).iter().collect()
+    }
+
+    /// 先頭 (TOP_N + 派生候補) の長さ。審判なし・tail なしの旧来の返り値の長さと同じ。
+    fn head_len(core: &Rc<KkcCore>, reading: &str) -> usize {
+        let converted = core.convert_all(reading);
+        let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
+        add_variants(core, &mut top);
+        top.len()
+    }
+
+    #[test]
+    #[ignore = "measurement only"]
+    fn measure_candidate_counts() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        for reading in ["かんじ", "こうしょう", "きしゃ", "いっとう", "きょうはいいてんきですね"] {
+            let main = core.convert_all(reading).main;
+            let whole = main.iter().skip(TOP_N).filter(|c| c.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana_of(reading)).count();
+            let shown = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, reading).len();
+            eprintln!("COUNT main={} whole_past_9={whole} head={} shown={shown}", main.len(), head_len(&core, reading));
+        }
+    }
+
+    #[test]
+    fn homophones_past_the_head_are_shown_and_cover_the_whole_reading() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+        let shown = e.convert(1, "かんじ");
+        let head = head_len(&core, "かんじ");
+        assert!(shown.len() > TOP_N && shown.len() <= MAX_SHOWN, "{}", shown.len());
+        assert!(shown.len() > head, "tail がある");
+        let want = katakana_of("かんじ");
+        for i in 0..shown.len() {
+            let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
+            if i >= head {
+                assert_eq!(ruby, want, "tail は読み全体を覆う");
+            }
+        }
+        let unique: HashSet<&String> = shown.iter().collect();
+        assert_eq!(unique.len(), shown.len(), "重複なし");
+    }
+
+    #[test]
+    fn a_sentence_gets_no_partial_cover_candidates_in_the_tail() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let reading = "きょうはいいてんきですね";
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+        let shown = e.convert(1, reading);
+        let want = katakana_of(reading);
+        for i in head_len(&core, reading)..shown.len() {
+            let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
+            assert_eq!(ruby, want);
+        }
+    }
+
+    #[test]
+    fn the_judge_moves_only_the_head_and_the_tail_keeps_the_engine_order() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let head = head_len(&core, "かんじ");
+        let plain = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, "かんじ");
+        let reversed = RustEngine::with_core(core).with_judge(reverse_judge).convert(1, "かんじ");
+        assert_eq!(plain.len(), reversed.len());
+        assert!(plain.len() > head);
+        assert_eq!(plain[head..], reversed[head..], "tail は審判で動かない");
+        let (mut a, mut b) = (plain[..head].to_vec(), reversed[..head].to_vec());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "先頭は同じ集合のまま");
+        assert_ne!(plain[..head], reversed[..head]);
+    }
+
+    #[test]
+    fn a_tail_candidate_has_its_data_and_is_learned_into_an_earlier_slot() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+        let shown = e.convert(1, "かんじ");
+        let i = shown.len() - 1;
+        assert!(i >= TOP_N);
+        let words = e.words(1, i).unwrap();
+        assert_eq!(words.iter().map(|(w, _)| w.as_str()).collect::<String>(), shown[i]);
+        assert!(e.select(1, i));
+        let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "かんじ");
+        let now = after.iter().position(|t| *t == shown[i]).expect("まだ表示される");
+        assert!(now < i, "{now} < {i}");
     }
 }
