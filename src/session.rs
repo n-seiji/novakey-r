@@ -333,7 +333,8 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 false
             }
             Action::PickCandidate(number) => {
-                if self.composer.select_candidate(usize::from(number) - 1) {
+                // 候補が 9 件を超えてパネルがスクロールした後は、行番号と数字の対応が分からないので何もしない。
+                if self.composer.digits_pick() && self.composer.select_candidate(usize::from(number) - 1) {
                     self.commit_and_insert(gates, "", fx);
                 }
                 true
