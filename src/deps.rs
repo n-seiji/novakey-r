@@ -9,6 +9,8 @@ pub trait Lexicon {
     fn english_for(&self, katakana: &str) -> Vec<String>;
     /// 打鍵列が英単語か。
     fn is_english_word(&self, typed: &str) -> bool;
+    /// 打鍵列で始まる英単語があるか (打鍵列そのものが語の場合も含む)。
+    fn is_english_prefix(&self, typed: &str) -> bool;
     /// 英語として確定したことのある語か (EnglishMemory が覚えたもの)。
     fn knows_english(&self, word: &str) -> bool;
     /// ひらがなの読み全体に対応する絵文字。
@@ -28,6 +30,9 @@ impl Lexicon for ProdLexicon {
     }
     fn is_english_word(&self, typed: &str) -> bool {
         crate::loanword::is_english_word(typed)
+    }
+    fn is_english_prefix(&self, typed: &str) -> bool {
+        crate::loanword::is_english_prefix(typed)
     }
     fn knows_english(&self, word: &str) -> bool {
         crate::english_memory::knows(word)
@@ -59,6 +64,7 @@ mod fakes {
     pub struct FakeLexicon {
         english: fn(&str) -> Vec<String>,
         english_word: fn(&str) -> bool,
+        english_prefix: fn(&str) -> bool,
         emoji: fn(&str) -> Vec<String>,
         learned: Rc<RefCell<Vec<String>>>,
     }
@@ -68,6 +74,7 @@ mod fakes {
             Self {
                 english: |_| Vec::new(),
                 english_word: |_| false,
+                english_prefix: |_| false,
                 emoji: |_| Vec::new(),
                 learned: Rc::default(),
             }
@@ -81,6 +88,10 @@ mod fakes {
         }
         pub fn with_english_word(mut self, f: fn(&str) -> bool) -> Self {
             self.english_word = f;
+            self
+        }
+        pub fn with_english_prefix(mut self, f: fn(&str) -> bool) -> Self {
+            self.english_prefix = f;
             self
         }
         pub fn with_emoji(mut self, f: fn(&str) -> Vec<String>) -> Self {
@@ -99,6 +110,9 @@ mod fakes {
         }
         fn is_english_word(&self, typed: &str) -> bool {
             (self.english_word)(typed)
+        }
+        fn is_english_prefix(&self, typed: &str) -> bool {
+            (self.english_prefix)(typed)
         }
         fn knows_english(&self, word: &str) -> bool {
             self.learned.borrow().iter().any(|w| w == word)

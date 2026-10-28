@@ -65,20 +65,35 @@ pub fn parse_words(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した集合。一覧が無ければ表だけ。
-static WORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+/// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した語の一覧。一覧が無ければ表だけ。
+/// 完全一致 (binary_search) と前方一致 (partition_point) の両方を引けるよう、整列して重複を除く。
+static WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
     let extra = crate::config::get()
         .dev_words_path
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| parse_words(&s))
         .unwrap_or_default();
-    words(&TABLE).into_iter().map(str::to_string).chain(extra).collect()
+    let mut all: Vec<String> = words(&TABLE).into_iter().map(str::to_string).chain(extra).collect();
+    all.sort_unstable();
+    all.dedup();
+    all
 });
 
 /// 打鍵列が表に載っている英単語か。
 pub fn is_english_word(typed: &str) -> bool {
-    WORDS.contains(typed)
+    WORDS.binary_search_by(|w| w.as_str().cmp(typed)).is_ok()
+}
+
+/// 打鍵列で始まる英単語があるか (打鍵列そのものが語の場合も含む)。
+pub fn is_english_prefix(typed: &str) -> bool {
+    has_prefix(&WORDS, typed)
+}
+
+/// 整列済みの語の一覧に、typed で始まる語があるか。
+fn has_prefix(sorted: &[String], typed: &str) -> bool {
+    let i = sorted.partition_point(|w| w.as_str() < typed);
+    sorted.get(i).is_some_and(|w| w.starts_with(typed))
 }
 
 #[cfg(test)]
@@ -128,5 +143,15 @@ mod tests {
     #[test]
     fn 語の無い行は捨てる() {
         assert!(parse("ア\t\nイ\n").is_empty());
+    }
+
+    #[test]
+    fn 前方一致は語そのものと語の途中を見つけ無関係な打鍵列は見つけない() {
+        let sorted: Vec<String> = ["inform", "information", "login"].iter().map(|w| w.to_string()).collect();
+        assert!(has_prefix(&sorted, "informa"));
+        assert!(has_prefix(&sorted, "login"));
+        assert!(has_prefix(&sorted, "log"));
+        assert!(!has_prefix(&sorted, "logini"));
+        assert!(!has_prefix(&sorted, "zzz"));
     }
 }
