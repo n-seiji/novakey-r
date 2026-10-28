@@ -886,7 +886,7 @@ mod tests {
     fn lt_の直後のハイフンは長音にしない() {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         session.handle(&ALLOW, classify('<'), "<");
-        session.set_context("<");
+        session.set_context("<", false);
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert_eq!(inserted(&outcome), ["-"]);
         assert_eq!(session.marked_text(), "");
@@ -897,7 +897,7 @@ mod tests {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         session.handle(&ALLOW, classify('<'), "<");
         session.forget_last_key();
-        session.set_context("<");
+        session.set_context("<", false);
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert!(inserted(&outcome).is_empty());
         assert_eq!(session.marked_text(), "ー");
