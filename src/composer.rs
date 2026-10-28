@@ -798,7 +798,19 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if kana.is_empty() {
             return;
         }
-        self.push_kana(text.to_string(), kana);
+        // 矢印: `-` の直後の `>` は長音をやめて `->` にする。`<` の直後の `-` は長音にしない (`<-`)。
+        let last_keys = match self.segments.last() {
+            Some(Segment::Kana { keys, .. }) => Some(keys.as_str()),
+            _ => None,
+        };
+        match (last_keys, text) {
+            (Some("-"), ">") => {
+                self.segments.pop();
+                self.push_kana("->".to_string(), "->");
+            }
+            (Some("<"), "-") => self.push_kana(text.to_string(), text),
+            _ => self.push_kana(text.to_string(), kana),
+        }
     }
 
     fn push_kana(&mut self, keys: String, kana: &str) {

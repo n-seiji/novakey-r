@@ -49,6 +49,8 @@ pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     memory: M,
     /// アプリで直前に打った文字列の今の行の末尾が ASCII か (`set_context` が更新する)。
     after_ascii: bool,
+    /// 直前に打った文字が `<` か (`<-` の `-` を長音にしないため)。
+    after_lt: bool,
 }
 
 /// 直前が半角のときに、組成の先頭でも半角のまま入れる記号。`[ ] - / ~` は含めない。
@@ -61,6 +63,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             composer,
             memory,
             after_ascii: false,
+            after_lt: false,
         }
     }
 
@@ -69,6 +72,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn set_context(&mut self, context: &str) {
         self.composer.engine_mut().set_context(context);
         self.after_ascii = crate::context::ends_ascii(context);
+        self.after_lt = context.ends_with('<');
     }
 
     pub fn phase(&self) -> Phase {
@@ -149,6 +153,11 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         }
         let phase = self.phase();
         if phase == Phase::Empty && self.after_ascii && matches!(key, Key::Punct | Key::Mark) && text.len() == 1 && HALF_WIDTH_AFTER_ASCII.contains(text) {
+            fx.push(Effect::Insert(text.to_string()));
+            return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
+        }
+        // `<` を打った直後の `-` は長音にせず半角のまま入れる (`<-`)。
+        if phase == Phase::Empty && self.after_lt && key == Key::Hyphen {
             fx.push(Effect::Insert(text.to_string()));
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
@@ -842,5 +851,24 @@ mod tests {
         session.handle(&ALLOW, classify('a'), "a");
         session.handle(&ALLOW, classify('!'), "!");
         assert_eq!(session.marked_text(), "あ！");
+    }
+
+    #[test]
+    fn ハイフンの直後の_gt_は長音をやめて矢印にする() {
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.handle(&ALLOW, classify('-'), "-");
+        assert_eq!(session.marked_text(), "ー");
+        session.handle(&ALLOW, classify('>'), ">");
+        assert_eq!(session.marked_text(), "->");
+        assert_eq!(session.commit_preview(), "->");
+    }
+
+    #[test]
+    fn lt_の直後のハイフンは長音にしない() {
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.set_context("<");
+        let outcome = session.handle(&ALLOW, classify('-'), "-");
+        assert_eq!(inserted(&outcome), ["-"]);
+        assert_eq!(session.marked_text(), "");
     }
 }
