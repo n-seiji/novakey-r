@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 const MAX_APPS: usize = 10;
 /// 1 アプリで覚える文字数 (後ろから残す)。文字で持つのはこの量で、審判が使うのは後ろの `judge::CONTEXT_TOKENS` (32 トークン) だけ。
 const MAX_CHARS: usize = 100;
-/// 最後の確定からこれだけ経つと、別の作業と見て文脈を捨てる。
+/// 最後の入力からこれだけ経つと、別の作業と見て文脈を捨てる。`Instant` なので、スリープの間は数えない (起動中の 2 日)。
 const STALE_AFTER: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 
 struct Entry {
@@ -25,7 +25,7 @@ pub struct ContextStore {
 }
 
 impl ContextStore {
-    /// `text` を `app` の文脈の末尾に足す。改行は文の切れ目として残す (続く改行は 1 つにまとめる)。
+    /// `text` を `app` の文脈の末尾に足す。改行は文の切れ目として残す (素通しの Backspace と数が合うよう、続く改行も全部残す)。
     pub fn record(&mut self, app: &str, text: &str, now: Instant) {
         if text.is_empty() {
             return;
@@ -37,11 +37,7 @@ impl ContextStore {
         if now.saturating_duration_since(entry.last) >= STALE_AFTER {
             entry.text.clear();
         }
-        for c in text.chars() {
-            if c != '\n' || !entry.text.ends_with('\n') {
-                entry.text.push(c);
-            }
-        }
+        entry.text.push_str(text);
         let extra = entry.text.chars().count().saturating_sub(MAX_CHARS);
         if extra > 0 {
             let cut = entry.text.char_indices().nth(extra).map_or(entry.text.len(), |(i, _)| i);
@@ -54,7 +50,7 @@ impl ContextStore {
         self.entries.push(entry);
     }
 
-    /// `app` の文脈。2 日以上確定が無ければ空。
+    /// `app` の文脈。2 日 (起動中) 以上入力が無ければ空。
     pub fn get(&self, app: &str, now: Instant) -> &str {
         self.entries
             .iter()
@@ -125,12 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn 改行は切れ目として残り_続く改行は1つにまとまる() {
+    fn 改行は切れ目として全部残り_バックスペースと数が合う() {
         let (mut s, t) = (ContextStore::default(), Instant::now());
         s.record("a", "前の行\n次の", t);
         assert_eq!(s.get("a", t), "前の行\n次の");
-        s.record("a", "\n", t);
         s.record("a", "\n\n", t);
+        assert_eq!(s.get("a", t), "前の行\n次の\n\n");
+        s.pop("a");
         assert_eq!(s.get("a", t), "前の行\n次の\n");
     }
 

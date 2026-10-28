@@ -995,6 +995,20 @@ mod tests {
     }
 
     #[test]
+    fn 連続した改行をバックスペースで戻しても_新しい行の頭は全角のまま() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert_eq!(context_of("app.one"), "Hello\n\n");
+        assert!(!press(&f, Key::Backspace, "\u{7f}"));
+        assert_eq!(context_of("app.one"), "Hello\n");
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.marked(), "！");
+    }
+
+    #[test]
     fn 修飾キー付きの素通しと_tab_と矢印は文脈を捨てない() {
         let f = fixture();
         f.1.set_bundle("app.one");

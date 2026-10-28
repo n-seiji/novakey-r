@@ -47,7 +47,7 @@ pub struct Gates {
 pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     composer: Composer<E, L>,
     memory: M,
-    /// アプリで直前に確定した文字列の末尾が ASCII か (`set_context` が更新する)。
+    /// アプリで直前に打った文字列の今の行の末尾が ASCII か (`set_context` が更新する)。
     after_ascii: bool,
 }
 
@@ -64,8 +64,8 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         }
     }
 
-    /// アプリで直前に確定した文字列 (空なら文脈なし)。キーごとに、処理の前に渡す。
-    /// 変換の文脈になり、末尾が ASCII なら組成の先頭の記号を半角のまま入れる。
+    /// アプリで直前に打った文字列 (空なら文脈なし)。キーごとに、処理の前に渡す。
+    /// 変換の文脈になり、今の行 (最後の改行より後ろ) の末尾が ASCII なら組成の先頭の記号を半角のまま入れる。
     pub fn set_context(&mut self, context: &str) {
         self.composer.engine_mut().set_context(context);
         self.after_ascii = crate::context::ends_ascii(context);
