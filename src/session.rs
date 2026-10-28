@@ -65,6 +65,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     }
 
     /// アプリで直前に打った文字列 (空なら文脈なし)。キーごとに、処理の前に渡す。
+    /// `english_app` はそのアプリが英語を打つアプリか。true なら、審判は行頭 (空の行・インデントだけ) でも英語の語を聞く。
     /// 変換の文脈になり、今の行 (最後の改行より後ろ) の末尾が ASCII なら組成の先頭の記号を半角のまま入れる。
     pub fn set_context(&mut self, context: &str, english_app: bool) {
         self.composer.engine_mut().set_context(context, english_app);
