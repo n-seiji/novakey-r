@@ -147,6 +147,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             *self.last_client.borrow_mut() = Some(client.clone());
             self.sync_conversion_mode();
         }
+        if matches!(route, Route::PassThrough | Route::Navigation) {
+            if let Ok(mut session) = self.session.try_borrow_mut() {
+                session.forget_last_key();
+            }
+        }
         match route {
             // Cmd / Ctrl / Option のショートカット (貼り付け・取り消し・全選択など) は、文脈に触れない。
             Route::PassThrough => false,
@@ -824,6 +829,37 @@ mod tests {
     #[test]
     fn picking_a_candidate_by_digit_is_not_learned_under_secure_input() {
         assert!(!picking_by_digit_learns(true));
+    }
+
+    #[test]
+    fn digits_do_nothing_once_the_cursor_has_left_the_first_nine() {
+        let env = RecEnv::default();
+        let client = RecClient::default();
+        let (c, core, _) = observing_controller(env);
+        open_candidate_window(&c, &client);
+        for _ in 0..13 {
+            rec_press(&c, &client, Key::Space, " ");
+        }
+        let Phase::Converting { selected, .. } = c.phase() else { panic!("not converting") };
+        assert!(selected >= 9, "{selected}");
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"), "数字キーは握りつぶす");
+        assert!(matches!(c.phase(), Phase::Converting { selected: s, window: true } if s == selected), "確定も移動もしない");
+        assert!(!engine_learned(&core));
+        // 上へ戻って先頭 9 件の中に来ても、パネルの見え方が分からないので数字は効かない。
+        for _ in 0..selected - 2 {
+            rec_press(&c, &client, Key::Up, "");
+        }
+        assert!(matches!(c.phase(), Phase::Converting { selected: 2, .. }));
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert!(matches!(c.phase(), Phase::Converting { selected: 2, window: true }));
+        assert!(!engine_learned(&core));
+        // #1 まで戻れば、パネルは最上段なので数字が効く。
+        rec_press(&c, &client, Key::Up, "");
+        rec_press(&c, &client, Key::Up, "");
+        assert!(matches!(c.phase(), Phase::Converting { selected: 0, .. }));
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert_eq!(c.phase(), Phase::Empty);
+        assert!(engine_learned(&core));
     }
 
     fn english_commit_is_remembered(secure: bool) -> bool {
