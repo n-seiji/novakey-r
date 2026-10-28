@@ -40,8 +40,8 @@ branch<S-space><enter>	branch
 open<S-space><enter>	open
 rainen<enter>	らいねん
 mainichi<space><enter>	毎日
-hello<space><enter>	へっォ
-hello<space><space><enter>	hello
+hello<space><enter>	hello \n
+hello<space><space><enter>	hello  \n
 world<S-space><enter>	world
 git<S-space><enter>	git
 commit<S-space><enter>	commit
@@ -500,3 +500,16 @@ loginjinihiraku<space><enter>	login耳に開く
 <live>timei<enter>	地名
 leann<enter>	ぇあん
 evenness<enter>	evenness
+# かなにしきれる英単語で、そのかなが辞書の見出しでないもの (issue → いっすえ) は、審判なしで英語として打つ (live でも Space でも)。
+# 見出しでもある語 (made, kitto) と、途中で英語の語に見える打鍵 (dosei の dose) の確定は変えない。
+<live>issue<enter>	issue
+issue<space>	issue 
+<live>line<enter>	line
+<live>issuea<bs><enter>	issue
+<live>doseihakireidesu<enter>	土星は綺麗です
+<live>issuenisitai<enter>	issueにしたい
+<live>kitto<enter>	きっと
+<live>made<enter>	間で
+# live の Backspace で、見えている日本語が英単語 (kite) の綴りに縮んでも、読みが見出しなら固定した表示を保つ。
+<live>kitekure<bs><bs><enter>	来て
+<live>kitekudasai<bs><bs><bs><bs><enter>	来て

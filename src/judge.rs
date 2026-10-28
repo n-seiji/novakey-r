@@ -959,23 +959,34 @@ pub fn rerank(context: &str, texts: &[&str], engine_scores: &[f32]) -> Option<Ve
     if texts.len() < 2 || texts.len() != engine_scores.len() {
         return None;
     }
-    let judge = if PRELOADED.load(Ordering::Relaxed) {
+    let (scores, unknown) = score_texts(context, texts)?;
+    order_by_total(engine_scores, &floor_unknown(&scores, &unknown)?)
+}
+
+/// 読み込み済みの審判。背景で読み込み中・使えないときは `None` (待たない)。
+fn ready() -> Option<&'static Judge> {
+    if PRELOADED.load(Ordering::Relaxed) {
         // 背景で読み込み中なら待たない。
         match JUDGE.get() {
             None => {
                 crate::trace::record("judge-skip", "loading=1");
-                return None;
+                None
             }
             Some(None) => {
                 // 読み込みは終わったが使えない。理由は読み込み側がログ済み (まだなら固定文を 1 度)。
                 log_once(&LOAD_LOGGED, "judge: unavailable; conversion keeps the engine order");
-                return None;
+                None
             }
-            Some(Some(j)) => j,
+            Some(Some(j)) => Some(j),
         }
     } else {
-        judge()?
-    };
+        judge()
+    }
+}
+
+/// `texts` それぞれの審判の対数尤度と、未知トークンを含むか。審判が使えない・失敗したときは `None`。
+fn score_texts(context: &str, texts: &[&str]) -> Option<(Vec<f64>, Vec<bool>)> {
+    let judge = ready()?;
     let t0 = Instant::now();
     let (scores, unknown, rows) = match judge.score(context, texts) {
         Ok(s) => s,
@@ -988,7 +999,23 @@ pub fn rerank(context: &str, texts: &[&str], engine_scores: &[f32]) -> Option<Ve
     LAST_MS.with(|c| c.set(Some(ms)));
     let unk = unknown.iter().filter(|&&u| u).count();
     crate::trace::record("judge", &format!("ms={ms:.1} n={} rows={rows} unk={unk}", texts.len()));
-    order_by_total(engine_scores, &floor_unknown(&scores, &unknown)?)
+    Some((scores, unknown))
+}
+
+/// `text` の対数尤度 − `over` の対数尤度 (文脈つき)。大きいほど `text` の方が文として自然。
+/// 審判が使えない・失敗した・どちらかが未知トークンを含む (比べられない)・有限でないときは `None`。
+pub fn margin(context: &str, text: &str, over: &str) -> Option<f64> {
+    let (scores, unknown) = score_texts(context, &[text, over])?;
+    margin_of(&scores, &unknown)
+}
+
+/// `margin` の、[text, over] の採点結果から差を出す部分。
+fn margin_of(scores: &[f64], unknown: &[bool]) -> Option<f64> {
+    if unknown.iter().any(|&u| u) {
+        return None;
+    }
+    let diff = scores.first()? - scores.get(1)?;
+    diff.is_finite().then_some(diff)
 }
 
 /// `--judge-bench <testset.tsv>`: 読み (1 列目)、正解 (2 列目、`|` 区切り)、任意で文脈 (3 列目、直前に確定した文字列) の表を、
@@ -1268,6 +1295,47 @@ mod tests {
     fn judged_order(judge: &Judge, context: &str, texts: &[&str]) -> Vec<usize> {
         let (scores, unknown, _) = judge.score(context, texts).unwrap();
         order_by_total(&vec![0.0; texts.len()], &floor_unknown(&scores, &unknown).unwrap()).unwrap()
+    }
+
+    /// 実際の審判で、`text` の対数尤度 − `over` の対数尤度 (文脈なし)。
+    fn real_margin(judge: &Judge, context: &str, text: &str, over: &str) -> f64 {
+        let (scores, unknown, _) = judge.score(context, &[text, over]).unwrap();
+        margin_of(&scores, &unknown).unwrap()
+    }
+
+    #[test]
+    fn 英語が自然な語は余裕を超えて英語が勝ち_日本語が自然な語は負ける() {
+        let Some(judge) = real_judge() else { return };
+        // 測った差 (文脈なし): issue +11.9 (いっ末), home +6.1 (褒め), made -5.4 (まで), kite -4.1 (来て), kitto -10.3 (きっと)。
+        assert!(real_margin(&judge, "", "issue", "いっ末") >= 4.0);
+        assert!(real_margin(&judge, "", "home", "褒め") >= 4.0);
+        assert!(real_margin(&judge, "", "made", "まで") < 4.0);
+        assert!(real_margin(&judge, "", "kite", "来て") < 4.0);
+        assert!(real_margin(&judge, "", "kitto", "きっと") < 4.0);
+    }
+
+    #[test]
+    fn 英語として打つ語は読みに退けられず_日本語の文節は退けられる() {
+        let Some(judge) = real_judge() else { return };
+        // 退ける境は -2 (VETO_MARGIN)。測った差 (文脈なし): issue +11.9, rename +1.3 (最小), line +2.7, hello +8.2。
+        // 日本語の文節: imago -9.3 (今後), anode -4.8 (あので), kiwano -4.1 (際の)。
+        for (word, reading) in [("issue", "いっ末"), ("rename", "れなめ"), ("line", "ぃね"), ("hello", "へっぉ")] {
+            assert!(real_margin(&judge, "", word, reading) > -2.0, "{word}");
+        }
+        for (word, reading) in [("imago", "今後"), ("anode", "あので"), ("kiwano", "際の")] {
+            assert!(real_margin(&judge, "", word, reading) <= -2.0, "{word}");
+        }
+    }
+
+    #[test]
+    fn 英文のあとの_code_は英語が勝つが_文脈なしの_more_も差だけでは勝つ() {
+        let Some(judge) = real_judge() else { return };
+        // `claude ` のあとの code は +6.7 (子で) で 4 を超える。文脈なしの more は +7.2 (漏れ) で、差だけでは code と分けられない。
+        // more を日本語のままにするのは、RustEngine::prefers_text の「文脈が ASCII で終わるときだけ」で、差の閾値ではない。
+        assert!(real_margin(&judge, "claude ", "code", "子で") >= 4.0);
+        assert!(real_margin(&judge, "", "more", "漏れ") >= 4.0);
+        assert!(real_margin(&judge, "claude ", "kite", "きて") < 4.0);
+        assert!(real_margin(&judge, "claude ", "made", "まで") < 4.0);
     }
 
     #[test]

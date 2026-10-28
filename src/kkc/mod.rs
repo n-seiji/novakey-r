@@ -170,10 +170,21 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
 /// 全文候補の並べ替え。(文脈, 文字列, engine のスコア) -> 良い順の添字、使えなければ `None`。本番は `judge::rerank`。
 type Judge = fn(&str, &[&str], &[f32]) -> Option<Vec<usize>>;
 
+/// 2 つの文の比較。(文脈, 文, 比べる文) -> 前者の対数尤度 - 後者の対数尤度、使えなければ `None`。本番は `judge::margin`。
+type Compare = fn(&str, &str, &str) -> Option<f64>;
+
+/// `prefers_text` が英語を選ぶのに要る、審判の対数尤度の差。
+const MARGIN: f64 = 4.0;
+
+/// `rejects_english` が日本語の読みを選ぶのに要る、審判の対数尤度の差 (読み - 英字)。
+/// 測った範囲では、英語として打つ語 (issue, line, rename…) は差が -1.3 以上、日本語の文節 (imago, anode, kiwano…) は -3 以下に分かれた。
+const VETO_MARGIN: f64 = 2.0;
+
 /// Rust 実装のかな漢字変換エンジン。
 pub struct RustEngine {
     core: Option<Rc<KkcCore>>,
     judge: Judge,
+    compare: Compare,
     /// 審判に渡す文脈 (アプリで直前に確定した文字列)。メモリ上だけで、ログにも書かない。
     context: String,
     /// 直近の変換の revision と、返した候補ごとの `Candidate.data`。`select` の検証と学習用。
@@ -182,18 +193,25 @@ pub struct RustEngine {
 
 impl RustEngine {
     pub fn new() -> Self {
-        Self { core: shared_core(), judge: crate::judge::rerank, context: String::new(), last: None }
+        Self { core: shared_core(), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), last: None }
     }
 
     #[cfg(test)]
     pub fn with_core(core: Rc<KkcCore>) -> Self {
-        Self { core: Some(core), judge: crate::judge::rerank, context: String::new(), last: None }
+        Self { core: Some(core), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), last: None }
     }
 
     /// 審判を差し替える (テスト用。実際の並べ替え経路を fake で通す)。
     #[cfg(test)]
     pub fn with_judge(mut self, judge: Judge) -> Self {
         self.judge = judge;
+        self
+    }
+
+    /// 2 文の比較を差し替える (テスト用)。
+    #[cfg(test)]
+    pub fn with_compare(mut self, compare: Compare) -> Self {
+        self.compare = compare;
         self
     }
 }
@@ -286,6 +304,23 @@ impl CandidateEngine for RustEngine {
 
     fn has_reading(&self, hiragana: &str) -> bool {
         self.core.as_ref().is_some_and(|core| core.has_reading(hiragana))
+    }
+
+    fn has_dictionary(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// 文脈の末尾 (空白を除く) が ASCII のときだけ審判に聞く。文脈なしや日本語の文脈では、日本語として自然な語 (more → 漏れ) も
+    /// 差が余裕を超えるので英語にしない。`claude ` のあとの code は 6.7、文脈なしの more は 7.2 で、差だけでは分けられない。
+    /// 審判が使えない・失敗したときは false (engine の順のまま)。
+    fn prefers_text(&mut self, text: &str, over: &str) -> bool {
+        crate::context::ends_ascii(&self.context)
+            && (self.compare)(&self.context, text, over).is_some_and(|diff| diff >= MARGIN)
+    }
+
+    /// 英字より読みの方が文として自然か。審判が使えない・失敗したときは false (英語のまま)。
+    fn rejects_english(&mut self, raw: &str, reading: &str) -> bool {
+        (self.compare)(&self.context, raw, reading).is_some_and(|diff| diff <= -VETO_MARGIN)
     }
 
     /// `last` を読むだけで取り出さない (`select` が学習に使う)。
@@ -588,6 +623,67 @@ mod tests {
         e.set_context("");
         e.convert(3, "かんじ");
         assert_eq!(SEEN.with(|s| s.borrow().clone()), ["", "机の", ""]);
+    }
+
+    thread_local! {
+        static COMPARED: RefCell<Vec<(String, String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn margin_of_four(context: &str, text: &str, over: &str) -> Option<f64> {
+        COMPARED.with(|c| c.borrow_mut().push((context.to_string(), text.to_string(), over.to_string())));
+        Some(MARGIN)
+    }
+
+    fn margin_below_four(_context: &str, _text: &str, _over: &str) -> Option<f64> {
+        Some(MARGIN - 0.1)
+    }
+
+    fn no_margin(_context: &str, _text: &str, _over: &str) -> Option<f64> {
+        None
+    }
+
+    #[test]
+    fn 比べた差が余裕に届いたときだけ英語を選び_審判が使えなければ選ばない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
+        e.set_context("claude ");
+        assert!(e.prefers_text("code", "子で"));
+        assert_eq!(COMPARED.with(|c| c.borrow().clone()), [("claude ".to_string(), "code".to_string(), "子で".to_string())]);
+        e = e.with_compare(margin_below_four);
+        assert!(!e.prefers_text("code", "子で"));
+        e = e.with_compare(no_margin);
+        assert!(!e.prefers_text("code", "子で"));
+    }
+
+    #[test]
+    fn 文脈が空か日本語で終わるときは審判に聞かず英語を選ばない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
+        let before = COMPARED.with(|c| c.borrow().len());
+        for context in ["", "机の", "今日は "] {
+            e.set_context(context);
+            assert!(!e.prefers_text("more", "漏れ"), "{context:?}");
+        }
+        assert_eq!(COMPARED.with(|c| c.borrow().len()), before);
+    }
+
+    fn margin_minus_two(_context: &str, _text: &str, _over: &str) -> Option<f64> {
+        Some(-VETO_MARGIN)
+    }
+
+    fn margin_minus_one(_context: &str, _text: &str, _over: &str) -> Option<f64> {
+        Some(-VETO_MARGIN + 0.1)
+    }
+
+    #[test]
+    fn 読みが余裕以上に自然なときだけ英字を退け_審判が使えなければ退けない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_compare(margin_minus_two);
+        assert!(e.rejects_english("imago", "今後"));
+        e = e.with_compare(margin_minus_one);
+        assert!(!e.rejects_english("imago", "今後"));
+        e = e.with_compare(no_margin);
+        assert!(!e.rejects_english("imago", "今後"));
     }
 
     /// 派生候補 (一棟貸し) を後ろに置く審判。`want` を先頭に、残りは元の順。
