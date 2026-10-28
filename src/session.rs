@@ -71,9 +71,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     }
 
     /// アプリで直前に打った文字列 (空なら文脈なし)。キーごとに、処理の前に渡す。
+    /// `english_app` はそのアプリが英語を打つアプリか。true なら、審判は行頭 (空の行・インデントだけ) でも英語の語を聞く。
     /// 変換の文脈になり、今の行 (最後の改行より後ろ) の末尾が ASCII なら組成の先頭の記号を半角のまま入れる。
-    pub fn set_context(&mut self, context: &str) {
-        self.composer.engine_mut().set_context(context);
+    pub fn set_context(&mut self, context: &str, english_app: bool) {
+        self.composer.engine_mut().set_context(context, english_app);
         self.after_ascii = crate::context::ends_ascii(context);
         self.after_lt = context.ends_with('<');
     }
@@ -833,7 +834,7 @@ mod tests {
     fn 直前が_ascii_なら組成の先頭の記号を半角のまま入れる() {
         for ch in "!?(){}.,:;".chars() {
             let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-            session.set_context("hello");
+            session.set_context("hello", false);
             let outcome = session.handle(&ALLOW, classify(ch), &ch.to_string());
             assert!(outcome.handled, "{ch}");
             assert_eq!(inserted(&outcome), [ch.to_string()], "{ch}");
@@ -845,7 +846,7 @@ mod tests {
     fn 文脈が無いか日本語で終わるときは記号を今までどおり全角にする() {
         for context in ["", "   ", "今日は", "hello。"] {
             let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-            session.set_context(context);
+            session.set_context(context, false);
             let outcome = session.handle(&ALLOW, classify('!'), "!");
             assert!(inserted(&outcome).is_empty(), "{context:?}");
             assert_eq!(session.marked_text(), "！", "{context:?}");
@@ -856,7 +857,7 @@ mod tests {
     fn 直前が_ascii_でも_括弧とハイフンなどは日本語のまま() {
         for (ch, want) in [('[', "「"), (']', "」"), ('-', "ー"), ('/', "・"), ('~', "〜")] {
             let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-            session.set_context("hello");
+            session.set_context("hello", false);
             session.handle(&ALLOW, classify(ch), &ch.to_string());
             assert_eq!(session.marked_text(), want, "{ch}");
         }
@@ -865,7 +866,7 @@ mod tests {
     #[test]
     fn 組成の途中の記号は文脈に関わらず今までどおり() {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
-        session.set_context("hello");
+        session.set_context("hello", false);
         session.handle(&ALLOW, classify('a'), "a");
         session.handle(&ALLOW, classify('!'), "!");
         assert_eq!(session.marked_text(), "あ！");
@@ -885,7 +886,7 @@ mod tests {
     fn lt_の直後のハイフンは長音にしない() {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         session.handle(&ALLOW, classify('<'), "<");
-        session.set_context("<");
+        session.set_context("<", false);
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert_eq!(inserted(&outcome), ["-"]);
         assert_eq!(session.marked_text(), "");
@@ -896,7 +897,7 @@ mod tests {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
         session.handle(&ALLOW, classify('<'), "<");
         session.forget_last_key();
-        session.set_context("<");
+        session.set_context("<", false);
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert!(inserted(&outcome).is_empty());
         assert_eq!(session.marked_text(), "ー");

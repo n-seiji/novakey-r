@@ -257,11 +257,22 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.bundle_id(client).filter(|_| allowed).map(str::to_string)
     }
 
-    /// このアプリで直前に打った文字列 (覚えていなければ空)。
-    fn context(&self, client: Option<&C>) -> String {
-        self.context_app(client).map_or_else(String::new, |app| {
-            crate::context::with(|store| store.get(&app, std::time::Instant::now()).to_string())
+    /// このアプリで直前に打った文字列 (覚えていなければ空)と、英語を打つアプリか。同じ `context_app` の門を 1 回だけ通る。
+    fn context_state(&self, client: Option<&C>) -> (String, bool) {
+        self.context_app(client).map_or_else(Default::default, |app| {
+            let now = std::time::Instant::now();
+            crate::context::with(|store| (store.get(&app, now).to_string(), store.is_english_app(&app, now)))
         })
+    }
+
+    #[cfg(test)]
+    fn context(&self, client: Option<&C>) -> String {
+        self.context_state(client).0
+    }
+
+    #[cfg(test)]
+    fn english_app(&self, client: Option<&C>) -> bool {
+        self.context_state(client).1
     }
 
     /// アプリに入った文字列を文脈に足す。
@@ -285,11 +296,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
         let gates = self.gates(Some(client));
-        let context = self.context(Some(client));
+        let (context, english_app) = self.context_state(Some(client));
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
         let outcome = {
             let mut session = self.session.borrow_mut();
-            session.set_context(&context);
+            session.set_context(&context, english_app);
             session.handle(&gates, key, text)
         };
         let Outcome { handled, action, phase, effects } = outcome;
@@ -297,17 +308,23 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         match action {
             None => self.env.trace(
                 "handleEvent",
-                &format!("id={} mode={:?} key={} phase={phase:?} action=Romaji handled={handled}", self.id, self.mode(), key.name()),
+                &format!("id={} mode={:?} key={} phase={phase:?} action=Romaji handled={handled} english_app={}",
+                    self.id,
+                    self.mode(),
+                    key.name(),
+                    u8::from(english_app)
+                ),
             ),
             Some(action) => self.env.trace(
                 "handleEvent",
                 &format!(
-                    "id={} mode={:?} key={} phase={phase:?} action={} handled={handled} now={:?}",
+                    "id={} mode={:?} key={} phase={phase:?} action={} handled={handled} now={:?} english_app={}",
                     self.id,
                     self.mode(),
                     key.name(),
                     action.name(),
-                    self.phase()
+                    self.phase(),
+                    u8::from(english_app)
                 ),
             ),
         }
@@ -1112,5 +1129,121 @@ mod tests {
         assert_eq!(context_of("app.one"), "Hello\n");
         assert!(press(&f, Key::Punct, "!"));
         assert_eq!(f.1.marked(), "！");
+    }
+
+    fn commit_hello(f: &Fixture) {
+        assert!(press(f, Key::Letter { upper: true }, "H"));
+        type_letters(f, "ello");
+        assert!(press(f, Key::Enter, "\r"));
+    }
+
+    fn english_app_of(app: &str) -> bool {
+        crate::context::with(|store| store.is_english_app(app, std::time::Instant::now()))
+    }
+
+    #[test]
+    fn 英語を確定し続けたアプリは英語のアプリになり_日本語が混ざると外れる() {
+        let f = fixture();
+        f.1.set_bundle("app.eng");
+        for _ in 0..12 {
+            commit_hello(&f);
+        }
+        assert!(english_app_of("app.eng"));
+        assert!(f.0.english_app(Some(&f.1)));
+        assert!(!english_app_of("app.other"));
+        for _ in 0..12 {
+            type_letters(&f, "a");
+            assert!(press(&f, Key::Enter, "\r"));
+        }
+        assert!(!english_app_of("app.eng"), "日本語が 25% を超えた");
+    }
+
+    #[test]
+    fn 英語の票はセキュア入力とパスワード管理アプリでは数えない() {
+        let (c, client, _panel, env) = rec_fixture();
+        client.set_bundle(Some("app.vote"));
+        env.secure.set(true);
+        for _ in 0..12 {
+            assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
+        }
+        env.secure.set(false);
+        assert!(!english_app_of("app.vote"));
+        assert!(!c.english_app(Some(&client)));
+        client.set_bundle(Some("com.1password.1password"));
+        for _ in 0..12 {
+            rec_press(&c, &client, Key::Letter { upper: false }, "a");
+        }
+        assert!(!english_app_of("com.1password.1password"));
+    }
+
+    #[test]
+    fn 直接入れた英字は一回ごとに一票() {
+        let f = fixture();
+        f.1.set_bundle("app.pass");
+        for _ in 0..11 {
+            assert!(press(&f, Key::Symbol, "x"));
+        }
+        assert!(!english_app_of("app.pass"), "11 回では足りない");
+        assert!(press(&f, Key::Symbol, "x"));
+        assert!(english_app_of("app.pass"), "12 回で英語のアプリ");
+    }
+
+    /// Space モードで `the` を打ち、候補を送って英字 (`the`) のところで確定する。記憶は fake なので本物の学習データに触れない。
+    fn pick_raw_the(c: &FakeDepsController, client: &RecClient) {
+        rec_type(c, client, "the");
+        for _ in 0..16 {
+            rec_press(c, client, Key::Space, " ");
+            if *client.marked.borrow() == "the" {
+                break;
+            }
+        }
+        assert_eq!(*client.marked.borrow(), "the");
+        assert!(rec_press(c, client, Key::Enter, "\r"));
+        assert_eq!(c.phase(), Phase::Empty);
+    }
+
+    #[test]
+    fn space_モードで英字の候補を選ぶと一回につき一票() {
+        let env = RecEnv::default();
+        let client = RecClient::default();
+        client.set_bundle(Some("app.pick"));
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "the");
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let composer = Composer::new(RustEngine::with_core(core), lexicon.clone());
+        let session = Session::new(composer, lexicon.memory(), ConversionMode::Space);
+        let c = Controller::new(1, session, HookPanel::default(), env);
+        for _ in 0..11 {
+            pick_raw_the(&c, &client);
+        }
+        assert!(!english_app_of("app.pick"), "11 回では足りない");
+        pick_raw_the(&c, &client);
+        assert!(english_app_of("app.pick"));
+    }
+
+    #[test]
+    fn ライブ変換の確定は一回につき一票() {
+        let f = fixture();
+        f.1.set_bundle("app.live");
+        f.0.env.set_live_conversion(true);
+        for _ in 0..11 {
+            type_letters(&f, "a");
+            assert!(press(&f, Key::Enter, "\r"));
+        }
+        assert_eq!(f.0.mode(), ConversionMode::Live);
+        // 日本語の票が 11 回で、英語の票はまだ無い。
+        assert!(!english_app_of("app.live"));
+        for _ in 0..40 {
+            commit_hello(&f);
+        }
+        assert!(english_app_of("app.live"));
+        for _ in 0..8 {
+            type_letters(&f, "a");
+            assert!(press(&f, Key::Enter, "\r"));
+        }
+        // 窓 32 票のうち日本語 8 票 (25%) までは英語のアプリ。
+        assert!(english_app_of("app.live"), "ライブの確定が 1 回 1 票なら 24 英 + 8 日本");
+        type_letters(&f, "a");
+        assert!(press(&f, Key::Enter, "\r"));
+        assert!(!english_app_of("app.live"), "9 票目の日本語で外れる");
     }
 }

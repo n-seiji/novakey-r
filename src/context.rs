@@ -12,10 +12,49 @@ const MAX_CHARS: usize = 100;
 /// 最後の入力からこれだけ経つと、別の作業と見て文脈を捨てる。`Instant` なので、スリープの間は数えない (起動中の 12 時間)。
 const STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// 英語のアプリかを決める投票の窓 (直近の確定の数)。
+const WINDOW: u32 = 32;
+/// 窓にこれだけ溜まるまでは英語のアプリと見ない。
+const MIN_VOTES: u32 = 12;
+
 struct Entry {
     app: String,
     text: String,
     last: Instant,
+    /// 直近の投票。最新が bit 0 で、1 が英語。数えるのは下位 `len` ビットだけ。文字は持たない。
+    votes: u32,
+    /// 溜まった投票の数 (`WINDOW` まで)。
+    len: u8,
+}
+
+/// 仮名・漢字・カタカナ (半角を含む) か。
+fn is_japanese(c: char) -> bool {
+    matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{FF66}'..='\u{FF9F}')
+}
+
+/// 1 回の入力が英語の票 (Some(true))・日本語の票 (Some(false))・票なし (None) のどれか。
+/// 仮名・漢字を 1 つでも含めば日本語 (`lineに` のような混在も)、なければ ASCII の英字を含めば英語。数字・記号・空白・改行だけなら票なし。
+fn vote_of(text: &str) -> Option<bool> {
+    if text.chars().any(is_japanese) {
+        Some(false)
+    } else if text.chars().any(|c| c.is_ascii_alphabetic()) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+impl Entry {
+    fn push_vote(&mut self, english: bool) {
+        self.votes = (self.votes << 1) | u32::from(english);
+        self.len = (u32::from(self.len) + 1).min(WINDOW) as u8;
+    }
+
+    fn is_english(&self) -> bool {
+        let len = u32::from(self.len);
+        let mask = if len >= WINDOW { u32::MAX } else { (1u32 << len) - 1 };
+        len >= MIN_VOTES && (self.votes & mask).count_ones() * 4 >= len * 3
+    }
 }
 
 /// アプリの bundle id ごとの文脈。先頭が最も古く、末尾が最近使ったもの。
@@ -32,10 +71,15 @@ impl ContextStore {
         }
         let mut entry = match self.entries.iter().position(|e| e.app == app) {
             Some(i) => self.entries.remove(i),
-            None => Entry { app: app.to_string(), text: String::new(), last: now },
+            None => Entry { app: app.to_string(), text: String::new(), last: now, votes: 0, len: 0 },
         };
         if now.saturating_duration_since(entry.last) >= STALE_AFTER {
             entry.text.clear();
+            entry.votes = 0;
+            entry.len = 0;
+        }
+        if let Some(english) = vote_of(text) {
+            entry.push_vote(english);
         }
         entry.text.push_str(text);
         let extra = entry.text.chars().count().saturating_sub(MAX_CHARS);
@@ -56,6 +100,11 @@ impl ContextStore {
             .iter()
             .find(|e| e.app == app && now.saturating_duration_since(e.last) < STALE_AFTER)
             .map_or("", |e| e.text.as_str())
+    }
+
+    /// `app` が英語を打つアプリか (直近 32 回の確定の 75% 以上が英語で、12 回以上溜まっているとき)。知らない・12 時間たったアプリは false。
+    pub fn is_english_app(&self, app: &str, now: Instant) -> bool {
+        self.entries.iter().find(|e| e.app == app && now.saturating_duration_since(e.last) < STALE_AFTER).is_some_and(Entry::is_english)
     }
 
     /// 後ろの 1 文字を取り除く (素通しの Backspace)。
@@ -94,6 +143,11 @@ fn current_line(context: &str) -> &str {
 /// true なら、半角で書いている最中と見て `! ? ( ) { } . , : ;` を半角のまま入れる。
 pub fn ends_ascii(context: &str) -> bool {
     current_line(context).trim_end().chars().next_back().is_some_and(|c| c.is_ascii() && !c.is_ascii_control())
+}
+
+/// 文脈の今の行が空白だけか (行の頭、またはインデントだけ)。
+pub fn at_line_start(context: &str) -> bool {
+    current_line(context).trim().is_empty()
 }
 
 #[cfg(test)]
@@ -186,5 +240,90 @@ mod tests {
         assert!(!ends_ascii("hello\n今日は"));
         assert!(ends_ascii("今日は\nhello"));
         assert!(ends_ascii("今日は\nhello \n\nworld"));
+    }
+
+    #[test]
+    fn 行の頭かインデントだけのときだけ行頭と見る() {
+        for c in ["", "x\n", "x\n  ", "\n\t"] {
+            assert!(at_line_start(c), "{c:?}");
+        }
+        for c in ["これは", "hello", "x\n  y"] {
+            assert!(!at_line_start(c), "{c:?}");
+        }
+    }
+
+    fn votes(s: &mut ContextStore, t: Instant, english: usize, japanese: usize) {
+        for _ in 0..english {
+            s.record("a", "word ", t);
+        }
+        for _ in 0..japanese {
+            s.record("a", "ことば", t);
+        }
+    }
+
+    #[test]
+    fn 票の分類は仮名漢字があれば日本語_なければ英字で英語_それ以外は票なし() {
+        for (text, want) in [
+            ("fix ", Some(true)),
+            ("PR", Some(true)),
+            ("v1.2", Some(true)),
+            ("あ", Some(false)),
+            ("漢字", Some(false)),
+            ("カタカナ", Some(false)),
+            ("ｶﾀｶﾅ", Some(false)),
+            ("lineに", Some(false)),
+            ("artifactを", Some(false)),
+            ("123", None),
+            ("@", None),
+            (" ", None),
+            ("\n", None),
+            ("ＡＢＣ", None),
+            ("😀", None),
+        ] {
+            assert_eq!(vote_of(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn 窓の中の英語が七割五分以上で十二票以上のとき英語のアプリ() {
+        let t = Instant::now();
+        let mut s = ContextStore::default();
+        votes(&mut s, t, 11, 0);
+        assert!(!s.is_english_app("a", t), "11 票は信用しない");
+        votes(&mut s, t, 1, 0);
+        assert!(s.is_english_app("a", t));
+        let mut s = ContextStore::default();
+        votes(&mut s, t, 24, 8);
+        assert!(s.is_english_app("a", t));
+        let mut s = ContextStore::default();
+        votes(&mut s, t, 23, 9);
+        assert!(!s.is_english_app("a", t));
+        let mut s = ContextStore::default();
+        votes(&mut s, t, 32, 32);
+        assert!(!s.is_english_app("a", t), "古い英語は窓から出る");
+        assert!(!s.is_english_app("b", t), "知らないアプリ");
+    }
+
+    #[test]
+    fn 票なしの入力は数えず_十二時間で票も消え_追い出しと全消去でも消える() {
+        let t = Instant::now();
+        let mut s = ContextStore::default();
+        votes(&mut s, t, 12, 0);
+        s.record("a", "123 \n", t);
+        assert!(s.is_english_app("a", t));
+        assert_eq!(s.entries[0].len, 12);
+        s.pop("a");
+        assert!(s.is_english_app("a", t), "pop は票に触れない");
+        assert!(!s.is_english_app("a", t + STALE_AFTER), "12 時間たつと使わない");
+        s.record("a", "word", t + STALE_AFTER);
+        assert_eq!(s.entries[0].len, 1, "古い票は捨てて数え直す");
+        votes(&mut s, t, 12, 0);
+        for i in 0..10 {
+            s.record(&format!("app{i}"), "x", t);
+        }
+        assert!(!s.is_english_app("a", t), "追い出されると票も消える");
+        votes(&mut s, t, 12, 0);
+        s.clear_all();
+        assert!(!s.is_english_app("a", t));
     }
 }
