@@ -246,7 +246,7 @@ fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
 }
 
 /// 先頭の後ろに、`rest` のうち読み全体を覆う候補 (語の読みをつないだものが `katakana` と一致) を engine の順で足す。
-/// 表示が先頭や互いに重なるもの、ASCII 以外の文字を含まない (絵文字・記号・英字だけの) ものは捨て、全体で `MAX_SHOWN` まで。先頭の一部だけを覆う候補は足さない (確定で残りの読みが消えるため)。審判にはかけない。
+/// 表示が先頭や互いに重なるもの、ASCII だけのものは捨て、全体で `MAX_SHOWN` まで。先頭の一部だけを覆う候補は足さない (確定で残りの読みが消えるため)。審判にはかけない。
 fn append_tail(top: &mut Vec<result::Cand>, rest: &[result::Cand], katakana: &str) {
     let mut seen: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
     for cand in rest {
@@ -254,9 +254,9 @@ fn append_tail(top: &mut Vec<result::Cand>, rest: &[result::Cand], katakana: &st
             break;
         }
         let covers_all = cand.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana;
-        // 絵文字・記号だけ、または ASCII だけ (server など) の候補は足さない。composer が emoji.tsv / loanwords.tsv から決まった位置に入れるので、
-        // 辞書側に同じ表記が先に居ると重複扱いで入らず、位置がずれる。
-        let has_letter = cand.text.chars().any(|c| c.is_alphanumeric() && !c.is_ascii());
+        // ASCII だけ (server, VAN, @hotmail.com など) の候補は足さない。英単語は composer が loanwords.tsv から入れる。記号・絵文字は足す
+        // (composer が emoji.tsv の絵文字を入れるときは、この後ろの複製を消して決まった位置に入れる)。
+        let has_letter = !cand.text.is_ascii();
         if covers_all && has_letter && seen.insert(cand.text.replace('\u{1F}', "")) {
             top.push(cand.clone());
         }

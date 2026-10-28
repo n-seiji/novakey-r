@@ -100,7 +100,7 @@ kyou<space><space><esc><enter>	きょう
 kyou<space><esc><esc><enter>	\n
 kyou<esc><enter>	\n
 kyou<esc><esc>
-kyou<space><S-space><S-space><enter>	香
+kyou<space><S-space><enter>	kyou
 kyou<S-space><enter>	強
 <S-space>	 
 <space>	 

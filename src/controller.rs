@@ -831,6 +831,13 @@ mod tests {
         assert!(rec_press(&c, &client, Key::Digit(3), "3"));
         assert!(matches!(c.phase(), Phase::Converting { selected: 2, window: true }));
         assert!(!engine_learned(&core));
+        // #1 まで戻れば、パネルは最上段なので数字が効く。
+        rec_press(&c, &client, Key::Up, "");
+        rec_press(&c, &client, Key::Up, "");
+        assert!(matches!(c.phase(), Phase::Converting { selected: 0, .. }));
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert_eq!(c.phase(), Phase::Empty);
+        assert!(engine_learned(&core));
     }
 
     fn english_commit_is_remembered(secure: bool) -> bool {

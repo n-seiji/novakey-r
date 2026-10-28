@@ -155,8 +155,8 @@ struct Selection {
     cursor: usize,
     /// 候補ウィンドウを出している間 true。
     window: bool,
-    /// カーソルが一度でも 1 ページ目 (数字キーで選べる先頭 9 件) の外へ出たら true。パネルがスクロールして
-    /// 行の見え方が分からなくなるので、以後は数字キーで選ばない。
+    /// カーソルが 1 ページ目 (数字キーで選べる先頭 9 件) の外へ出たら true。パネルがスクロールして行の見え方が分からなくなるので、
+    /// 数字キーで選ばない。先頭 (#1) に戻ればパネルも最上段なので false に戻る。
     scrolled: bool,
 }
 
@@ -1047,7 +1047,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
         s.cursor = (s.cursor + 1) % s.list.len();
         s.window = true;
-        s.scrolled |= s.cursor >= DIGIT_PICKS;
+        s.scrolled = s.cursor != 0 && (s.scrolled || s.cursor >= DIGIT_PICKS);
         true
     }
 
@@ -1058,7 +1058,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         };
         s.cursor = (s.cursor + s.list.len() - 1) % s.list.len();
         s.window = true;
-        s.scrolled |= s.cursor >= DIGIT_PICKS;
+        s.scrolled = s.cursor != 0 && (s.scrolled || s.cursor >= DIGIT_PICKS);
         true
     }
 
@@ -1074,7 +1074,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if let Stage::Selecting(s) = &mut self.stage {
             s.cursor = index;
             s.window = true;
-            s.scrolled |= index >= DIGIT_PICKS;
+            s.scrolled = index != 0 && (s.scrolled || index >= DIGIT_PICKS);
             return true;
         }
         let list = self.candidates().to_vec();
@@ -1168,15 +1168,15 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         }
         let words = self.lexicon.english_for(&translit::to_katakana(&self.hiragana));
+        let position = list.len().min(1);
         let fresh: Vec<Candidate> = words
             .into_iter()
-            .filter(|w| !list.iter().any(|c| &c.text == w))
+            .filter(|w| !Self::claim_slot(list, w, position))
             .map(|text| Candidate {
                 text,
                 source: Source::Loanword,
             })
             .collect();
-        let position = list.len().min(1);
         list.splice(position..position, fresh);
     }
 
@@ -1187,7 +1187,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         }
         let fresh: Vec<Candidate> = self.lexicon.emoji_for(&self.hiragana)
             .into_iter()
-            .filter(|e| !list.iter().any(|c| &c.text == e))
+            .filter(|e| !Self::claim_slot(list, e, Self::emoji_position(list)))
             .take(EMOJI_LIMIT)
             .map(|text| Candidate {
                 text,
@@ -1199,10 +1199,30 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 絵文字を、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
     fn place_emoji(list: &mut Vec<Candidate>, emoji: Vec<Candidate>) {
+        let position = Self::emoji_position(list);
+        list.splice(position..position, emoji);
+    }
+
+    fn emoji_position(list: &[Candidate]) -> usize {
         let engine = list.iter().filter(|c| c.engine_rank().is_some()).count();
         let extras = list.len() - engine;
-        let position = (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(list.len());
-        list.splice(position..position, emoji);
+        (extras + engine.min(EMOJI_AFTER_ENGINE)).max(3).min(list.len())
+    }
+
+    /// `text` が `position` より前に既にあれば true (呼び出し側は足さない)。`position` 以降にエンジン候補として居るなら、その複製を消して
+    /// false を返す (呼び出し側が決まった位置に入れる)。消す候補は後ろの重複なので、他の候補の `EngineRank` (学習の添字) は変わらない。
+    fn claim_slot(list: &mut Vec<Candidate>, text: &str, position: usize) -> bool {
+        if list.iter().take(position).any(|c| c.text == text) {
+            return true;
+        }
+        match list.iter().skip(position).position(|c| c.text == text) {
+            Some(i) if list[position + i].engine_rank().is_some() => {
+                list.remove(position + i);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
     }
 
     /// エンジンが候補を 1 つも返さなかったとき (辞書が開けない・未知の読みなど) に、ひらがなとカタカナを候補にする。
@@ -2648,6 +2668,19 @@ mod tests {
             vec!["デスクトップ", "desktop", "デス区トップ", "desukutoppu"]
         );
         assert_eq!(c.candidates()[1].engine_rank(), None);
+    }
+
+    #[test]
+    fn エンジン候補の後ろに同じ英単語があれば複製を消して決まった位置に入れ_他の候補の添字は変わらない() {
+        let mut c = loan_composer("ですくとっぷ", &["デスクトップ", "デス区トップ", "desktop", "デスク取っぷ"]);
+        c.push_input("desukutoppu", "ですくとっぷ", "");
+        c.begin_conversion();
+        let t = texts(&c);
+        assert_eq!(&t[..4], ["デスクトップ", "desktop", "デス区トップ", "デスク取っぷ"]);
+        assert_eq!(t.iter().filter(|x| **x == "desktop").count(), 1);
+        assert_eq!(c.candidates()[1].engine_rank(), None);
+        assert_eq!(c.candidates()[2].engine_rank(), Some(EngineRank(1)));
+        assert_eq!(c.candidates()[3].engine_rank(), Some(EngineRank(3)));
     }
 
     #[test]
