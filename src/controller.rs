@@ -9,6 +9,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
 use crate::composer::{Composer, Phase};
+use crate::context::HostRead;
 use crate::deps::{EnglishMemory, Lexicon, ProdLexicon, ProdMemory};
 use crate::input::Route;
 use crate::keymap::Key;
@@ -21,6 +22,10 @@ pub trait TextClient {
     fn insert(&self, text: &str);
     fn set_marked(&self, text: &str);
     fn bundle_id(&self) -> Option<String>;
+    /// カーソルの前のテキスト (`context::MAX_UTF16` 単位まで、行頭から)。ホストのユーザーのテキストなので、記録も表示もしない。
+    fn text_before_caret(&self) -> HostRead {
+        HostRead::Unsupported
+    }
 }
 
 /// 候補パネル。行番号は問い合わせず、Controller が追跡する。
@@ -80,6 +85,9 @@ pub struct Controller<C, P, E, L: Lexicon = ProdLexicon, M: EnglishMemory = Prod
     /// クライアントの bundle id。コントローラは 1 つのクライアントに付くので、最初に取れたものを使い回す。
     /// 取れなかったときは入れず、次の機会に取り直す。
     bundle_id: OnceCell<String>,
+    /// 入力の開始時にホストアプリから読んだ、カーソル前のテキスト。Some なら (空でも) ホストが答えたもので、
+    /// 入力中はこちらを文脈に使い、覚えている文脈とは足し合わせない。Empty に戻ったら捨てる。メモリ上だけに置く。
+    host_context: RefCell<Option<String>>,
 }
 
 impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: EnglishMemory> Controller<C, P, E, L, M> {
@@ -93,6 +101,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             syncing: Cell::new(false),
             panel_line: Cell::new(0),
             bundle_id: OnceCell::new(),
+            host_context: RefCell::new(None),
         }
     }
 
@@ -138,7 +147,12 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     fn sync_activity(&self) {
         // panic の後始末 (reset_after_panic) からも呼ぶので、借用中なら (状態が分からないので) 触らない。
         if let Ok(session) = self.session.try_borrow() {
-            self.env.set_composing(session.phase() != Phase::Empty);
+            let composing = session.phase() != Phase::Empty;
+            self.env.set_composing(composing);
+            // 未変換のローマ字だけ ("k") の間は Phase が Empty でも入力中なので、文脈を残す。
+            if !session.has_pending() {
+                self.clear_host_context();
+            }
         }
     }
 
@@ -206,6 +220,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.run(effects, client.as_ref());
         // クリックやフォーカスの移動でカーソルが動いたかもしれない。
         self.clear_context(client.as_ref());
+        self.clear_host_context();
         self.sync_activity();
     }
 
@@ -267,11 +282,63 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         }
     }
 
-    /// このアプリで直前に確定した文字列 (覚えていなければ空)。
+    /// 変換の文脈。入力の開始時にホストから読めていればそれ、なければこのアプリで直前に確定した文字列 (覚えていなければ空)。
     fn context(&self, client: Option<&C>) -> String {
         self.context_app(client).map_or_else(String::new, |app| {
+            if let Some(host) = self.host_context.borrow().as_ref() {
+                return host.clone();
+            }
             crate::context::with(|store| store.get(&app, std::time::Instant::now()).to_string())
         })
+    }
+
+    fn clear_host_context(&self) {
+        if let Ok(mut host) = self.host_context.try_borrow_mut() {
+            *host = None;
+        }
+    }
+
+    /// 入力の開始 (未確定の文字が無く、入力を始めるか半角の判断に使うキー) でだけ、ホストのカーソル前のテキストを 1 回読む。
+    /// 覚えている文脈と同じ条件 (`context_app`) でだけ読み、遅い・例外を投げるアプリでは以後読まない。
+    /// 数値と固定の名前だけをトレースする。読んだテキストは記録も表示もしない。
+    fn read_host_context(&self, client: &C) {
+        self.clear_host_context();
+        let Some(app) = self.context_app(Some(client)) else { return };
+        if crate::context::host_read_disabled(&app) {
+            self.env.trace("surrounding", &format!("id={} ms=0.0 src=disabled disabled=1", self.id));
+            return;
+        }
+        let started = std::time::Instant::now();
+        let read = client.text_before_caret();
+        let took = started.elapsed();
+        let reason = match read {
+            HostRead::Failed => Some("exception"),
+            HostRead::Garbage => Some("garbage"),
+            _ => crate::context::note_read_speed(&app, took > crate::context::SLOW_READ).then_some("slow"),
+        };
+        // 直前に足した文字列がホストの答えの末尾に無ければ、ホストがまだ反映していない (非同期のホスト) とみて覚えている方を使う。
+        let lagging = |text: &str| {
+            crate::context::with(|store| {
+                let fresh = store.fresh(&app, std::time::Instant::now(), crate::context::STORE_FRESH);
+                !fresh.is_empty() && !text.ends_with(fresh)
+            })
+        };
+        let source = match read {
+            HostRead::Text(text) if !lagging(&text) => {
+                *self.host_context.borrow_mut() = Some(text);
+                "host"
+            }
+            _ if !self.context(Some(client)).is_empty() => "store",
+            _ => "none",
+        };
+        if let Some(reason) = reason {
+            crate::context::disable_host_read(&app);
+            self.env.log(&format!("host context read disabled for {app}: {reason}"));
+        }
+        self.env.trace(
+            "surrounding",
+            &format!("id={} ms={:.1} src={source} disabled={}", self.id, took.as_secs_f64() * 1000.0, u8::from(reason.is_some())),
+        );
     }
 
     /// アプリに入った文字列を文脈に足す。
@@ -295,6 +362,9 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// session に判断させ、返ってきた Effect を実行する。処理したら true。
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
         let gates = self.gates(Some(client));
+        if matches!(key, Key::Letter { .. } | Key::Punct | Key::Mark | Key::Hyphen) && !self.session.borrow().has_pending() {
+            self.read_host_context(client);
+        }
         let context = self.context(Some(client));
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
         let outcome = {
@@ -337,6 +407,9 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                         client.insert(&text);
                     }
                     self.remember(&text, client);
+                    if let Some(host) = self.host_context.borrow_mut().as_mut() {
+                        crate::context::append_capped(host, &text);
+                    }
                 }
                 Effect::ShowCandidates { selected } => self.show_candidates(selected),
                 Effect::HideCandidates => self.panel.hide(),
@@ -537,9 +610,20 @@ mod tests {
         bundle_calls: Rc<Cell<usize>>,
         marked: Rc<RefCell<String>>,
         inserted: Rc<RefCell<Vec<String>>>,
+        /// (全文, カーソル位置)。None ならホストはカーソル位置を答えない。
+        surrounding: Rc<RefCell<Option<(String, usize)>>>,
+        surrounding_calls: Rc<Cell<usize>>,
+        surrounding_delay: Rc<Cell<std::time::Duration>>,
+        surrounding_raises: Rc<Cell<bool>>,
+        /// 範囲を無視して全文を返す。
+        ignore_range: Rc<RefCell<bool>>,
     }
 
     impl RecClient {
+        fn set_surrounding(&self, text: &str, caret: usize) {
+            *self.surrounding.borrow_mut() = Some((text.to_string(), caret));
+        }
+
         fn set_bundle(&self, id: Option<&str>) {
             *self.bundle.borrow_mut() = id.map(str::to_string);
         }
@@ -556,6 +640,21 @@ mod tests {
         fn bundle_id(&self) -> Option<String> {
             self.bundle_calls.set(self.bundle_calls.get() + 1);
             self.bundle.borrow().clone()
+        }
+        fn text_before_caret(&self) -> HostRead {
+            self.surrounding_calls.set(self.surrounding_calls.get() + 1);
+            std::thread::sleep(self.surrounding_delay.get());
+            if self.surrounding_raises.get() {
+                return HostRead::Failed;
+            }
+            let surrounding = self.surrounding.borrow();
+            let location = surrounding.as_ref().map(|(_, caret)| *caret);
+            crate::context::before_caret(location, |start, len| {
+                let (text, _) = surrounding.as_ref()?;
+                let units: Vec<u16> = text.encode_utf16().collect();
+                let (start, end) = if *self.ignore_range.borrow() { (0, units.len()) } else { (start, (start + len).min(units.len())) };
+                Some(Some(String::from_utf16_lossy(&units[start.min(end)..end])))
+            })
         }
     }
 
@@ -1065,5 +1164,196 @@ mod tests {
         type_hello_and_commit(&f);
         assert!(press(&f, Key::Punct, "["));
         assert_eq!(f.1.marked(), "「");
+    }
+
+    /// ホストが答えるクライアント。アプリ名はテストごとに変える (読み取りの停止はプロセス全体で覚えるため)。
+    fn host_fixture(app: &str, text: &str, caret: usize) -> (Rc<RecController>, RecClient, RecEnv) {
+        let (c, client, _panel, env) = rec_fixture();
+        client.set_bundle(Some(app));
+        client.set_surrounding(text, caret);
+        (c, client, env)
+    }
+
+    fn letter(c: &RecController, client: &RecClient, ch: &str) {
+        assert!(rec_press(c, client, Key::Letter { upper: false }, ch));
+    }
+
+    #[test]
+    fn 入力の開始でホストのカーソル前の行を文脈にする() {
+        let (c, client, _env) = host_fixture("host.line", "今日は\n明日も晴れ", 9);
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "明日も晴れ");
+    }
+
+    #[test]
+    fn 二打鍵目からはホストを読み直さない() {
+        let (c, client, _env) = host_fixture("host.once", "前の文", 3);
+        letter(&c, &client, "k");
+        letter(&c, &client, "y");
+        letter(&c, &client, "o");
+        assert_eq!(client.surrounding_calls.get(), 1);
+        assert!(rec_press(&c, &client, Key::Enter, "\r"));
+        letter(&c, &client, "k");
+        assert_eq!(client.surrounding_calls.get(), 2, "次の入力の開始では読む");
+    }
+
+    #[test]
+    fn 数字と編集キーは入力の開始に数えず_ホストを読まない() {
+        let (c, client, _env) = host_fixture("host.nokey", "前の文", 3);
+        rec_press(&c, &client, Key::Digit(1), "1");
+        rec_press(&c, &client, Key::Enter, "\r");
+        rec_press(&c, &client, Key::Backspace, "\u{7f}");
+        rec_press(&c, &client, Key::Space, " ");
+        assert_eq!(client.surrounding_calls.get(), 0);
+    }
+
+    #[test]
+    fn ホストが答えなければ覚えている文脈を使う() {
+        let (c, client, _env) = host_fixture("host.none", "x", 0);
+        *client.surrounding.borrow_mut() = None; // カーソル位置が NSNotFound
+        crate::context::with(|store| store.record("host.none", "覚えた", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "覚えた");
+    }
+
+    #[test]
+    fn 位置_0_と答えるホストは信用せず覚えている文脈を使う() {
+        let (c, client, _env) = host_fixture("host.zero", "", 0);
+        crate::context::with(|store| store.record("host.zero", "覚えた", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "覚えた");
+    }
+
+    #[test]
+    fn 行頭と答えるホストは古い文脈を空で上書きする() {
+        let (c, client, _env) = host_fixture("host.bol", "前の行\n", 4);
+        crate::context::with(|store| store.record("host.bol", "古い", std::time::Instant::now() - crate::context::STORE_FRESH * 2));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "");
+    }
+
+    #[test]
+    fn 例外を投げるホストは覚えている文脈に戻り_そのアプリでは以後読まない() {
+        let (c, client, _env) = host_fixture("host.raises", "前", 1);
+        client.surrounding_raises.set(true);
+        crate::context::with(|store| store.record("host.raises", "覚えた", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "覚えた");
+        rec_press(&c, &client, Key::Enter, "\r");
+        letter(&c, &client, "k");
+        assert_eq!(client.surrounding_calls.get(), 1);
+    }
+
+    fn finish_and_restart(c: &RecController, client: &RecClient) {
+        rec_press(c, client, Key::Enter, "\r");
+        crate::context::with(|store| store.clear_all());
+        letter(c, client, "k");
+    }
+
+    #[test]
+    fn 遅いホストは三回続けて遅いときだけそのアプリで読み取りを止める() {
+        let (c, client, env) = host_fixture("host.slow", "前の文", 3);
+        client.surrounding_delay.set(crate::context::SLOW_READ + std::time::Duration::from_millis(10));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "前の文", "遅くても今回の答えは使う");
+        finish_and_restart(&c, &client);
+        finish_and_restart(&c, &client);
+        assert_eq!(client.surrounding_calls.get(), 3);
+        assert!(env.logs.borrow().iter().any(|l| l.contains("host.slow") && l.contains("slow")));
+        assert!(!env.logs.borrow().iter().any(|l| l.contains("前の文")), "ログにテキストを書かない");
+        finish_and_restart(&c, &client);
+        assert_eq!(client.surrounding_calls.get(), 3, "止めたあとは読まない");
+    }
+
+    #[test]
+    fn 速い読み取りが挟まれば遅い回数は数え直す() {
+        let (c, client, _env) = host_fixture("host.sometimes.slow", "前の文", 3);
+        let slow = crate::context::SLOW_READ + std::time::Duration::from_millis(10);
+        for delay in [slow, slow, std::time::Duration::ZERO, slow, slow] {
+            client.surrounding_delay.set(delay);
+            finish_and_restart(&c, &client);
+        }
+        assert_eq!(client.surrounding_calls.get(), 5);
+    }
+
+    #[test]
+    fn 範囲を無視して全文を返すホストは使わず_そのアプリでは以後読まない() {
+        let (c, client, _env) = host_fixture("host.garbage", "ab", 1);
+        // 全文を返すホスト: 要求の長さより長く返す
+        let long = "あ".repeat(300);
+        client.set_surrounding(&long, 250);
+        *client.ignore_range.borrow_mut() = true;
+        crate::context::with(|store| store.record("host.garbage", "覚えた", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "覚えた");
+        finish_and_restart(&c, &client);
+        assert_eq!(client.surrounding_calls.get(), 1);
+    }
+
+    #[test]
+    fn 直前に足した文字列がホストの答えに無ければ覚えている方を使う() {
+        let (c, client, _env) = host_fixture("host.lag", "古い", 2);
+        crate::context::with(|store| store.record("host.lag", "いま確定した", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "いま確定した");
+        // ホストが追いついていれば、ホストの答えを使う
+        let (c, client, _env) = host_fixture("host.caught.up", "古いいま確定した", 8);
+        crate::context::with(|store| store.record("host.caught.up", "いま確定した", std::time::Instant::now()));
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "古いいま確定した");
+    }
+
+    #[test]
+    fn commit_composition_のあとはホストの文脈を使わない() {
+        let (c, client, _env) = host_fixture("host.commit", "前の文", 3);
+        letter(&c, &client, "k");
+        assert_eq!(c.context(Some(&client)), "前の文");
+        c.on_commit_composition(Some(client.clone()));
+        *client.surrounding.borrow_mut() = None;
+        crate::context::with(|store| store.clear_all());
+        assert_eq!(c.context(Some(&client)), "", "古いホストの文脈は残らない");
+    }
+
+    #[test]
+    fn markup_だけの行頭ではホストが半角でも記号は全角のまま() {
+        let (c, client, _env) = host_fixture("host.markup", "- ", 2);
+        assert!(rec_press(&c, &client, Key::Mark, "("));
+        assert_eq!(*client.marked.borrow(), "（");
+        assert!(client.inserted.borrow().is_empty());
+    }
+
+    #[test]
+    fn セキュア入力とパスワード管理アプリではホストを読まない() {
+        let (c, client, env) = host_fixture("host.secure", "秘密", 2);
+        env.secure.set(true);
+        rec_press(&c, &client, Key::Letter { upper: false }, "k");
+        env.secure.set(false);
+        let (c2, client2, _env) = host_fixture("com.1password.1password", "秘密", 2);
+        rec_press(&c2, &client2, Key::Letter { upper: false }, "k");
+        assert_eq!(client.surrounding_calls.get() + client2.surrounding_calls.get(), 0);
+        assert_eq!(c.context(Some(&client)), "");
+    }
+
+    #[test]
+    fn ホストの文脈が半角なら先頭の記号を半角のまま入れる() {
+        let (c, client, _env) = host_fixture("host.ascii", "hello", 5);
+        assert!(rec_press(&c, &client, Key::Punct, "!"));
+        assert_eq!(*client.inserted.borrow(), ["!"]);
+        let (c, client, _env) = host_fixture("host.japanese", "今日は", 3);
+        assert!(rec_press(&c, &client, Key::Punct, "!"));
+        assert_eq!(*client.marked.borrow(), "！");
+    }
+
+    #[test]
+    fn 確定して続けて入力を始めると_次の打鍵の文脈に確定した文字列が入る() {
+        let (c, client, _env) = host_fixture("host.restart", "前", 1);
+        for ch in ["k", "y", "o", "u"] {
+            letter(&c, &client, ch);
+        }
+        assert!(rec_press(&c, &client, Key::Space, " "));
+        letter(&c, &client, "a"); // 変換中の英字: 確定して新しい入力を始める
+        let committed = client.inserted.borrow().concat();
+        assert!(!committed.is_empty());
+        assert_eq!(c.context(Some(&client)), format!("前{committed}"));
     }
 }

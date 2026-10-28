@@ -5,6 +5,7 @@ use objc2::runtime::AnyObject;
 use objc2::sel;
 use objc2_foundation::{NSNotFound, NSRange, NSString};
 
+use crate::context::{before_caret, HostRead};
 use crate::controller::TextClient;
 use crate::platform::{catch_objc, lossy_string, send};
 
@@ -49,9 +50,35 @@ impl TextClient for Client {
         let id: Option<Id<NSString>> = unsafe { Id::retain(id.cast()) };
         id.map(|s| lossy_string(&s))
     }
+
+    fn text_before_caret(&self) -> HostRead {
+        let action = sel!(selectedRange);
+        // SAFETY: IMKTextInput の selectedRange は NSRange (16 バイトの構造体) を返す。
+        let Some(range) = catch_objc(|s| unsafe { send!(s, &*self.0, action; () -> NSRange) }) else {
+            return HostRead::Failed;
+        };
+        let location = (range.location != NOT_FOUND).then_some(range.location);
+        before_caret(location, |start, len| self.substring(start, len))
+    }
 }
 
 impl Client {
+    /// `[start, start + len)` の文字列。呼び出しの失敗は `None`、nil は `Some(None)`。
+    fn substring(&self, start: usize, len: usize) -> Option<Option<String>> {
+        let range = NSRange { location: start, length: len };
+        let action = sel!(attributedSubstringFromRange:);
+        // SAFETY: IMKTextInput の attributedSubstringFromRange: は NSRange を取り NSAttributedString (nil 可) を返す。
+        let attributed = catch_objc(|s| unsafe { send!(s, &*self.0, action; (range => NSRange) -> *mut AnyObject) })?;
+        // SAFETY: 戻り値は NSAttributedString か nil。+0 の戻り値を retain して所有する。
+        let Some(attributed) = (unsafe { Id::retain(attributed) }) else { return Some(None) };
+        let action = sel!(string);
+        // SAFETY: NSAttributedString の string は NSString を返す。
+        let string = catch_objc(|s| unsafe { send!(s, &*attributed, action; () -> *mut AnyObject) })?;
+        // SAFETY: string は NSString (nil 可)。+0 の戻り値を retain して所有する。
+        let string: Option<Id<NSString>> = unsafe { Id::retain(string.cast()) };
+        Some(string.map(|s| lossy_string(&s)))
+    }
+
     pub fn new(client: &AnyObject) -> Self {
         let ptr = client as *const AnyObject as *mut AnyObject;
         // SAFETY: ptr は有効な参照から作ったので非 null で生存している。retain して所有権を得る。
@@ -83,6 +110,10 @@ mod tests {
     struct FakeState {
         calls: RefCell<Vec<Call>>,
         bundle: Option<&'static str>,
+        /// (全文, カーソル位置)。要求された範囲の部分文字列を返す。
+        document: Option<(&'static str, usize)>,
+        /// attributedSubstringFromRange: が nil を返す。
+        nil_substring: bool,
     }
 
     impl FakeState {
@@ -90,6 +121,8 @@ mod tests {
             Self {
                 calls: RefCell::new(Vec::new()),
                 bundle: None,
+                document: None,
+                nil_substring: false,
             }
         }
     }
@@ -122,6 +155,27 @@ mod tests {
                     (replacement.location, replacement.length),
                 );
                 self.ivars().calls.borrow_mut().push(call);
+            }
+
+            #[method(selectedRange)]
+            fn selected_range(&self) -> NSRange {
+                match self.ivars().document {
+                    Some((_, caret)) => NSRange { location: caret, length: 0 },
+                    None => NSRange { location: NOT_FOUND, length: 0 },
+                }
+            }
+
+            #[method_id(attributedSubstringFromRange:)]
+            fn attributed_substring(&self, range: NSRange) -> Option<Id<AnyObject>> {
+                self.ivars().document.filter(|_| !self.ivars().nil_substring).map(|(text, _)| {
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    let end = (range.location + range.length).min(units.len());
+                    let part = String::from_utf16_lossy(&units[range.location.min(end)..end]);
+                    // SAFETY: NSAttributedString の alloc + initWithString: (NSString を取る)。
+                    unsafe {
+                        msg_send_id![msg_send_id![objc2::class!(NSAttributedString), alloc], initWithString: &*NSString::from_str(&part)]
+                    }
+                })
             }
 
             #[method_id(bundleIdentifier)]
@@ -177,10 +231,34 @@ mod tests {
         assert_eq!(client.bundle_id(), None);
     }
 
+    #[test]
+    fn text_before_caret_reads_the_text_before_the_caret_through_the_host() {
+        let (_fake, client) = make_fake(FakeState { document: Some(("今日は\n明日も晴れ", 9)), ..FakeState::new() });
+        assert_eq!(client.text_before_caret(), HostRead::Text("明日も晴れ".to_string()));
+    }
+
+    #[test]
+    fn text_before_caret_is_unsupported_without_a_selection() {
+        let (_fake, client) = make_fake(FakeState::new());
+        assert_eq!(client.text_before_caret(), HostRead::Unsupported);
+    }
+
+    #[test]
+    fn text_before_caret_fails_when_the_host_raises() {
+        assert_eq!(raising().text_before_caret(), HostRead::Failed);
+    }
+
+    #[test]
+    fn text_before_caret_is_unsupported_when_the_host_returns_nil() {
+        let (_fake, client) = make_fake(FakeState { document: Some(("abc", 3)), nil_substring: true, ..FakeState::new() });
+        assert_eq!(client.text_before_caret(), HostRead::Unsupported);
+    }
+
     use std::mem;
 
     type InsertFn = extern "C-unwind" fn(*mut AnyObject, Sel, *const NSString, NSRange);
     type SetMarkedFn = extern "C-unwind" fn(*mut AnyObject, Sel, *const NSString, NSRange, NSRange);
+    type SelectedRangeFn = extern "C-unwind" fn(*mut AnyObject, Sel) -> NSRange;
     type BundleFn = extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject;
 
     fn raise() -> ! {
@@ -211,6 +289,9 @@ mod tests {
     extern "C-unwind" fn raise_bundle(_: *mut AnyObject, _: Sel) -> *mut AnyObject {
         raise()
     }
+    extern "C-unwind" fn raise_selected_range(_: *mut AnyObject, _: Sel) -> NSRange {
+        raise()
+    }
 
     /// 全メソッドが NSException を投げるクライアント。Rust で宣言したメソッドは extern "C" で巻き戻せず abort するので、
     /// C-unwind の IMP を直接登録する。
@@ -233,6 +314,10 @@ mod tests {
                     ),
                 );
                 builder.add_method(
+                    sel!(selectedRange),
+                    mem::transmute::<SelectedRangeFn, extern "C" fn(*mut AnyObject, Sel) -> NSRange>(raise_selected_range),
+                );
+                builder.add_method(
                     sel!(bundleIdentifier),
                     mem::transmute::<BundleFn, extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject>(raise_bundle),
                 );
@@ -242,6 +327,54 @@ mod tests {
         // SAFETY: 登録済みクラスの new は引数なしで新しいインスタンスを返す。
         let object: Id<AnyObject> = unsafe { msg_send_id![*class, new] };
         Client::new(&object)
+    }
+
+    extern "C-unwind" fn range_5(_: *mut AnyObject, _: Sel) -> NSRange {
+        NSRange { location: 5, length: 0 }
+    }
+    extern "C-unwind" fn raise_substring(_: *mut AnyObject, _: Sel, _: NSRange) -> *mut AnyObject {
+        raise()
+    }
+    extern "C-unwind" fn string_object(this: *mut AnyObject, _: Sel, _: NSRange) -> *mut AnyObject {
+        // 戻り値は +0 で足りる (受け手が retain する) ので、この物自身を返す。string を投げるクラスのインスタンス。
+        this
+    }
+
+    /// selectedRange は {5,0}。attributedSubstringFromRange: / string のどちらかが例外を投げる。
+    fn raising_in(name: &'static str, substring_raises: bool) -> Client {
+        type SubstringFn = extern "C-unwind" fn(*mut AnyObject, Sel, NSRange) -> *mut AnyObject;
+        type StringFn = extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject;
+        let mut builder = ClassBuilder::new(name, NSObject::class()).expect("クラス名が未登録");
+        // SAFETY: 各 IMP の型は対応するメソッドの型に一致する (C-unwind を "C" に読み替える理由は `raising` と同じ)。
+        unsafe {
+            builder.add_method(
+                sel!(selectedRange),
+                mem::transmute::<SelectedRangeFn, extern "C" fn(*mut AnyObject, Sel) -> NSRange>(range_5),
+            );
+            let substring: SubstringFn = if substring_raises { raise_substring } else { string_object };
+            builder.add_method(
+                sel!(attributedSubstringFromRange:),
+                mem::transmute::<SubstringFn, extern "C" fn(*mut AnyObject, Sel, NSRange) -> *mut AnyObject>(substring),
+            );
+            builder.add_method(
+                sel!(string),
+                mem::transmute::<StringFn, extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject>(raise_bundle),
+            );
+        }
+        let class = builder.register();
+        // SAFETY: 登録済みクラスの new は引数なしで新しいインスタンスを返す。
+        let object: Id<AnyObject> = unsafe { msg_send_id![class, new] };
+        Client::new(&object)
+    }
+
+    #[test]
+    fn text_before_caret_fails_when_the_substring_call_raises() {
+        assert_eq!(raising_in("ShizukuRaisingSubstring", true).text_before_caret(), HostRead::Failed);
+    }
+
+    #[test]
+    fn text_before_caret_fails_when_string_raises() {
+        assert_eq!(raising_in("ShizukuRaisingString", false).text_before_caret(), HostRead::Failed);
     }
 
     #[test]
