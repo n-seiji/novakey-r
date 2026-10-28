@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 const MAX_APPS: usize = 10;
 /// 1 アプリで覚える文字数 (後ろから残す)。文字で持つのはこの量で、審判が使うのは後ろの `judge::CONTEXT_TOKENS` (32 トークン) だけ。
 const MAX_CHARS: usize = 100;
-/// 最後の入力からこれだけ経つと、別の作業と見て文脈を捨てる。`Instant` なので、スリープの間は数えない (起動中の 2 日)。
-const STALE_AFTER: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+/// 最後の入力からこれだけ経つと、別の作業と見て文脈を捨てる。`Instant` なので、スリープの間は数えない (起動中の 12 時間)。
+const STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 struct Entry {
     app: String,
@@ -50,7 +50,7 @@ impl ContextStore {
         self.entries.push(entry);
     }
 
-    /// `app` の文脈。2 日 (起動中) 以上入力が無ければ空。
+    /// `app` の文脈。12 時間 (起動中) 以上入力が無ければ空。
     pub fn get(&self, app: &str, now: Instant) -> &str {
         self.entries
             .iter()
@@ -145,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn 一日たっても文脈は残り_二日たつと使わず_次の確定は新しく始まる() {
+    fn 数時間たっても文脈は残り_十二時間たつと使わず_次の確定は新しく始まる() {
         let (mut s, t) = (ContextStore::default(), Instant::now());
         s.record("a", "古い", t);
         let later = t + STALE_AFTER;
-        assert_eq!(s.get("a", t + Duration::from_secs(24 * 60 * 60)), "古い");
+        assert_eq!(s.get("a", t + Duration::from_secs(6 * 60 * 60)), "古い");
         assert_eq!(s.get("a", t + STALE_AFTER - Duration::from_secs(1)), "古い");
         assert_eq!(s.get("a", later), "");
         s.record("a", "新しい", later);
