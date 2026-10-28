@@ -227,6 +227,8 @@ impl Segment {
 const EMOJI_LIMIT: usize = 5;
 /// 絵文字より前に並べるエンジン候補の数
 const EMOJI_AFTER_ENGINE: usize = 3;
+/// live 変換は、読みがこの文字数 (かな) を超えてから表示を変換する。これ以下はひらがなのまま (Space の変換は別)。
+const LIVE_MIN_KANA: usize = 2;
 
 pub struct Composer<E: CandidateEngine, L: Lexicon> {
     engine: E,
@@ -330,7 +332,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     pub fn display(&self) -> Cow<'_, str> {
         match &self.stage {
             Stage::Selecting(s) => Cow::Borrowed(&s.list[s.cursor].text),
-            Stage::Editing if self.typing == Typing::Kana && self.live => match &self.pin {
+            Stage::Editing if self.typing == Typing::Kana && self.live_converts() => match &self.pin {
                 None => Cow::Borrowed(self.reading.list.first().map_or(self.hiragana.as_str(), |c| c.text.as_str())),
                 Some(pin) => {
                     let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some());
@@ -446,7 +448,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 .collect();
             return;
         }
-        if !self.pin_matches_reading() {
+        if !self.live_converts() || !self.pin_matches_reading() {
             self.pin = None;
         }
         self.sync_live_split();
@@ -894,11 +896,16 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reading.list.first().and_then(Candidate::engine_rank)
     }
 
-    /// live 変換でかなを入力中で、英語としては扱われていない。
+    /// live 変換が表示を変換する長さの読みか。未確定のローマ字は数えない。
+    fn live_converts(&self) -> bool {
+        self.live && self.hiragana.chars().count() > LIVE_MIN_KANA
+    }
+
+    /// live 変換でかなを入力中で、英語としては扱われていない。短い読みはひらがなのままなので含めない。
     fn is_live_kana(&self) -> bool {
         matches!(self.stage, Stage::Editing)
             && self.typing == Typing::Kana
-            && self.live
+            && self.live_converts()
             && self.shown_split().is_none()
             && !self.is_typing_english()
     }
@@ -1600,6 +1607,7 @@ mod tests {
     fn words_table(hiragana: &str) -> Vec<Vec<(String, String)>> {
         match hiragana {
             "せんせい" => vec![pairs(&[("先生", "センセイ")]), pairs(&[("戦", "セン"), ("世以", "セイ")])],
+            "せんせいは" => vec![pairs(&[("先生", "センセイ"), ("は", "ハ")])],
             "せん" => vec![pairs(&[("戦", "セン")])],
             "こう" => vec![pairs(&[("後", "コウ")])],
             "くぎをうつ" => vec![pairs(&[("釘", "クギ"), ("を", "ヲ"), ("打つ", "ウツ")])],
@@ -1663,10 +1671,11 @@ mod tests {
         type_units(c, &[("ko", "こ"), ("u", "う")]);
     }
 
-    /// 先生 を打って Backspace で 先 (読みはせん) を固定した状態。
-    fn pinned_sen() -> WordsComposer {
+    /// 先生は を打って Backspace で 先生 (読みはせんせい) を固定した状態。
+    fn pinned_sensei() -> WordsComposer {
         let mut c = words_composer();
         type_sensei(&mut c);
+        type_units(&mut c, &[("ha", "は")]);
         assert!(c.backspace());
         c
     }
@@ -1677,18 +1686,21 @@ mod tests {
 
     #[test]
     fn live中のbackspaceは見えている最後の文字に当たる読みを消し残りを固定する() {
-        let mut c = pinned_sen();
-        assert_eq!(c.hiragana, "せん");
-        assert_eq!(c.raw(), "sen");
-        assert_eq!(c.display(), "先");
-        assert_eq!(c.preedit(), "先");
+        let mut c = pinned_sensei();
+        assert_eq!(c.hiragana, "せんせい");
+        assert_eq!(c.raw(), "sensei");
+        assert_eq!(c.display(), "先生");
+        assert_eq!(c.preedit(), "先生");
         assert_wysiwyg(&c);
     }
 
     #[test]
     fn 固定した先のbackspaceでさらに消すと空になる() {
-        let mut c = pinned_sen();
-        assert!(c.backspace());
+        let mut c = pinned_sensei();
+        while !c.is_empty() {
+            assert!(c.backspace());
+            assert_wysiwyg(&c);
+        }
         assert_eq!(c.phase(), Phase::Empty);
         assert!(c.is_empty());
         assert_eq!(c.display(), "");
@@ -1717,57 +1729,58 @@ mod tests {
             shown.push(c.display().into_owned());
             assert_wysiwyg(&c);
         }
-        assert_eq!(shown, ["会社の", "会社", "会"]);
+        // 読みが 2 かな (かい) になったら固定せずひらがなに戻る。
+        assert_eq!(shown, ["会社の", "会社", "かい"]);
         assert_eq!(c.hiragana, "かい");
     }
 
     #[test]
     fn 固定したあとにかなを打つと残りの読みだけを変換して後ろに付ける() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.engine.converted.borrow_mut().clear();
         type_kou(&mut c);
-        assert_eq!(c.hiragana, "せんこう");
+        assert_eq!(c.hiragana, "せんせいこう");
         assert_eq!(c.engine.converted.borrow().as_slice(), ["こ", "こう"]);
-        assert_eq!(c.display(), "先後");
-        assert_eq!(c.preedit(), "先後");
+        assert_eq!(c.display(), "先生後");
+        assert_eq!(c.preedit(), "先生後");
         assert_wysiwyg(&c);
     }
 
     #[test]
     fn 固定中に未確定のローマ字があれば固定と残りの後ろに出る() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.type_romaji("k");
-        assert_eq!(c.preedit(), "先k");
+        assert_eq!(c.preedit(), "先生k");
         assert!(c.has_romaji());
     }
 
     #[test]
     fn 固定した後の残りがあるときのbackspaceは固定を保ち残りを固定に足す() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         type_kou(&mut c);
         assert!(c.backspace());
-        // 後 (こう) は 1 字なので読みごと消え、固定は 先 のまま。
-        assert_eq!(c.hiragana, "せん");
-        assert_eq!(c.display(), "先");
+        // 後 (こう) は 1 字なので読みごと消え、固定は 先生 のまま。
+        assert_eq!(c.hiragana, "せんせい");
+        assert_eq!(c.display(), "先生");
         assert_wysiwyg(&c);
     }
 
     #[test]
     fn 残りの語列が合わないbackspaceは残りを1文字だけ消して固定を保つ() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         type_units(&mut c, &[("ho", "ほ"), ("ge", "げ")]);
-        assert_eq!(c.display(), "先保");
+        assert_eq!(c.display(), "先生保");
         assert!(c.backspace());
-        assert_eq!(c.hiragana, "せんほ");
-        assert_eq!(c.display(), "先保");
-        assert_eq!(c.pin.as_ref().map(Pin::surface).as_deref(), Some("先"));
+        assert_eq!(c.hiragana, "せんせいほ");
+        assert_eq!(c.display(), "先生保");
+        assert_eq!(c.pin.as_ref().map(Pin::surface).as_deref(), Some("先生"));
     }
 
     #[test]
     fn 固定中の確定は表示のまま学習しない() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         let committed = c.commit();
-        assert_eq!(committed.text, "先");
+        assert_eq!(committed.text, "先生");
         assert_eq!(committed.engine, None);
         assert!(c.pin.is_none());
         assert!(c.is_empty());
@@ -1775,29 +1788,29 @@ mod tests {
 
     #[test]
     fn 固定と残りを含む確定は表示のまま学習しない() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         type_kou(&mut c);
         let preview = c.commit_preview();
         let committed = c.commit();
-        assert_eq!(committed.text, "先後");
-        assert_eq!(preview, "先後");
+        assert_eq!(committed.text, "先生後");
+        assert_eq!(preview, "先生後");
         assert_eq!(committed.engine, None);
     }
 
     #[test]
     fn 固定中のスペースは固定を外して読み全体を変換し直す() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         assert!(c.begin_conversion());
         assert!(c.pin.is_none());
-        assert_eq!(c.hiragana, "せん");
-        assert_eq!(c.display(), "戦");
-        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("戦"));
-        assert_eq!(c.engine.converted.borrow().last().map(String::as_str), Some("せん"));
+        assert_eq!(c.hiragana, "せんせい");
+        assert_eq!(c.display(), "先生");
+        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("先生"));
+        assert_eq!(c.engine.converted.borrow().last().map(String::as_str), Some("せんせい"));
     }
 
     #[test]
     fn 固定中のescapeは読みごと捨てる() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.discard();
         assert!(c.is_empty());
         assert!(c.pin.is_none());
@@ -1806,53 +1819,53 @@ mod tests {
 
     #[test]
     fn 固定中に読みへ戻すと固定が外れて読みが残る() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.revert();
         assert!(c.pin.is_none());
         assert_eq!(c.phase(), Phase::Reverted);
-        assert_eq!(c.display(), "せん");
+        assert_eq!(c.display(), "せんせい");
         assert!(c.begin_conversion());
-        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("戦"));
+        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("先生"));
     }
 
     #[test]
     fn 固定中の字種変換は読み全体を変換し固定を外す() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         assert!(c.transliterate(Form::Katakana));
         assert!(c.pin.is_none());
-        assert_eq!(c.display(), "セン");
-        assert_eq!(c.commit_preview(), "セン");
+        assert_eq!(c.display(), "センセイ");
+        assert_eq!(c.commit_preview(), "センセイ");
     }
 
     #[test]
     fn 固定中に大文字を打つと固定が外れてかな混じりになる() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.push_literal("A");
         assert!(c.pin.is_none());
         assert_eq!(c.phase(), Phase::Mixed);
-        assert_eq!(c.hiragana, "せんA");
-        assert_eq!(c.preedit(), "せんA");
+        assert_eq!(c.hiragana, "せんせいA");
+        assert_eq!(c.preedit(), "せんせいA");
         assert_wysiwyg(&c);
     }
 
     #[test]
     fn 固定中にliveを切ると固定が外れて読みが残る() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         c.set_live(false);
         assert!(c.pin.is_none());
-        assert_eq!(c.display(), "せん");
-        assert_eq!(c.preedit(), "せん");
+        assert_eq!(c.display(), "せんせい");
+        assert_eq!(c.preedit(), "せんせい");
         assert_wysiwyg(&c);
     }
 
     #[test]
     fn 固定中は候補を出さず選択もできない() {
-        let mut c = pinned_sen();
+        let mut c = pinned_sensei();
         assert!(c.candidates().is_empty());
         assert!(!c.select_candidate(0));
-        assert!(!c.select_candidate_text("戦"));
+        assert!(!c.select_candidate_text("先生"));
         assert!(c.pin.is_some());
-        assert_eq!(c.display(), "先");
+        assert_eq!(c.display(), "先生");
         assert_wysiwyg(&c);
     }
 
@@ -1920,6 +1933,65 @@ mod tests {
         assert!(c.backspace());
         assert_eq!(*c.engine.asked.borrow(), 0);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn live中でも読みが2かな以下ならひらがなのまま確定する() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("se", "せ"), ("n", "ん")]);
+        assert_eq!(c.display(), "せん");
+        assert_eq!(c.preedit(), "せん");
+        assert_wysiwyg(&c);
+        let committed = c.commit();
+        assert_eq!(committed.text, "せん");
+        assert_eq!(committed.engine, None);
+    }
+
+    #[test]
+    fn live中の未確定のローマ字は読みの長さに数えない() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("se", "せ"), ("n", "ん")]);
+        c.type_romaji("k");
+        assert_eq!(c.preedit(), "せんk");
+    }
+
+    #[test]
+    fn live中でも読みが3かなになると変換して表示する() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("se", "せ"), ("n", "ん"), ("se", "せ")]);
+        assert_eq!(c.display(), "変せんせ");
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn live中の短い読みでもスペースで候補を出せる() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("se", "せ"), ("n", "ん")]);
+        assert!(c.begin_conversion());
+        assert_eq!(c.display(), "戦");
+        assert_eq!(c.candidates().first().map(|x| x.text.as_str()), Some("戦"));
+    }
+
+    #[test]
+    fn live中のbackspaceで3かなから2かなに戻ると2かなを直接打った表示と同じになる() {
+        let mut c = words_composer();
+        type_units(&mut c, &[("se", "せ"), ("n", "ん"), ("se", "せ")]);
+        assert!(c.backspace());
+        let mut direct = words_composer();
+        type_units(&mut direct, &[("se", "せ"), ("n", "ん")]);
+        assert_eq!(c.preedit(), "せん");
+        assert_eq!(c.preedit(), direct.preedit());
+        assert_eq!(c.commit_preview(), direct.commit_preview());
+        assert!(c.pin.is_none());
+        assert_wysiwyg(&c);
+    }
+
+    #[test]
+    fn 非liveでは読みの長さに関わらずひらがなのまま() {
+        let mut c = words_composer();
+        c.set_live(false);
+        type_units(&mut c, &[("se", "せ"), ("n", "ん"), ("se", "せ")]);
+        assert_eq!(c.display(), "せんせ");
     }
 
     #[test]
@@ -2832,7 +2904,7 @@ mod tests {
         c.set_live(true);
         type_keys(&mut c, "made");
         assert_eq!(c.phase(), Phase::Composing);
-        assert_eq!(c.preedit(), "までK1");
+        assert_eq!(c.preedit(), "まで");
         assert_eq!(log.asked.borrow().len(), 1);
     }
 
