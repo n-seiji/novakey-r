@@ -187,18 +187,20 @@ pub struct RustEngine {
     compare: Compare,
     /// 審判に渡す文脈 (アプリで直前に確定した文字列)。メモリ上だけで、ログにも書かない。
     context: String,
+    /// いまのアプリが英語を打つアプリか (`context::ContextStore::is_english_app`)。行頭でも審判に聞くかの判断に使う。
+    english_app: bool,
     /// 直近の変換の revision と、返した候補ごとの `Candidate.data`。`select` の検証と学習用。
     last: Option<(u64, Vec<Vec<Rc<elem::Elem>>>)>,
 }
 
 impl RustEngine {
     pub fn new() -> Self {
-        Self { core: shared_core(), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), last: None }
+        Self { core: shared_core(), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), english_app: false, last: None }
     }
 
     #[cfg(test)]
     pub fn with_core(core: Rc<KkcCore>) -> Self {
-        Self { core: Some(core), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), last: None }
+        Self { core: Some(core), judge: crate::judge::rerank, compare: crate::judge::margin, context: String::new(), english_app: false, last: None }
     }
 
     /// 審判を差し替える (テスト用。実際の並べ替え経路を fake で通す)。
@@ -297,9 +299,10 @@ impl CandidateEngine for RustEngine {
         self.last = None;
     }
 
-    fn set_context(&mut self, context: &str) {
+    fn set_context(&mut self, context: &str, english_app: bool) {
         self.context.clear();
         self.context.push_str(context);
+        self.english_app = english_app;
     }
 
     fn has_reading(&self, hiragana: &str) -> bool {
@@ -312,9 +315,10 @@ impl CandidateEngine for RustEngine {
 
     /// 文脈の今の行 (最後の改行より後ろ) の末尾 (空白を除く) が ASCII のときだけ審判に聞く。文脈なしや日本語の文脈では、日本語として自然な語 (more → 漏れ) も
     /// 差が余裕を超えるので英語にしない。`claude ` のあとの code は 6.7、文脈なしの more は 7.2 で、差だけでは分けられない。
+    /// 英語を打つアプリでは、行頭 (空の行・インデントだけ) でも聞く。行の途中が日本語のときは聞かない。
     /// 審判が使えない・失敗したときは false (engine の順のまま)。
     fn prefers_text(&mut self, text: &str, over: &str) -> bool {
-        crate::context::ends_ascii(&self.context)
+        (crate::context::ends_ascii(&self.context) || (self.english_app && crate::context::at_line_start(&self.context)))
             && (self.compare)(&self.context, text, over).is_some_and(|diff| diff >= MARGIN)
     }
 
@@ -618,9 +622,9 @@ mod tests {
         let core = Rc::new(KkcCore::open().unwrap());
         let mut e = RustEngine::with_core(core).with_judge(spy_judge);
         e.convert(1, "かんじ");
-        e.set_context("机の");
+        e.set_context("机の", false);
         e.convert(2, "かんじ");
-        e.set_context("");
+        e.set_context("", false);
         e.convert(3, "かんじ");
         assert_eq!(SEEN.with(|s| s.borrow().clone()), ["", "机の", ""]);
     }
@@ -646,7 +650,7 @@ mod tests {
     fn 比べた差が余裕に届いたときだけ英語を選び_審判が使えなければ選ばない() {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
-        e.set_context("claude ");
+        e.set_context("claude ", false);
         assert!(e.prefers_text("code", "子で"));
         assert_eq!(COMPARED.with(|c| c.borrow().clone()), [("claude ".to_string(), "code".to_string(), "子で".to_string())]);
         e = e.with_compare(margin_below_four);
@@ -661,10 +665,28 @@ mod tests {
         let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
         let before = COMPARED.with(|c| c.borrow().len());
         for context in ["", "机の", "今日は ", "hello\n", "hello\n\n"] {
-            e.set_context(context);
+            e.set_context(context, false);
             assert!(!e.prefers_text("more", "漏れ"), "{context:?}");
         }
         assert_eq!(COMPARED.with(|c| c.borrow().len()), before);
+    }
+
+    #[test]
+    fn 英語のアプリでは行頭でも審判に聞くが_日本語の行の途中では聞かない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
+        for context in ["hello\n", "今日は\n", "", "x\n  "] {
+            e.set_context(context, true);
+            assert!(e.prefers_text("code", "子で"), "{context:?}");
+        }
+        let before = COMPARED.with(|c| c.borrow().len());
+        for context in ["これは", "今日は ", "x\n機能"] {
+            e.set_context(context, true);
+            assert!(!e.prefers_text("more", "漏れ"), "{context:?}");
+        }
+        assert_eq!(COMPARED.with(|c| c.borrow().len()), before);
+        e.set_context("hello", true);
+        assert!(e.prefers_text("code", "子で"), "ASCII の途中は今まで通り");
     }
 
     fn margin_minus_two(_context: &str, _text: &str, _over: &str) -> Option<f64> {

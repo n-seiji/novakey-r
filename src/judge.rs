@@ -1053,7 +1053,7 @@ pub fn bench_cli(path: &str) -> i32 {
         rev += 1;
         // 審判なしの engine の順 (比較の基準) と、実際の経路 (審判あり)。
         let base: Vec<String> = core.convert_all(reading).main.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
-        engine.set_context("");
+        engine.set_context("", false);
         let live = engine.convert(rev, reading);
         if let Some(m) = take_last_ms() {
             ms.push(m);
@@ -1065,7 +1065,7 @@ pub fn bench_cli(path: &str) -> i32 {
         if context.is_empty() {
             continue;
         }
-        engine.set_context(context);
+        engine.set_context(context, false);
         let with_ctx = engine.convert(rev, reading);
         let fresh = context != prev_ctx;
         if let Some(m) = take_last_ms() {
@@ -1325,6 +1325,21 @@ mod tests {
         for (word, reading) in [("imago", "今後"), ("anode", "あので"), ("kiwano", "際の")] {
             assert!(real_margin(&judge, "", word, reading) <= -2.0, "{word}");
         }
+    }
+
+    #[test]
+    fn 英語のアプリの行頭では_code_data_time_が英語に勝ち_made_kite_kore_は負ける() {
+        let Some(judge) = real_judge() else { return };
+        // 測った差 (文脈 `fix the bug\n`): code +7.8, data +9.4, time +12.9。made -3.2, kite +0.0, kore +0.6。
+        // more は +6.1 (漏れ) で英語に勝つ。英語のアプリの行頭では more も英語になる (既知の限界。英語を打つ前提なので許容)。
+        let ctx = "fix the bug\n";
+        for (word, reading) in [("code", "子で"), ("data", "だた"), ("time", "ちめ")] {
+            assert!(real_margin(&judge, ctx, word, reading) >= 4.0, "{word}");
+        }
+        for (word, reading) in [("made", "まで"), ("kite", "来て"), ("kore", "これ")] {
+            assert!(real_margin(&judge, ctx, word, reading) < 4.0, "{word}");
+        }
+        // 文脈が空だと code は +2.8 で 4 に届かない (既知の限界)。
     }
 
     #[test]

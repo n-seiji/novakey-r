@@ -259,6 +259,12 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         })
     }
 
+    /// このアプリは英語を打つアプリか (同じ `context_app` の門を通る)。
+    fn english_app(&self, client: Option<&C>) -> bool {
+        self.context_app(client)
+            .is_some_and(|app| crate::context::with(|store| store.is_english_app(&app, std::time::Instant::now())))
+    }
+
     /// アプリに入った文字列を文脈に足す。
     fn remember(&self, text: &str, client: Option<&C>) {
         if let Some(app) = self.context_app(client) {
@@ -281,10 +287,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     fn dispatch(&self, key: Key, text: &str, client: &C) -> bool {
         let gates = self.gates(Some(client));
         let context = self.context(Some(client));
+        let english_app = self.english_app(Some(client));
         // session の借用はここで外れる。以降のポート呼び出しは composer を再借用してよい。
         let outcome = {
             let mut session = self.session.borrow_mut();
-            session.set_context(&context);
+            session.set_context(&context, english_app);
             session.handle(&gates, key, text)
         };
         let Outcome { handled, action, phase, effects } = outcome;
@@ -292,17 +299,23 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         match action {
             None => self.env.trace(
                 "handleEvent",
-                &format!("id={} mode={:?} key={} phase={phase:?} action=Romaji handled={handled}", self.id, self.mode(), key.name()),
+                &format!("id={} mode={:?} key={} phase={phase:?} action=Romaji handled={handled} english_app={}",
+                    self.id,
+                    self.mode(),
+                    key.name(),
+                    u8::from(english_app)
+                ),
             ),
             Some(action) => self.env.trace(
                 "handleEvent",
                 &format!(
-                    "id={} mode={:?} key={} phase={phase:?} action={} handled={handled} now={:?}",
+                    "id={} mode={:?} key={} phase={phase:?} action={} handled={handled} now={:?} english_app={}",
                     self.id,
                     self.mode(),
                     key.name(),
                     action.name(),
-                    self.phase()
+                    self.phase(),
+                    u8::from(english_app)
                 ),
             ),
         }
@@ -1076,5 +1089,69 @@ mod tests {
         assert_eq!(context_of("app.one"), "Hello\n");
         assert!(press(&f, Key::Punct, "!"));
         assert_eq!(f.1.marked(), "！");
+    }
+
+    fn commit_hello(f: &Fixture) {
+        assert!(press(f, Key::Letter { upper: true }, "H"));
+        type_letters(f, "ello");
+        assert!(press(f, Key::Enter, "\r"));
+    }
+
+    fn english_app_of(app: &str) -> bool {
+        crate::context::with(|store| store.is_english_app(app, std::time::Instant::now()))
+    }
+
+    #[test]
+    fn 英語を確定し続けたアプリは英語のアプリになり_日本語が混ざると外れる() {
+        let f = fixture();
+        f.1.set_bundle("app.eng");
+        for _ in 0..12 {
+            commit_hello(&f);
+        }
+        assert!(english_app_of("app.eng"));
+        assert!(f.0.english_app(Some(&f.1)));
+        assert!(!english_app_of("app.other"));
+        for _ in 0..12 {
+            type_letters(&f, "a");
+            assert!(press(&f, Key::Enter, "\r"));
+        }
+        assert!(!english_app_of("app.eng"), "日本語が 25% を超えた");
+    }
+
+    #[test]
+    fn 英語の票はセキュア入力とパスワード管理アプリでは数えない() {
+        let (c, client, _panel, env) = rec_fixture();
+        client.set_bundle(Some("app.vote"));
+        env.secure.set(true);
+        for _ in 0..12 {
+            assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
+        }
+        env.secure.set(false);
+        assert!(!english_app_of("app.vote"));
+        assert!(!c.english_app(Some(&client)));
+        client.set_bundle(Some("com.1password.1password"));
+        for _ in 0..12 {
+            rec_press(&c, &client, Key::Letter { upper: false }, "a");
+        }
+        assert!(!english_app_of("com.1password.1password"));
+    }
+
+    #[test]
+    fn 素通しの英字は一回ごとに一票_ことばを確定すると日本語の一票() {
+        let f = fixture();
+        f.1.set_bundle("app.count");
+        for _ in 0..12 {
+            assert!(press(&f, Key::Symbol, "@"));
+            assert!(press(&f, Key::Symbol, "x"));
+        }
+        assert!(english_app_of("app.count"), "12 回の英字で 12 票");
+        let g = fixture();
+        g.1.set_bundle("app.count2");
+        for _ in 0..11 {
+            commit_hello(&g);
+        }
+        assert!(!english_app_of("app.count2"), "11 回では足りない");
+        commit_hello(&g);
+        assert!(english_app_of("app.count2"), "Space モードの英字確定は 1 回 1 票");
     }
 }
