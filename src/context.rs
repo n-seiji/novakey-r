@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-//! アプリごとの「直前に確定した文字列」。変換の文脈と記号の幅の判断に使う。
-//! メモリ上だけに置き、ファイルにもログにも書かない。時刻は呼び出し側から渡すので、純粋に試せる。
+//! アプリごとの「Shizuku を通して直前に打った文字列」。変換の文脈と記号の幅の判断に使う。
+//! アプリ側の文字は読まない。メモリ上だけに置き、ファイルにもログにも書かない。時刻は呼び出し側から渡すので、純粋に試せる。
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 const MAX_APPS: usize = 10;
 /// 1 アプリで覚える文字数 (後ろから残す)。文字で持つのはこの量で、審判が使うのは後ろの `judge::CONTEXT_TOKENS` (32 トークン) だけ。
 const MAX_CHARS: usize = 100;
-/// 最後の確定からこれだけ経つと、カーソルが動いたと見て文脈を捨てる。
-const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+/// 最後の入力からこれだけ経つと、別の作業と見て文脈を捨てる。`Instant` なので、スリープの間は数えない (起動中の 12 時間)。
+const STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 struct Entry {
     app: String,
@@ -25,7 +25,7 @@ pub struct ContextStore {
 }
 
 impl ContextStore {
-    /// `text` を `app` の文脈の末尾に足す。改行より前は捨てる (改行は新しい文の始まりと見る)。
+    /// `text` を `app` の文脈の末尾に足す。改行は文の切れ目として残す (素通しの Backspace と数が合うよう、続く改行も全部残す)。
     pub fn record(&mut self, app: &str, text: &str, now: Instant) {
         if text.is_empty() {
             return;
@@ -38,9 +38,6 @@ impl ContextStore {
             entry.text.clear();
         }
         entry.text.push_str(text);
-        if let Some(i) = entry.text.rfind('\n') {
-            entry.text.drain(..=i);
-        }
         let extra = entry.text.chars().count().saturating_sub(MAX_CHARS);
         if extra > 0 {
             let cut = entry.text.char_indices().nth(extra).map_or(entry.text.len(), |(i, _)| i);
@@ -53,7 +50,7 @@ impl ContextStore {
         self.entries.push(entry);
     }
 
-    /// `app` の文脈。10 分以上確定が無ければ空。
+    /// `app` の文脈。12 時間 (起動中) 以上入力が無ければ空。
     pub fn get(&self, app: &str, now: Instant) -> &str {
         self.entries
             .iter()
@@ -66,10 +63,6 @@ impl ContextStore {
         if let Some(e) = self.entries.iter_mut().find(|e| e.app == app) {
             e.text.pop();
         }
-    }
-
-    pub fn clear(&mut self, app: &str) {
-        self.entries.retain(|e| e.app != app);
     }
 
     #[cfg(test)]
@@ -92,10 +85,15 @@ pub fn with<T>(f: impl FnOnce(&mut ContextStore) -> T) -> T {
     STORE.with(|s| f(&mut s.borrow_mut()))
 }
 
-/// 文脈の末尾 (空白を除く) が ASCII の英数字か記号か。文脈が無いときは false。
+/// 文脈の最後の行 (最後の改行より後ろ)。新しい行の頭では空になる。
+fn current_line(context: &str) -> &str {
+    context.rsplit('\n').next().unwrap_or("")
+}
+
+/// 今の行の末尾 (空白を除く) が ASCII の英数字か記号か。行が空のときは false (前の行が英語でも見ない)。
 /// true なら、半角で書いている最中と見て `! ? ( ) { } . , : ;` を半角のまま入れる。
 pub fn ends_ascii(context: &str) -> bool {
-    context.trim_end().chars().next_back().is_some_and(|c| c.is_ascii() && !c.is_ascii_control())
+    current_line(context).trim_end().chars().next_back().is_some_and(|c| c.is_ascii() && !c.is_ascii_control())
 }
 
 #[cfg(test)]
@@ -123,12 +121,14 @@ mod tests {
     }
 
     #[test]
-    fn 改行より前は捨てる() {
+    fn 改行は切れ目として全部残り_バックスペースと数が合う() {
         let (mut s, t) = (ContextStore::default(), Instant::now());
         s.record("a", "前の行\n次の", t);
-        assert_eq!(s.get("a", t), "次の");
-        s.record("a", "\n", t);
-        assert_eq!(s.get("a", t), "");
+        assert_eq!(s.get("a", t), "前の行\n次の");
+        s.record("a", "\n\n", t);
+        assert_eq!(s.get("a", t), "前の行\n次の\n\n");
+        s.pop("a");
+        assert_eq!(s.get("a", t), "前の行\n次の\n");
     }
 
     #[test]
@@ -145,10 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn 十分たつと古い文脈は使わず_次の確定は新しく始まる() {
+    fn 数時間たっても文脈は残り_十二時間たつと使わず_次の確定は新しく始まる() {
         let (mut s, t) = (ContextStore::default(), Instant::now());
         s.record("a", "古い", t);
         let later = t + STALE_AFTER;
+        assert_eq!(s.get("a", t + Duration::from_secs(6 * 60 * 60)), "古い");
         assert_eq!(s.get("a", t + STALE_AFTER - Duration::from_secs(1)), "古い");
         assert_eq!(s.get("a", later), "");
         s.record("a", "新しい", later);
@@ -156,14 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn 後ろの一文字を消し_アプリごとに捨てられる() {
+    fn 後ろの一文字を消し_全部を捨てられる() {
         let (mut s, t) = (ContextStore::default(), Instant::now());
         s.record("a", "ab", t);
         s.record("b", "cd", t);
         s.pop("a");
         assert_eq!(s.get("a", t), "a");
-        s.clear("a");
-        assert_eq!(s.get("a", t), "");
         assert_eq!(s.get("b", t), "cd");
         s.clear_all();
         assert_eq!(s.get("b", t), "");
@@ -179,5 +178,13 @@ mod tests {
         assert!(!ends_ascii("   "));
         assert!(!ends_ascii("今日は"));
         assert!(!ends_ascii("hello。"));
+    }
+
+    #[test]
+    fn 新しい行の頭では前の行の末尾を見ない() {
+        assert!(!ends_ascii("hello\n"));
+        assert!(!ends_ascii("hello\n今日は"));
+        assert!(ends_ascii("今日は\nhello"));
+        assert!(ends_ascii("今日は\nhello \n\nworld"));
     }
 }

@@ -310,7 +310,7 @@ impl CandidateEngine for RustEngine {
         self.core.is_some()
     }
 
-    /// 文脈の末尾 (空白を除く) が ASCII のときだけ審判に聞く。文脈なしや日本語の文脈では、日本語として自然な語 (more → 漏れ) も
+    /// 文脈の今の行 (最後の改行より後ろ) の末尾 (空白を除く) が ASCII のときだけ審判に聞く。文脈なしや日本語の文脈では、日本語として自然な語 (more → 漏れ) も
     /// 差が余裕を超えるので英語にしない。`claude ` のあとの code は 6.7、文脈なしの more は 7.2 で、差だけでは分けられない。
     /// 審判が使えない・失敗したときは false (engine の順のまま)。
     fn prefers_text(&mut self, text: &str, over: &str) -> bool {
@@ -656,11 +656,11 @@ mod tests {
     }
 
     #[test]
-    fn 文脈が空か日本語で終わるときは審判に聞かず英語を選ばない() {
+    fn 文脈が空か日本語で終わるか改行で終わるときは審判に聞かず英語を選ばない() {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let mut e = RustEngine::with_core(core).with_compare(margin_of_four);
         let before = COMPARED.with(|c| c.borrow().len());
-        for context in ["", "机の", "今日は "] {
+        for context in ["", "机の", "今日は ", "hello\n", "hello\n\n"] {
             e.set_context(context);
             assert!(!e.prefers_text("more", "漏れ"), "{context:?}");
         }

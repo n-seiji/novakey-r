@@ -148,11 +148,8 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             self.sync_conversion_mode();
         }
         match route {
-            Route::PassThrough => {
-                // Cmd / Ctrl / Option のショートカット (貼り付け・取り消し・全選択など) は、何が入ったか分からない。
-                self.clear_context(Some(&client));
-                false
-            }
+            // Cmd / Ctrl / Option のショートカット (貼り付け・取り消し・全選択など) は、文脈に触れない。
+            Route::PassThrough => false,
             Route::Translit(form) => self.dispatch(Key::Translit(form), "", &client),
             Route::Keys(keys) => {
                 let handled = keys.iter().fold(false, |handled, (key, text)| self.dispatch(*key, text, &client) || handled);
@@ -167,9 +164,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
                     "handleEvent",
                     &format!("id={} mode={:?} key=Navigation phase={:?} handled={has_pending}", self.id, self.mode(), self.phase()),
                 );
-                if !has_pending {
-                    self.clear_context(Some(&client));
-                }
                 has_pending
             }
         }
@@ -204,8 +198,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         let gates = self.gates(client.as_ref());
         let effects = self.session.borrow_mut().commit_composition(&gates);
         self.run(effects, client.as_ref());
-        // クリックやフォーカスの移動でカーソルが動いたかもしれない。
-        self.clear_context(client.as_ref());
         self.sync_activity();
     }
 
@@ -260,14 +252,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.bundle_id(client).filter(|_| allowed).map(str::to_string)
     }
 
-    /// このアプリの文脈を捨てる (カーソルが動いたか、入った文字が分からなくなった)。
-    fn clear_context(&self, client: Option<&C>) {
-        if let Some(app) = self.context_app(client) {
-            crate::context::with(|store| store.clear(&app));
-        }
-    }
-
-    /// このアプリで直前に確定した文字列 (覚えていなければ空)。
+    /// このアプリで直前に打った文字列 (覚えていなければ空)。
     fn context(&self, client: Option<&C>) -> String {
         self.context_app(client).map_or_else(String::new, |app| {
             crate::context::with(|store| store.get(&app, std::time::Instant::now()).to_string())
@@ -281,13 +266,13 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         }
     }
 
-    /// 処理しなかったキーがアプリへ素通しになった。入る文字は文脈に足し、カーソルが動くキーは文脈を捨てる。
+    /// 処理しなかったキーがアプリへ素通しになった。入る文字は文脈に足す (Enter は改行)。カーソルが動くキーでも文脈は捨てない。
     fn remember_pass_through(&self, key: Key, text: &str, client: &C) {
         let Some(app) = self.context_app(Some(client)) else { return };
         match key {
-            Key::Enter | Key::Up | Key::Down | Key::Control => crate::context::with(|store| store.clear(&app)),
+            Key::Enter => self.remember("\n", Some(client)),
             Key::Backspace => crate::context::with(|store| store.pop(&app)),
-            Key::Translit(_) | Key::Escape => {}
+            Key::Up | Key::Down | Key::Control | Key::Translit(_) | Key::Escape => {}
             _ => self.remember(text, Some(client)),
         }
     }
@@ -993,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn 直接入れた文字は覚え_バックスペースで消え_改行とナビゲーションで捨てる() {
+    fn 直接入れた文字は覚え_バックスペースで消え_改行は切れ目として残る() {
         let f = fixture();
         f.1.set_bundle("app.one");
         assert!(press(&f, Key::Symbol, "@"));
@@ -1002,35 +987,50 @@ mod tests {
         assert!(!press(&f, Key::Backspace, "\u{7f}"));
         assert_eq!(context_of("app.one"), "@");
         assert!(!press(&f, Key::Enter, "\r"));
-        assert_eq!(context_of("app.one"), "");
+        assert_eq!(context_of("app.one"), "@\n");
         assert!(press(&f, Key::Symbol, "@"));
-        assert_eq!(context_of("app.one"), "@");
+        assert_eq!(context_of("app.one"), "@\n@");
         assert!(!f.0.on_key(Route::Navigation, f.1.clone()));
-        assert_eq!(context_of("app.one"), "");
+        assert_eq!(context_of("app.one"), "@\n@", "ナビゲーションでは捨てない");
     }
 
     #[test]
-    fn 修飾キー付きの素通しと_tab_は文脈を捨てる() {
+    fn 連続した改行をバックスペースで戻しても_新しい行の頭は全角のまま() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert_eq!(context_of("app.one"), "Hello\n\n");
+        assert!(!press(&f, Key::Backspace, "\u{7f}"));
+        assert_eq!(context_of("app.one"), "Hello\n");
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.marked(), "！");
+    }
+
+    #[test]
+    fn 修飾キー付きの素通しと_tab_と矢印は文脈を捨てない() {
         let f = fixture();
         f.1.set_bundle("app.one");
         assert!(press(&f, Key::Symbol, "@"));
         // Cmd+V / Cmd+Z / Cmd+Backspace / Cmd+A など (Cmd / Ctrl / Option が付くと Route::PassThrough)。
         assert!(!f.0.on_key(Route::PassThrough, f.1.clone()));
-        assert_eq!(context_of("app.one"), "");
-        assert!(press(&f, Key::Symbol, "@"));
+        assert_eq!(context_of("app.one"), "@");
         assert!(!press(&f, Key::Control, ""));
-        assert_eq!(context_of("app.one"), "");
+        assert!(!press(&f, Key::Up, ""));
+        assert!(!press(&f, Key::Down, ""));
+        assert_eq!(context_of("app.one"), "@");
     }
 
     #[test]
-    fn commit_composition_のあとは文脈を捨てる() {
+    fn commit_composition_のあとも文脈は残る() {
         let f = fixture();
         f.1.set_bundle("app.one");
         type_hello_and_commit(&f);
         type_letters(&f, "a");
         f.0.on_commit_composition(Some(f.1.clone()));
         assert_eq!(f.1.committed(), "Helloあ");
-        assert_eq!(context_of("app.one"), "");
+        assert_eq!(context_of("app.one"), "Helloあ");
     }
 
     #[test]
@@ -1065,5 +1065,16 @@ mod tests {
         type_hello_and_commit(&f);
         assert!(press(&f, Key::Punct, "["));
         assert_eq!(f.1.marked(), "「");
+    }
+
+    #[test]
+    fn 改行のあとの_感嘆符は前の行が英語でも全角の組成になる() {
+        let f = fixture();
+        f.1.set_bundle("app.one");
+        type_hello_and_commit(&f);
+        assert!(!press(&f, Key::Enter, "\r"));
+        assert_eq!(context_of("app.one"), "Hello\n");
+        assert!(press(&f, Key::Punct, "!"));
+        assert_eq!(f.1.marked(), "！");
     }
 }
