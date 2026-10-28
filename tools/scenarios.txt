@@ -486,6 +486,7 @@ sonokenn<bs><enter>	そのけ
 <live>sensei<bs><bs><enter>
 <live>kugiwoutu<bs><enter>	釘を打
 <live>sensei<bs>kou<enter>	先行
+<live>senseiha<bs>kou<enter>	先生項
 <live>sensei<bs><space><enter>	戦
 <live>sensei<bs>Apple<enter>	せんApple
 # 英単語のあとに助詞で始まらないかなが続いても、頭に l q v x を含む語なら英単語とかなに分ける。語が打ちかけの間 (informa) や日本語として自然でない続きは分けない。
@@ -510,7 +511,10 @@ issue<space>	issue
 <live>issuenisitai<enter>	issueにしたい
 <live>kitto<enter>	きっと
 <live>made<enter>	まで
-# live の Backspace で、見えている日本語が英単語 (kite) の綴りに縮んでも、読みが見出しなら固定した表示を保つ。
+# live の Backspace で、見えている日本語が英単語 (kimono) の綴りに縮んでも、読みが見出しなら固定した表示を保つ。
+<live>kimonowo<bs><enter>	着物
+<live>animega<bs><enter>	アニメ
+# 読みが 2 かなに戻る Backspace は固定せずひらがな (3 かな以上の固定とは別)。
 <live>kitekure<bs><bs><enter>	きて
 <live>kitekudasai<bs><bs><bs><bs><enter>	きて
 # live 変換は、読みが 2 かな以下の間は変換せずひらがなのまま (3 かなめから変換する)。Space の変換は 1〜2 かなでも使える。
@@ -522,3 +526,8 @@ issue<space>	issue
 <live>kikuno<bs><enter>	きく
 <live>kikuno<bs><bs><enter>	き
 <live>ki<space><enter>	機
+<live>ki!?<enter>	き！？
+<live>kiku,<enter>	きく、
+<live>kiku1<enter>	きく1
+# 2 かなの英単語は、エンジンの第 1 候補が英語でも live ではひらがなのまま (Space なら候補に出る)。
+<live>on<enter>	おん

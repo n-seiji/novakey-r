@@ -734,7 +734,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.word_verdict = None;
             return;
         }
-        // 比べる相手は見えている表示。固定中は固定した分 + 残りの変換 (読みに戻すと見えている表示が変わる)。
+        // 比べる相手は engine の第 1 候補 (live の短い読みはひらがな表示でも同じ)。固定中は固定した分 + 残りの変換 (読みに戻すと見えている表示が変わる)。
         let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some()).map(|c| c.text.clone());
         let first = match &self.pin {
             Some(pin) => Some(pin.surface() + converted.as_deref().unwrap_or_else(|| self.rest())),
@@ -896,9 +896,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reading.list.first().and_then(Candidate::engine_rank)
     }
 
-    /// live 変換が表示を変換する長さの読みか。未確定のローマ字は数えない。
+    /// live 変換が表示を変換する長さの読みか。かなだけを数え、未確定のローマ字・記号・数字・長音は数えない。
     fn live_converts(&self) -> bool {
-        self.live && self.hiragana.chars().count() > LIVE_MIN_KANA
+        let kana = self.hiragana.chars().filter(|c| matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}')).count();
+        self.live && kana > LIVE_MIN_KANA
     }
 
     /// live 変換でかなを入力中で、英語としては扱われていない。短い読みはひらがなのままなので含めない。
@@ -1945,6 +1946,18 @@ mod tests {
         let committed = c.commit();
         assert_eq!(committed.text, "せん");
         assert_eq!(committed.engine, None);
+    }
+
+    #[test]
+    fn live中の記号と数字は読みの長さに数えない() {
+        for tail in ["!", "?", "1"] {
+            let mut c = words_composer();
+            type_units(&mut c, &[("se", "せ"), ("n", "ん")]);
+            c.push_input(tail, tail, "");
+            c.push_input(tail, tail, "");
+            assert_eq!(c.preedit(), format!("せん{tail}{tail}"));
+            assert_wysiwyg(&c);
+        }
     }
 
     #[test]
