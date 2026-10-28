@@ -542,3 +542,9 @@ ra-men<enter>	らーめん
 <lt>-a<enter>	<-あ
 <lt>-<gt>a<enter>	<->あ
 a<lt>-<gt><enter>	あ<->
+kyou->asita<space><enter>	今日->明日
+<live>kyou->asita<enter>	今日->明日
+-><bs><enter>	ー
+<lt><right>-<enter>	<ー
+<lt><up>-<enter>	<ー
+<lt><esc>-<enter>	<ー

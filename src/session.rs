@@ -51,6 +51,8 @@ pub struct Session<E: CandidateEngine, L: Lexicon, M: EnglishMemory> {
     after_ascii: bool,
     /// 直前に打った文字が `<` か (`<-` の `-` を長音にしないため)。
     after_lt: bool,
+    /// このセッションが最後に処理したキーが、`<` の直接挿入だったか。
+    last_key_was_lt: bool,
 }
 
 /// 直前が半角のときに、組成の先頭でも半角のまま入れる記号。`[ ] - / ~` は含めない。
@@ -64,6 +66,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             memory,
             after_ascii: false,
             after_lt: false,
+            last_key_was_lt: false,
         }
     }
 
@@ -131,6 +134,19 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
 
     /// キー処理の入口。キーを動作表で解決して実行する。
     pub fn handle(&mut self, gates: &Gates, key: Key, text: &str) -> Outcome {
+        let after_lt = self.after_lt && self.last_key_was_lt;
+        self.last_key_was_lt = false;
+        let outcome = self.handle_key(gates, key, text, after_lt);
+        self.last_key_was_lt = outcome.action == Some(Action::InsertDirect) && text == "<";
+        outcome
+    }
+
+    /// セッションを通らないキー (カーソル移動・ショートカット) があった。`<-` の判定をそこで切る。
+    pub fn forget_last_key(&mut self) {
+        self.last_key_was_lt = false;
+    }
+
+    fn handle_key(&mut self, gates: &Gates, key: Key, text: &str, after_lt: bool) -> Outcome {
         let mut fx = Vec::new();
         let phase = self.phase();
         if gates.direct {
@@ -157,7 +173,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
         // `<` を打った直後の `-` は長音にせず半角のまま入れる (`<-`)。
-        if phase == Phase::Empty && self.after_lt && key == Key::Hyphen {
+        if phase == Phase::Empty && after_lt && key == Key::Hyphen {
             fx.push(Effect::Insert(text.to_string()));
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
@@ -182,6 +198,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
 
     /// 入力ソースの切り替えなどによる確定 (commitComposition:)。
     pub fn commit_composition(&mut self, gates: &Gates) -> Vec<Effect> {
+        self.last_key_was_lt = false;
         let mut fx = Vec::new();
         self.composer.flush_romaji();
         if !self.composer.is_empty() {
@@ -866,9 +883,30 @@ mod tests {
     #[test]
     fn lt_の直後のハイフンは長音にしない() {
         let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.handle(&ALLOW, classify('<'), "<");
         session.set_context("<");
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert_eq!(inserted(&outcome), ["-"]);
         assert_eq!(session.marked_text(), "");
+    }
+
+    #[test]
+    fn lt_のあとにカーソルが動いたら_ハイフンは長音のまま() {
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.handle(&ALLOW, classify('<'), "<");
+        session.forget_last_key();
+        session.set_context("<");
+        let outcome = session.handle(&ALLOW, classify('-'), "-");
+        assert!(inserted(&outcome).is_empty());
+        assert_eq!(session.marked_text(), "ー");
+    }
+
+    #[test]
+    fn 矢印のgtを_bs_で消すと長音に戻る() {
+        let mut session = Session::new(Composer::new(NullEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Space);
+        session.handle(&ALLOW, classify('-'), "-");
+        session.handle(&ALLOW, classify('>'), ">");
+        session.handle(&ALLOW, Key::Backspace, "\u{7f}");
+        assert_eq!(session.marked_text(), "ー");
     }
 }
