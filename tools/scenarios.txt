@@ -478,14 +478,15 @@ cachega<enter>	cacheが
 # live 変換の Backspace は、見えている最後の 1 文字に当たる読みを消す (Space 変換と未確定ローマ字は従来どおり 1 文字)。
 <live>sonokenn<bs><enter>	その
 <live>kaisyanokenn<bs><bs><enter>	会社
-<live>kaisyanokenn<bs><bs><bs><enter>	会
+<live>kaisyanokenn<bs><bs><bs><enter>	かい
 <live>sonok<bs><enter>	その
 sonokenn<bs><enter>	そのけ
 # live 変換の Backspace で残った部分は、見えているまま固定する。続けて打った分だけを変換し、Space で固定を外して読み全体を変換し直す。
-<live>sensei<bs><enter>	先
+<live>sensei<bs><enter>	せん
 <live>sensei<bs><bs><enter>
 <live>kugiwoutu<bs><enter>	釘を打
-<live>sensei<bs>kou<enter>	先項
+<live>sensei<bs>kou<enter>	先行
+<live>senseiha<bs>kou<enter>	先生項
 <live>sensei<bs><space><enter>	戦
 <live>sensei<bs>Apple<enter>	せんApple
 # 英単語のあとに助詞で始まらないかなが続いても、頭に l q v x を含む語なら英単語とかなに分ける。語が打ちかけの間 (informa) や日本語として自然でない続きは分けない。
@@ -509,7 +510,24 @@ issue<space>	issue
 <live>doseihakireidesu<enter>	土星は綺麗です
 <live>issuenisitai<enter>	issueにしたい
 <live>kitto<enter>	きっと
-<live>made<enter>	間で
-# live の Backspace で、見えている日本語が英単語 (kite) の綴りに縮んでも、読みが見出しなら固定した表示を保つ。
-<live>kitekure<bs><bs><enter>	来て
-<live>kitekudasai<bs><bs><bs><bs><enter>	来て
+<live>made<enter>	まで
+# live の Backspace で、見えている日本語が英単語 (kimono) の綴りに縮んでも、読みが見出しなら固定した表示を保つ。
+<live>kimonowo<bs><enter>	着物
+<live>animega<bs><enter>	アニメ
+# 読みが 2 かなに戻る Backspace は固定せずひらがな (3 かな以上の固定とは別)。
+<live>kitekure<bs><bs><enter>	きて
+<live>kitekudasai<bs><bs><bs><bs><enter>	きて
+# live 変換は、読みが 2 かな以下の間は変換せずひらがなのまま (3 かなめから変換する)。Space の変換は 1〜2 かなでも使える。
+<live>ki<enter>	き
+<live>ti<enter>	ち
+<live>kyo<enter>	きょ
+<live>kiku<enter>	きく
+<live>kikuno<enter>	菊の
+<live>kikuno<bs><enter>	きく
+<live>kikuno<bs><bs><enter>	き
+<live>ki<space><enter>	機
+<live>ki!?<enter>	き！？
+<live>kiku,<enter>	きく、
+<live>kiku1<enter>	きく1
+# 2 かなの英単語は、エンジンの第 1 候補が英語でも live ではひらがなのまま (Space なら候補に出る)。
+<live>on<enter>	おん
