@@ -203,7 +203,8 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         let mut fx = Vec::new();
         self.composer.flush_romaji();
         if !self.composer.is_empty() {
-            fx.push(Effect::Insert(self.commit(gates)));
+            // フォーカス喪失などによる確定は、英語を「選んだ」のではないので、選択による学習はしない。
+            fx.push(Effect::Insert(self.commit(gates, false)));
         }
         fx.push(Effect::HideCandidates);
         fx
@@ -211,8 +212,9 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
 
     /// 確定して、学習してよければ学習する。学習の可否を判定するのはここだけ。
     /// 学習しない (ゲートが閉じている / 学習対象の engine 候補が無い) ときは engine の保留を取り消す。
-    fn commit(&mut self, gates: &Gates) -> String {
-        let Committed { text, engine, english } = self.composer.commit();
+    /// chosen は、利用者が確定を選んだ (commitComposition ではない) とき true。候補から選んだ英字はそのときだけ学習する。
+    fn commit(&mut self, gates: &Gates, chosen: bool) -> String {
+        let Committed { text, engine, english, picked } = self.composer.commit();
         match engine.filter(|_| gates.learning) {
             Some((generation, rank)) => {
                 let _ = self.composer.engine_mut().select(generation, rank.0);
@@ -220,7 +222,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             None => self.composer.engine_mut().cancel(),
         }
         if gates.learning {
-            for word in &english {
+            for word in english.iter().chain(picked.iter().filter(|_| chosen)) {
                 self.memory.learn(word);
             }
         }
@@ -233,7 +235,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
 
     /// 現在の表示内容を確定して挿入する。suffix は確定直後に続けて入れる文字列。
     fn commit_and_insert(&mut self, gates: &Gates, suffix: &str, fx: &mut Vec<Effect>) {
-        let text = self.commit(gates);
+        let text = self.commit(gates, true);
         fx.push(Effect::SetMarked(String::new()));
         fx.push(Effect::Insert(format!("{text}{suffix}")));
         fx.push(Effect::HideCandidates);
@@ -824,6 +826,53 @@ mod tests {
         assert_eq!(commit_with(&ALLOW, "G").1.learned(), ["G"]);
         let denied = Gates { learning: false, direct: false };
         assert!(commit_with(&denied, "G").1.learned().is_empty());
+    }
+
+    /// どの読みも辞書の見出しとして答える RecordingEngine (done が どね の見出しと衝突して、Space で候補が出る)。
+    struct HeadwordEngine(RecordingEngine);
+    impl CandidateEngine for HeadwordEngine {
+        fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+            self.0.convert(revision, hiragana)
+        }
+        fn select(&mut self, revision: u64, index: usize) -> bool {
+            self.0.select(revision, index)
+        }
+        fn cancel(&mut self) {
+            self.0.cancel();
+        }
+        fn has_reading(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    /// done を辞書の英単語とし、done を打って Space で候補を出し、done を選ぶ。finish が確定のしかた。
+    fn pick_done(gates: &Gates, finish: impl FnOnce(&mut Session<HeadwordEngine, FakeLexicon, FakeMemory>, &Gates)) -> FakeMemory {
+        let lexicon = FakeLexicon::default().with_english_word(|w| w == "done");
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(HeadwordEngine(RecordingEngine::default()), lexicon), memory.clone(), ConversionMode::Space);
+        for ch in "done ".chars() {
+            session.handle(gates, classify(ch), &ch.to_string());
+        }
+        assert!(session.composer.select_candidate_text("done"));
+        finish(&mut session, gates);
+        memory
+    }
+
+    #[test]
+    fn 候補から選んだ英字は学習が許されるときだけ英語として覚える() {
+        let enter = |s: &mut Session<_, _, _>, g: &Gates| {
+            s.handle(g, Key::Enter, "\r");
+        };
+        assert_eq!(pick_done(&ALLOW, enter).learned(), ["done"]);
+        assert_eq!(pick_done(&ALLOW, |s, g| drop(s.commit_selected(g, "done"))).learned(), ["done"]);
+        let denied = Gates { learning: false, direct: false };
+        assert!(pick_done(&denied, enter).learned().is_empty());
+    }
+
+    #[test]
+    fn 入力ソース切り替えなどの確定では英字を選んだことにしない() {
+        let memory = pick_done(&ALLOW, |s, g| drop(s.commit_composition(g)));
+        assert!(memory.learned().is_empty());
     }
 
     fn inserted(outcome: &Outcome) -> Vec<&str> {

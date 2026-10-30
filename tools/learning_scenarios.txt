@@ -8,3 +8,13 @@ kanji<space><enter>	幹事
 kankei<space><enter>	関係
 # 覚えた語は長い読みの中でも効く
 kanjiwokaku<space><enter>	幹事を書く
+# 候補から選んで英語として確定した語は、以後 (見出しの読みがあっても) 英字のまま打つ。選ぶ前は読み
+donewo<enter>	どねを
+done<space><pick:2>	done
+done<enter>	done
+the<space><pick:10>	the
+the<enter>	the
+# 選んでいない語と、覚えた語に続く読みは分割しない
+madeni<enter>	までに
+donewo<enter>	どねを
+thenoyoni<enter>	てぇのよに
