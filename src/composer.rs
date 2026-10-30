@@ -166,6 +166,15 @@ struct Selection {
 /// 数字キーで選べる先頭の件数。
 const DIGIT_PICKS: usize = 9;
 
+impl Selection {
+    /// カーソルを index へ動かし、候補ウィンドウを出す状態にする。scrolled の更新はここだけ。
+    fn move_to(&mut self, index: usize) {
+        self.cursor = index;
+        self.window = true;
+        self.scrolled = index != 0 && (self.scrolled || index >= DIGIT_PICKS);
+    }
+}
+
 /// 組成の段階。局面ごとにしか意味のないデータは variant の中に置く。打鍵の解釈 (Typing) は段階をまたいで Composer が持つ。
 #[derive(Debug)]
 enum Stage {
@@ -937,11 +946,16 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.sync_hiragana();
         self.reset_candidates();
         self.stage = Stage::Editing;
-        self.typing = if self.segments.iter().all(Segment::is_literal) {
+        self.typing = self.literal_typing();
+    }
+
+    /// 英字入力を含む組成の打鍵の解釈。英字だけなら Literal、かなが混じれば Mixed。
+    fn literal_typing(&self) -> Typing {
+        if self.segments.iter().all(Segment::is_literal) {
             Typing::Literal
         } else {
             Typing::Mixed
-        };
+        }
     }
 
     /// live 変換で、underline に出ている (preedit と同じ) 第 1 候補の engine 順位。
@@ -1041,11 +1055,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             self.pin = None;
             self.sync_hiragana();
             self.reset_candidates();
-            self.typing = if self.segments.iter().all(Segment::is_literal) {
-                Typing::Literal
-            } else {
-                Typing::Mixed
-            };
+            self.typing = self.literal_typing();
         } else {
             self.refresh();
         }
@@ -1102,9 +1112,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let Stage::Selecting(s) = &mut self.stage else {
             return false;
         };
-        s.cursor = (s.cursor + 1) % s.list.len();
-        s.window = true;
-        s.scrolled = s.cursor != 0 && (s.scrolled || s.cursor >= DIGIT_PICKS);
+        let next = (s.cursor + 1) % s.list.len();
+        s.move_to(next);
         true
     }
 
@@ -1113,9 +1122,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let Stage::Selecting(s) = &mut self.stage else {
             return false;
         };
-        s.cursor = (s.cursor + s.list.len() - 1) % s.list.len();
-        s.window = true;
-        s.scrolled = s.cursor != 0 && (s.scrolled || s.cursor >= DIGIT_PICKS);
+        let prev = (s.cursor + s.list.len() - 1) % s.list.len();
+        s.move_to(prev);
         true
     }
 
@@ -1129,13 +1137,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return false;
         }
         if let Stage::Selecting(s) = &mut self.stage {
-            s.cursor = index;
-            s.window = true;
-            s.scrolled = index != 0 && (s.scrolled || index >= DIGIT_PICKS);
+            s.move_to(index);
             return true;
         }
         let list = self.candidates().to_vec();
-        self.stage = Stage::Selecting(Selection { list, cursor: index, window: true, scrolled: index >= DIGIT_PICKS });
+        let mut selection = Selection { list, cursor: 0, window: false, scrolled: false };
+        selection.move_to(index);
+        self.stage = Stage::Selecting(selection);
         true
     }
 
@@ -1149,6 +1157,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 組成を捨てて空に戻す(何も確定しない)。
     pub fn discard(&mut self) {
         self.engine.cancel();
+        self.clear();
+    }
+
+    /// 組成の状態を空に戻す。discard と commit の共通の後始末。
+    fn clear(&mut self) {
         self.pin = None;
         self.segments.clear();
         self.split_origin = None;
@@ -1216,15 +1229,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             _ => self.live_rank(),
         }
         .map(|rank| (self.reading.generation, rank));
-        self.pin = None;
-        self.segments.clear();
-        self.split_origin = None;
-        self.romaji.clear();
-        self.hiragana.clear();
-        self.reset_candidates();
-        self.stage = Stage::Editing;
-        self.typing = Typing::Empty;
-        self.word_verdict = None;
+        self.clear();
         Committed { text, engine, english, picked }
     }
 
