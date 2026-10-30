@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use super::dict::to_katakana;
 use super::elem::{count_graphemes, Elem, CID_NUMBER, CID_PROPER_NOUN, CID_SYMBOL, MID_GENERAL, MID_NUMBER, MID_SMALL_NUMBER};
 
 /// 全角記号 -> 半角記号の対応。`DicdataStore.fullwidthToHalfwidth` を ICU の結果で固定した表
@@ -134,14 +135,6 @@ fn weak_lookup() -> &'static HashMap<&'static str, Vec<&'static str>> {
 /// Rust の `is_numeric` (Nd / Nl / No) に、Numeric_Type が付く漢数字を足す。
 pub fn is_number(c: char) -> bool {
     c.is_numeric() || matches!(c, '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千' | '万' | '億' | '兆' | '零' | '壱' | '弐' | '参' | '拾' | '京' | '〇' | '廿' | '卅' | '卌' | '皕' | '陌' | '阡' | '萬' | '貳' | '叁' | '肆' | '伍' | '陸' | '柒' | '捌' | '玖' | '仟' | '佰')
-}
-
-/// ひらがな -> カタカナ (`String.toKatakana`)。
-pub fn to_katakana_char(c: char) -> char {
-    match c as u32 {
-        0x3041..=0x3096 => char::from_u32(c as u32 + 0x60).unwrap_or(c),
-        _ => c,
-    }
 }
 
 /// カタカナ -> ひらがな (`String.toHiragana`)。
@@ -565,7 +558,7 @@ pub fn wise_dicdata(segment: &str, range: std::ops::Range<usize>, full_text: &[c
     // `convertTarget.count == 1` は grapheme 数。1 スカラーの場合に加え、結合文字つきの 1 文字も数える
     let is_single_grapheme = single.is_some() || (segment.chars().count() > 1 && count_graphemes(segment) == 1);
     if is_single_grapheme {
-        let katakana: String = segment.chars().map(to_katakana_char).collect();
+        let katakana = to_katakana(segment);
         let hiragana = to_hiragana(segment);
         if katakana == hiragana {
             result.push(Elem::new(katakana.clone(), katakana, CID_PROPER_NOUN, CID_PROPER_NOUN, MID_GENERAL, -14.0));

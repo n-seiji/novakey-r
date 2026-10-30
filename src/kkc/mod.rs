@@ -86,8 +86,8 @@ impl KkcCore {
         if reading.is_empty() {
             return Converted::default();
         }
-        let chars = lattice::katakana_chars(reading);
-        let katakana: String = chars.iter().collect();
+        let katakana = dict::to_katakana(reading);
+        let chars: Vec<char> = katakana.chars().collect();
         let learning = self.learning.borrow();
         let mut lat = lattice::Lattice::build_with_memory(&self.dict, &mut self.cache.borrow_mut(), Some(&learning), &chars);
         lat.run(&self.dict, N_BEST);
@@ -279,7 +279,7 @@ impl CandidateEngine for RustEngine {
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
         add_variants(core, &mut top);
         let head_len = top.len();
-        let katakana: String = lattice::katakana_chars(hiragana).iter().collect();
+        let katakana = dict::to_katakana(hiragana);
         append_tail(&mut top, &converted.main[converted.main.len().min(TOP_N)..], &katakana);
         let mut order: Vec<usize> = (0..top.len()).collect();
         let slots: Vec<usize> = (0..head_len).filter(|&i| top[i].source == result::Source::Full).collect();
@@ -789,9 +789,6 @@ mod tests {
         let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "いっとうがし");
         assert_eq!(after[0], "一棟貸し", "{after:?}");
     }
-    fn katakana_of(reading: &str) -> String {
-        lattice::katakana_chars(reading).iter().collect()
-    }
 
     /// 先頭 (TOP_N + 派生候補) の長さ。審判なし・tail なしの旧来の返り値の長さと同じ。
     fn head_len(core: &Rc<KkcCore>, reading: &str) -> usize {
@@ -807,7 +804,7 @@ mod tests {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         for reading in ["かんじ", "こうしょう", "きしゃ", "いっとう", "きょうはいいてんきですね"] {
             let main = core.convert_all(reading).main;
-            let whole = main.iter().skip(TOP_N).filter(|c| c.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana_of(reading)).count();
+            let whole = main.iter().skip(TOP_N).filter(|c| c.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == dict::to_katakana(reading)).count();
             let shown = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, reading).len();
             eprintln!("COUNT main={} whole_past_9={whole} head={} shown={shown}", main.len(), head_len(&core, reading));
         }
@@ -821,7 +818,7 @@ mod tests {
         let head = head_len(&core, "かんじ");
         assert!(shown.len() > TOP_N && shown.len() <= MAX_SHOWN, "{}", shown.len());
         assert!(shown.len() > head, "tail がある");
-        let want = katakana_of("かんじ");
+        let want = dict::to_katakana("かんじ");
         for i in 0..shown.len() {
             let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
             if i >= head {
@@ -838,7 +835,7 @@ mod tests {
         let reading = "きょうはいいてんきですね";
         let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
         let shown = e.convert(1, reading);
-        let want = katakana_of(reading);
+        let want = dict::to_katakana(reading);
         for i in head_len(&core, reading)..shown.len() {
             let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
             assert_eq!(ruby, want);

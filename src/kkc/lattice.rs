@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::dict::{to_katakana, Dictionary, CC_MISSING};
+use super::dict::{Dictionary, CC_MISSING};
 use super::learning::Learning;
 use super::elem::{include_mm_value_calculation, is_clause, Elem, MID_BOS_EOS};
 use super::wise::wise_dicdata;
@@ -360,13 +360,9 @@ impl Lattice {
     }
 }
 
-/// 読み (ひらがな可) をカタカナ化した文字列の `Vec<char>`
-pub fn katakana_chars(reading: &str) -> Vec<char> {
-    to_katakana(reading).chars().collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::dict::to_katakana;
     use super::*;
 
     fn elem(word: &str, ruby: &str, lcid: usize, rcid: usize, mid: usize, v: f32) -> Rc<Elem> {
