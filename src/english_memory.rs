@@ -5,7 +5,6 @@
 // 新しい語を覚えたときだけ書き出す (語はたまにしか増えないので、変換の学習のような裏の書き手は持たない)。
 
 use std::cell::RefCell;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 覚えておく語数の上限。超えたら使っていない順に忘れる。
@@ -89,23 +88,8 @@ pub fn learn(word: &str) {
 }
 
 fn save(path: &Path, words: &[String]) {
-    let result = (|| -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            crate::private_fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension(format!("txt.tmp-{}", std::process::id()));
-        let written = (|| -> std::io::Result<()> {
-            let mut file = crate::private_fs::create_file(&tmp)?;
-            file.write_all((words.join("\n") + "\n").as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
-    })();
-    if let Err(e) = result {
+    let tmp = path.with_extension(format!("txt.tmp-{}", std::process::id()));
+    if let Err(e) = crate::private_fs::write_atomic(path, &tmp, (words.join("\n") + "\n").as_bytes()) {
         crate::platform::log(&format!("english memory not saved: {e}"));
     }
 }
