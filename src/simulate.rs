@@ -18,7 +18,6 @@ use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
 use crate::session::ConversionMode;
-use crate::translit::Form;
 
 fn key_input(key_code: u16, characters: &str) -> KeyInput {
     KeyInput {
@@ -256,11 +255,6 @@ struct Sim {
     controller: SimController,
     client: FakeClient,
     panel: FakePanel,
-    /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
-    stale: Vec<String>,
-    /// 表示 (preedit) と、Enter で確定される文字列 (commit_preview) が食い違った打鍵 (ラベル)。
-    /// 検査は opt-in。未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない。
-    wysiwyg_broken: Vec<String>,
 }
 
 impl Sim {
@@ -271,8 +265,6 @@ impl Sim {
             controller: Controller::new(0, session, panel.clone(), FakeEnv::default()),
             client: FakeClient::default(),
             panel,
-            stale: Vec::new(),
-            wysiwyg_broken: Vec::new(),
         }
     }
 
@@ -345,13 +337,9 @@ impl Sim {
             .join(" ")
     }
 
-    fn describe_form(form: Form) -> String {
-        form.name().to_string()
-    }
-
     fn phase_name(&self) -> String {
         match self.controller.phase() {
-            Phase::Transliterated(form) => format!("Transliterated({})", Self::describe_form(form)),
+            Phase::Transliterated(form) => format!("Transliterated({})", form.name()),
             other => format!("{other:?}"),
         }
     }
@@ -452,6 +440,9 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
     crate::context::with(|store| store.clear_all());
     let mut sim = Sim::new();
     sim.client.set_bundle("sim");
+    let mut stale = Vec::new();
+    // 検査は opt-in。未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない。
+    let mut wysiwyg_broken = Vec::new();
     for (label, step) in parse_keys(keys)? {
         let started = std::time::Instant::now();
         sim.apply(&label, &step)?;
@@ -463,10 +454,10 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
             TIMINGS.with(|t| t.borrow_mut().push((started.elapsed().as_secs_f64() * 1e3, judge_ms.is_some())));
         }
         if sim.client.marked() != sim.controller.marked_text() {
-            sim.stale.push(label.clone());
+            stale.push(label.clone());
         }
         if check_preedit && sim.controller.commit_preview().is_some_and(|p| p != sim.controller.marked_text()) {
-            sim.wysiwyg_broken.push(label.clone());
+            wysiwyg_broken.push(label.clone());
         }
         if verbose {
             let panel = if sim.panel.visible() { format!(" panel@{}", sim.panel.line() + 1) } else { String::new() };
@@ -485,7 +476,7 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
             }
         }
     }
-    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale: sim.stale, wysiwyg_broken: sim.wysiwyg_broken })
+    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale, wysiwyg_broken })
 }
 
 /// `--simulate '<keys>'`
