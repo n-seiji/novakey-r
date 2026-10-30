@@ -274,7 +274,7 @@ fn 英単語のrawは第2候補に残る() {
 fn 変換候補が空でもdanglingならrawが先頭のまま() {
     let engine = MockEngine { log: Log::default(), table: vec![] };
     let mut c = Composer::new(engine, FakeLexicon::default());
-    c.push_flush(Flush::Dangling("きょうh".to_string()));
+    c.push_flush(Some("きょうh".into()));
     c.push_input("kyouh", "", "");
     assert_eq!(c.phase(), Phase::Dangling);
     assert!(c.begin_conversion());
@@ -1127,7 +1127,7 @@ fn 末尾が変換しきれない組成のかな形は子音をそのまま残�
     c.push_input("n", "ん", "");
     c.push_input("te", "て", "");
     c.push_input("r", "", "r");
-    c.push_flush(Flush::Dangling("r".to_string()));
+    c.push_flush(Some("r".into()));
     assert_eq!(c.phase(), Phase::Dangling);
     c.transliterate(Form::Katakana);
     assert_eq!(c.display(), "エンテr");
@@ -1213,7 +1213,7 @@ fn 取り消しても_literal_のままで確定は英字になる() {
 fn 取り消しからの再変換は直前の候補列から続く_dangling() {
     let engine = MockEngine { log: Log::default(), table: vec![("きょうh".to_string(), vec![])] };
     let mut c = Composer::new(engine, FakeLexicon::default());
-    c.push_flush(Flush::Dangling("きょうh".to_string()));
+    c.push_flush(Some("きょうh".into()));
     c.push_input("kyouh", "", "");
     assert!(c.begin_conversion());
     assert_eq!(texts(&c), vec!["kyouh"]);
@@ -1456,7 +1456,7 @@ fn 表に無い語は候補が増えない() {
 fn 末尾の子音が残るDanglingでは英単語を引かない() {
     let mut c = loan_composer("ですくとっぷ", &["デスクトップ"]);
     c.push_input("desukutoppu", "ですくとっぷ", "");
-    c.push_flush(Flush::Dangling("r".to_string()));
+    c.push_flush(Some("r".into()));
     assert_eq!(c.phase(), Phase::Dangling);
     c.begin_conversion();
     assert!(!texts(&c).contains(&"desktop"));
@@ -1545,7 +1545,7 @@ fn 読みが表に無ければ候補は変わらない() {
 fn 末尾の子音が残るDanglingでは絵文字を引かない() {
     let mut c = emoji_composer("ねこ", &["猫"]);
     c.push_input("neko", "ねこ", "");
-    c.push_flush(Flush::Dangling("r".to_string()));
+    c.push_flush(Some("r".into()));
     c.begin_conversion();
     assert!(!texts(&c).contains(&"😺"));
 }

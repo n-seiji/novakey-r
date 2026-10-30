@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use crate::deps::Lexicon;
 use crate::english_split;
 use crate::kkc::live_backspace;
-use crate::romaji_converter::{Flush, RomajiConverter};
+use crate::romaji_converter::RomajiConverter;
 use crate::symbols;
 use crate::translit::{self, Form};
 
@@ -582,7 +582,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.symbol_variants().is_some()
     }
 
-    /// 未確定のローマ字を確定かなとして取り込む。Dangling なら局面を Dangling にする。
+    /// 未確定のローマ字を確定かなとして取り込む。変換しきれない子音が残れば (`enter` の `r`) 局面を Dangling にする。
     pub fn flush_romaji(&mut self) {
         let english = self.is_typing_english();
         let keys = self.romaji.buffer().to_string();
@@ -591,10 +591,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     }
 
     /// english は、未確定のローマ字を残した状態で英語と見なせていたか。
-    fn absorb_flush(&mut self, english: bool, keys: String, flush: Flush) {
-        match flush {
-            Flush::Empty => {}
-            Flush::Kana(kana) | Flush::Dangling(kana) => self.push_kana(keys, &kana),
+    fn absorb_flush(&mut self, english: bool, keys: String, flush: Option<String>) {
+        if let Some(kana) = flush {
+            self.push_kana(keys, &kana);
         }
         match self.settle(english) {
             Settle::Mixed(split) => self.fix_english_split(split),
@@ -911,9 +910,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.push_kana(pending[..split].to_string(), kana);
     }
 
-    /// テスト用: 外の RomajiConverter が返した Flush を取り込む。
+    /// テスト用: 外の RomajiConverter が flush で返したかなを取り込む。
     #[cfg(test)]
-    pub fn push_flush(&mut self, flush: Flush) {
+    pub fn push_flush(&mut self, flush: Option<String>) {
         let english = self.is_typing_english();
         let keys = self.romaji.buffer().to_string();
         self.romaji.clear();
