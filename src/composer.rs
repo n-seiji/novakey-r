@@ -239,6 +239,11 @@ impl Segment {
     fn is_literal(&self) -> bool {
         matches!(self, Segment::Literal(_))
     }
+
+    /// 英語分割の英単語 (Literal) とかな部分 (Kana) を、区切りの並びにする。
+    fn from_split(head: String, tail: Vec<(String, String)>) -> impl Iterator<Item = Segment> {
+        std::iter::once(Segment::Literal(head)).chain(tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana }))
+    }
 }
 
 /// 1 回の変換で入れる絵文字の上限
@@ -353,12 +358,12 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Stage::Editing if self.typing == Typing::Kana && self.live_converts() => match &self.pin {
                 None => Cow::Borrowed(self.reading.list.first().map_or(self.hiragana.as_str(), |c| c.text.as_str())),
                 Some(pin) => {
-                    let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some());
+                    let converted = self.converted_first();
                     Cow::Owned(pin.surface() + converted.map_or(self.rest(), |c| c.text.as_str()))
                 }
             },
             Stage::Editing if self.typing == Typing::Mixed && self.live => {
-                let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some());
+                let converted = self.converted_first();
                 Cow::Borrowed(converted.map_or(self.hiragana.as_str(), |c| c.text.as_str()))
             }
             Stage::Transliterated { text, .. } => Cow::Borrowed(text),
@@ -508,6 +513,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         &self.hiragana[at..]
     }
 
+    /// 読みの候補列 (`reading.list`) の第 1 候補が engine の変換結果ならそれ。記号の異体などは None。
+    fn converted_first(&self) -> Option<&Candidate> {
+        self.reading.list.first().filter(|c| c.engine_rank().is_some())
+    }
+
     /// 固定を外して読み全体を変換し直す。読みはそのまま。
     fn unpin(&mut self) {
         if self.pin.take().is_none() {
@@ -521,14 +531,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     }
 
     fn convert_reading(&mut self) -> Vec<Candidate> {
-        let mut list: Vec<Candidate> = Vec::new();
         let rest = self.rest().to_string();
-        for (engine_index, text) in self.convert_with_arrows(&rest).into_iter().enumerate() {
-            if !list.iter().any(|c| c.text == text) {
-                list.push(Candidate { text, source: Source::Engine(EngineRank(engine_index)) });
-            }
-        }
-        list
+        self.convert_mixed("", &rest)
     }
 
     /// 読みの `->` を `>` としてエンジンに渡して変換し、返った候補の同じ位置の `>` を `->` に戻す。
@@ -698,7 +702,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         list.first().filter(|c| c.engine_rank().is_some()).map(|c| c.text.as_str())
     }
 
-    /// 英単語 head のあとに、かな tail をエンジンで変換したものを付けた候補列。
+    /// 英単語 head のあとに、かな tail をエンジンで変換したものを付けた候補列。head が空なら tail の変換結果だけ。
     fn convert_mixed(&mut self, head: &str, tail: &str) -> Vec<Candidate> {
         let mut list: Vec<Candidate> = Vec::new();
         for (engine_index, text) in self.convert_with_arrows(tail).into_iter().enumerate() {
@@ -743,9 +747,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let origin = (self.segments.clone(), self.romaji.buffer().to_string());
         self.pin = None;
         let head_text = split.head.clone();
-        let head = Segment::Literal(split.head);
-        let tail_segments = split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana });
-        self.segments = std::iter::once(head).chain(tail_segments).collect();
+        self.segments = Segment::from_split(split.head, split.tail).collect();
         self.romaji.clear();
         self.sync_hiragana();
         self.reset_candidates();
@@ -789,7 +791,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         }
         // 比べる相手は engine の第 1 候補 (live の短い読みはひらがな表示でも同じ)。固定中は固定した分 + 残りの変換 (読みに戻すと見えている表示が変わる)。
-        let converted = self.reading.list.first().filter(|c| c.engine_rank().is_some()).map(|c| c.text.clone());
+        let converted = self.converted_first().map(|c| c.text.clone());
         let first = match &self.pin {
             Some(pin) => Some(pin.surface() + converted.as_deref().unwrap_or_else(|| self.rest())),
             None => converted,
@@ -928,8 +930,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let split = if self.typing == Typing::English { self.english_split(false) } else { None };
         if let Some(split) = split {
             // 英語分割を表示している間の大文字は、見えているとおり (英単語+かな) の後ろに付ける。
-            self.segments = std::iter::once(Segment::Literal(split.head))
-                .chain(split.tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana }))
+            self.segments = Segment::from_split(split.head, split.tail)
                 .chain((!split.pending.is_empty()).then(|| Segment::Kana { keys: split.pending.clone(), kana: split.pending }))
                 .chain(std::iter::once(Segment::Literal(text.to_string())))
                 .collect();
@@ -1066,10 +1067,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     pub fn begin_conversion(&mut self) -> bool {
         self.unpin();
         let mut kept = None;
-        if matches!(self.stage, Stage::Transliterated { .. }) {
-            if let Stage::Transliterated { kept: k, .. } = std::mem::replace(&mut self.stage, Stage::Editing) {
-                kept = k;
-            }
+        if let Stage::Transliterated { kept: k, .. } = &mut self.stage {
+            kept = k.take();
+            self.stage = Stage::Editing;
         }
         let phase = self.phase();
         if !matches!(
@@ -1270,13 +1270,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
                 source: Source::Emoji,
             })
             .collect();
-        Self::place_emoji(list, fresh);
-    }
-
-    /// 絵文字を、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
-    fn place_emoji(list: &mut Vec<Candidate>, emoji: Vec<Candidate>) {
+        // 絵文字は、上位 3 件のエンジン候補と英単語・raw の後ろに入れる (3 番目より前には入れない)。
         let position = Self::emoji_position(list);
-        list.splice(position..position, emoji);
+        list.splice(position..position, fresh);
     }
 
     fn emoji_position(list: &[Candidate]) -> usize {
