@@ -234,8 +234,7 @@ fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
         .into_iter()
         .map(|(k, v)| {
             let value = top[full[k]].value - variants::PENALTY;
-            let ruby_count = v.data.iter().map(|e| e.ruby_len).sum();
-            result::Cand { text: v.text, value, ruby_count, data: v.data, source: result::Source::Full }
+            result::Cand::new(v.text, value, v.data, result::Source::Full)
         })
         .collect();
     top.splice(last_full + 1..last_full + 1, cands);
@@ -249,7 +248,7 @@ fn append_tail(top: &mut Vec<result::Cand>, rest: &[result::Cand], katakana: &st
         if top.len() >= MAX_SHOWN {
             break;
         }
-        let covers_all = cand.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana;
+        let covers_all = cand.ruby() == katakana;
         // ASCII だけ (server, VAN, @hotmail.com など) の候補は足さない。英単語は composer が loanwords.tsv から入れる。記号・絵文字は足す
         // (composer が emoji.tsv の絵文字を入れるときは、この後ろの複製を消して決まった位置に入れる)。
         let has_letter = !cand.text.is_ascii();
@@ -804,7 +803,7 @@ mod tests {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         for reading in ["かんじ", "こうしょう", "きしゃ", "いっとう", "きょうはいいてんきですね"] {
             let main = core.convert_all(reading).main;
-            let whole = main.iter().skip(TOP_N).filter(|c| c.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == dict::to_katakana(reading)).count();
+            let whole = main.iter().skip(TOP_N).filter(|c| c.ruby() == dict::to_katakana(reading)).count();
             let shown = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, reading).len();
             eprintln!("COUNT main={} whole_past_9={whole} head={} shown={shown}", main.len(), head_len(&core, reading));
         }

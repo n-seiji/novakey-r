@@ -54,7 +54,6 @@ pub struct Elem {
     pub rcid: usize,
     pub mid: usize,
     pub base: f32,
-    pub adjust: f32,
     /// `word.count` (grapheme 数)
     pub word_len: usize,
     /// `ruby.count` (grapheme 数)
@@ -67,16 +66,15 @@ impl Elem {
     pub fn new(word: String, ruby: String, lcid: usize, rcid: usize, mid: usize, base: f32) -> Self {
         let word_len = count_graphemes(&word);
         let ruby_len = if ruby == word { word_len } else { count_graphemes(&ruby) };
-        let mut e = Self { word, ruby, lcid, rcid, mid, base, adjust: 0.0, word_len, ruby_len, removed: false };
+        let mut e = Self { word, ruby, lcid, rcid, mid, base, word_len, ruby_len, removed: false };
         e.removed = e.compute_removed();
         e
     }
 
-    /// `DicdataElement.value()`: `min(0, base + adjust)`
+    /// `DicdataElement.value()`: `min(0, base + adjust)`。`adjust` は常に 0 なので持たない。
     pub fn value(&self) -> f32 {
-        let v = self.base + self.adjust;
-        if v < 0.0 {
-            v
+        if self.base < 0.0 {
+            self.base
         } else {
             0.0
         }

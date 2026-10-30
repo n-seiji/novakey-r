@@ -56,13 +56,13 @@ pub struct Cand {
 }
 
 impl Cand {
-    fn new(text: String, value: f32, data: Vec<Rc<Elem>>, source: Source) -> Self {
+    pub(super) fn new(text: String, value: f32, data: Vec<Rc<Elem>>, source: Source) -> Self {
         let ruby_count = data.iter().map(|e| e.ruby_len).sum();
         Self { text, value, ruby_count, data, source }
     }
 
     /// data の ruby をつなげたもの
-    fn ruby(&self) -> String {
+    pub(super) fn ruby(&self) -> String {
         self.data.iter().map(|e| e.ruby.as_str()).collect()
     }
 }
@@ -254,26 +254,18 @@ fn unicode_candidates(reading: &str) -> Vec<Cand> {
     Vec::new()
 }
 
-/// `Candidate.data` の ruby をつなげた文字列が読みに一致するか
-fn matches_reading(c: &Cand, reading_katakana: &str) -> bool {
-    c.ruby() == reading_katakana
-}
-
 /// 3 番目までに最低でも 1 つ、(誤り訂正ではなく) 入力に完全一致する候補が入るようにする。
-/// 4 番目以降にあればそれを 3 番目に上げ、無ければ全文候補の上位 5 件、それも無ければ全文候補全体から探して挟む。
-fn ensure_reading_match(result: &mut Vec<Cand>, best_five: &[Cand], whole_sentence: &[Cand], reading_katakana: &str) {
-    if result.iter().take(3).any(|c| matches_reading(c, reading_katakana)) {
+/// 4 番目以降にあればそれを 3 番目に上げ、無ければ全文候補全体から探して挟む。
+fn ensure_reading_match(result: &mut Vec<Cand>, whole_sentence: &[Cand], reading_katakana: &str) {
+    if result.iter().take(3).any(|c| c.ruby() == reading_katakana) {
         return;
     }
-    let found = result.iter().skip(3).position(|c| matches_reading(c, reading_katakana)).map(|p| p + 3);
+    let found = result.iter().skip(3).position(|c| c.ruby() == reading_katakana).map(|p| p + 3);
     if let Some(i) = found {
         let c = result.remove(i);
         let at = result.len().min(2);
         result.insert(at, c);
-    } else if let Some(c) = best_five.iter().find(|c| matches_reading(c, reading_katakana)) {
-        let at = result.len().min(2);
-        result.insert(at, c.clone());
-    } else if let Some(c) = whole_sentence.iter().find(|c| matches_reading(c, reading_katakana)) {
+    } else if let Some(c) = whole_sentence.iter().find(|c| c.ruby() == reading_katakana) {
         let at = result.len().min(2);
         result.insert(at, c.clone());
     }
@@ -297,8 +289,7 @@ pub fn process(dict: &Dictionary, lattice: &Lattice, reading_katakana: &str) -> 
 
     // 文章全体を変換した場合の候補上位 5 件
     let whole_sentence_unique = get_unique(clause_result.iter().map(|d| process_clause_candidate(dict, d)), &empty_seen);
-    let best_five = min_count(whole_sentence_unique.clone(), 5, by_value_desc);
-    let full_candidates = min_count(get_unique(best_five.clone(), &empty_seen), 5, by_value_desc);
+    let full_candidates = min_count(whole_sentence_unique.clone(), 5, by_value_desc);
 
     // 文節のみ変換するパターン
     let unique_first_clause = get_unique(clause_result.iter().map(first_clause_candidate), &empty_seen);
@@ -333,7 +324,7 @@ pub fn process(dict: &Dictionary, lattice: &Lattice, reading_katakana: &str) -> 
     };
 
     let mut result = full_candidates;
-    ensure_reading_match(&mut result, &best_five, &whole_sentence_unique, reading_katakana);
+    ensure_reading_match(&mut result, &whole_sentence_unique, reading_katakana);
     result.extend(first_clause_candidates);
     result.extend(word_candidates);
     Converted { main: result, first_clause: first_clause_results }
@@ -487,29 +478,29 @@ mod tests {
     fn reading_match_is_kept_when_already_in_top3() {
         let mut r = vec![cand("x", "イ", -1.0), cand("y", "アイ", -2.0), cand("z", "ウ", -3.0)];
         let before = texts(&r).join(",");
-        ensure_reading_match(&mut r, &[], &[], "アイ");
+        ensure_reading_match(&mut r, &[], "アイ");
         assert_eq!(texts(&r).join(","), before);
     }
 
     #[test]
     fn reading_match_in_4th_or_later_moves_to_third() {
         let mut r = vec![cand("a", "イ", -1.0), cand("b", "イ", -2.0), cand("c", "イ", -3.0), cand("d", "イ", -4.0), cand("e", "アイ", -5.0)];
-        ensure_reading_match(&mut r, &[], &[], "アイ");
+        ensure_reading_match(&mut r, &[], "アイ");
         assert_eq!(texts(&r), vec!["a", "b", "e", "c", "d"]);
     }
 
     #[test]
-    fn missing_reading_match_is_taken_from_best_five_then_whole_sentence() {
+    fn missing_reading_match_is_taken_from_whole_sentence() {
         let mut r = vec![cand("a", "イ", -1.0), cand("b", "イ", -2.0), cand("c", "イ", -3.0)];
-        ensure_reading_match(&mut r, &[cand("m", "アイ", -9.0)], &[], "アイ");
+        ensure_reading_match(&mut r, &[cand("m", "アイ", -9.0)], "アイ");
         assert_eq!(texts(&r), vec!["a", "b", "m", "c"]);
         let mut r = vec![cand("a", "イ", -1.0)];
-        ensure_reading_match(&mut r, &[], &[cand("w", "アイ", -9.0)], "アイ");
+        ensure_reading_match(&mut r, &[cand("w", "アイ", -9.0)], "アイ");
         // 1 件しかないときは末尾 (min(endIndex, 2))
         assert_eq!(texts(&r), vec!["a", "w"]);
         // どこにも無ければ何もしない
         let mut r = vec![cand("a", "イ", -1.0)];
-        ensure_reading_match(&mut r, &[], &[], "アイ");
+        ensure_reading_match(&mut r, &[], "アイ");
         assert_eq!(texts(&r), vec!["a"]);
     }
 
