@@ -231,45 +231,20 @@ enum Tok {
 
 impl Tok {
     fn is_number(self) -> bool {
-        matches!(self, Tok::Ichi | Tok::Ni | Tok::San | Tok::Yon | Tok::Go | Tok::Roku | Tok::Nana | Tok::Hachi | Tok::Kyuu | Tok::Rei | Tok::End)
+        self == Tok::End || self.digit().is_some()
     }
     fn is_not_number(self) -> bool {
         matches!(self, Tok::Juu | Tok::Hyaku | Tok::Sen | Tok::Man | Tok::Oku | Tok::Chou | Tok::Err | Tok::End)
     }
-    fn to_roman(self) -> &'static str {
-        match self {
-            Tok::Ichi => "1",
-            Tok::Ni => "2",
-            Tok::San => "3",
-            Tok::Yon => "4",
-            Tok::Go => "5",
-            Tok::Roku => "6",
-            Tok::Nana => "7",
-            Tok::Hachi => "8",
-            Tok::Kyuu => "9",
-            Tok::Rei => "0",
-            _ => "",
-        }
-    }
     fn to_kanji(self) -> &'static str {
         match self {
-            Tok::Ichi => "一",
-            Tok::Ni => "二",
-            Tok::San => "三",
-            Tok::Yon => "四",
-            Tok::Go => "五",
-            Tok::Roku => "六",
-            Tok::Nana => "七",
-            Tok::Hachi => "八",
-            Tok::Kyuu => "九",
-            Tok::Rei => "〇",
             Tok::Juu => "十",
             Tok::Hyaku => "百",
             Tok::Sen => "千",
             Tok::Man => "万",
             Tok::Oku => "億",
             Tok::Chou => "兆",
-            Tok::End | Tok::Err => "",
+            _ => self.digit().map_or("", |d| KANSUJI_DIGITS[usize::from(d)]),
         }
     }
     fn max_digit(self) -> Option<usize> {
@@ -493,7 +468,7 @@ fn japanese_number_dicdata(head: &str, out: &mut Vec<Elem>) {
     }
     let kanji: String = tokens.iter().map(|t| t.to_kanji()).collect();
     let roman: String = if tokens.iter().all(|t| t.is_number()) {
-        tokens.iter().map(|t| t.to_roman()).collect()
+        tokens.iter().filter_map(|t| t.digit()).map(|d| char::from(b'0' + d)).collect()
     } else if tokens.iter().all(|t| t.is_not_number()) {
         return;
     } else {
