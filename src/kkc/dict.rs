@@ -25,7 +25,7 @@ pub const CID_COUNT: usize = 1319;
 /// 意味 ID の数 (`DicdataStore.midCount`)
 pub const MID_COUNT: usize = 502;
 /// 連接コストの行が無いときの値
-const CC_MISSING: f32 = -25.0;
+pub(super) const CC_MISSING: f32 = -25.0;
 const UNKNOWN_CHAR_ID: u8 = 255;
 
 #[derive(Debug)]
@@ -351,16 +351,8 @@ impl Dictionary {
     /// `movingTowardPrefixSearch` + `getDicdataFromLoudstxt3` の first-character トライ分に当たる。
     /// user / memory 辞書は対象外。読みはカタカナ化済みであること (`to_katakana`)。
     pub fn prefix_entries(&self, katakana_reading: &str) -> Result<Vec<Entry>, DictError> {
-        let chars: Vec<char> = katakana_reading.chars().collect();
-        let Some(&first) = chars.first() else {
-            return Ok(Vec::new());
-        };
-        let Some(trie) = self.trie(first)? else {
-            return Ok(Vec::new());
-        };
-        let ids: Vec<u8> = chars.iter().map(|&c| self.char_id(c)).collect();
         let mut out = Vec::new();
-        for (_depth, node) in trie.walk(&ids) {
+        for (first, node) in self.prefix_nodes(katakana_reading)? {
             out.extend(self.node_entries(first, node)?);
         }
         Ok(out)
@@ -382,14 +374,7 @@ impl Dictionary {
     /// 品詞連接コスト。`former` は左の語の rcid、`latter` は右の語の lcid。
     /// 行が無い・読めない・範囲外は -25 (Swift 版と同じ)。
     pub fn cc(&self, rcid: usize, lcid: usize) -> f32 {
-        let Some(cell) = self.cc_rows.get(rcid) else {
-            return CC_MISSING;
-        };
-        let row = cell.get_or_init(|| self.load_cc_row(rcid).ok().flatten());
-        match row {
-            Some(r) => r.get(lcid).copied().unwrap_or(CC_MISSING),
-            None => CC_MISSING,
-        }
+        self.cc_row(rcid).and_then(|r| r.get(lcid).copied()).unwrap_or(CC_MISSING)
     }
 
     /// 左の語の rcid の連接コスト行 (`getCCLatter`)。行が無ければ `None` で、呼び出し側は -25 とみなす。
@@ -399,7 +384,7 @@ impl Dictionary {
     }
 
     /// `cb/{rcid}.binary` = (i32 key, f32 value) の並び。最初が key -1 の行既定値、残りが疎な上書き。
-    pub fn load_cc_row(&self, rcid: usize) -> Result<Option<Box<[f32]>>, DictError> {
+    fn load_cc_row(&self, rcid: usize) -> Result<Option<Box<[f32]>>, DictError> {
         let path = self.dir.join(format!("cb/{rcid}.binary"));
         let Some(bytes) = read_file_optional(&path)? else {
             return Ok(None);

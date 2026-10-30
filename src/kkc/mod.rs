@@ -66,20 +66,14 @@ impl KkcCore {
 
     /// 読みがそのまま辞書の見出しにあるか。トライを 1 本たどるだけで、ラティスは作らない。学習・動的な語は見ない。
     pub fn has_reading(&self, hiragana: &str) -> bool {
-        let katakana = dict::to_katakana(hiragana);
-        !katakana.is_empty()
-            && self.dict.prefix_entries(&katakana).is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana))
+        !self.headwords(&dict::to_katakana(hiragana)).is_empty()
     }
 
     /// カタカナの読み `katakana` で、表記が漢字 `kanji` 1 字の見出しが辞書にあるか。live 変換の Backspace が読みを切り分けるのに使う。
     pub fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
         let mut buf = [0u8; 4];
         let kanji: &str = kanji.encode_utf8(&mut buf);
-        !katakana.is_empty()
-            && self
-                .dict
-                .prefix_entries(katakana)
-                .is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana && e.word == kanji))
+        self.headwords(katakana).iter().any(|e| e.word == kanji)
     }
 
     /// カタカナの読みがちょうど一致する辞書の見出し (派生候補の連濁の語探し用)。学習・動的な語は見ない。辞書が読めなければ空。

@@ -7,15 +7,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::dict::{to_katakana, Dictionary};
+use super::dict::{to_katakana, Dictionary, CC_MISSING};
 use super::learning::Learning;
 use super::elem::{include_mm_value_calculation, is_clause, Elem, MID_BOS_EOS};
 use super::wise::wise_dicdata;
 
 /// 辞書のエントリの最大長さ (`DicdataStore.maxlength`)
 pub const MAX_LENGTH: usize = 20;
-/// 連接コストの行が無いときの値
-const CC_MISSING: f32 = -25.0;
 
 /// 1 回の辞書引きの結果の 1 件。`ruby_chars` は ruby のスカラー数 (= ノードの長さ)。
 #[derive(Debug, Clone)]
