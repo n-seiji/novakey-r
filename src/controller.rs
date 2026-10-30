@@ -1210,7 +1210,8 @@ mod tests {
         let lexicon = FakeLexicon::default().with_english_word(|w| w == "the");
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         let composer = Composer::new(RustEngine::with_core(core), lexicon.clone());
-        let session = Session::new(composer, lexicon.memory(), ConversionMode::Space);
+        // 記憶は lexicon と繋がない: 繋ぐと 1 回目の選択で the を覚え、2 回目以降は候補を経ず英字のまま確定する (票の数え方を見るテストなので外す)。
+        let session = Session::new(composer, crate::deps::FakeMemory::default(), ConversionMode::Space);
         let c = Controller::new(1, session, HookPanel::default(), env);
         for _ in 0..11 {
             pick_raw_the(&c, &client);

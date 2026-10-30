@@ -77,12 +77,13 @@ fn has_ascii(units: &[(String, String)]) -> bool {
 
 /// 辞書の英単語を頭に使ってよいか。日本語の打ちかけと紛れないよう 4 文字以上で、かな読みが日本語の語なら使わない。
 fn dictionary_head(head: &str, is_word: &impl Fn(&str) -> bool, is_japanese: &impl Fn(&str) -> bool) -> bool {
-    if head.len() < DICTIONARY_MIN_LEN || !is_word(head) {
-        return false;
-    }
+    head.len() >= DICTIONARY_MIN_LEN && is_word(head) && not_japanese(head, is_japanese)
+}
+
+/// 頭のかな読みが日本語の語でないか。かなにしきれない語 (commit の こっみt) は日本語の語になりえない。
+fn not_japanese(head: &str, is_japanese: &impl Fn(&str) -> bool) -> bool {
     let (units, pending) = convert(head, true);
     let kana: String = units.iter().map(|(_, k)| k.as_str()).collect();
-    // かなにしきれない語 (commit の こっみt) は日本語の語になりえない。
     has_ascii(&units) || !pending.is_empty() || !is_japanese(&kana)
 }
 
@@ -103,7 +104,8 @@ fn natural_kana(tail: &[(String, String)]) -> bool {
 /// raw を 英単語 + 助詞などで始まるかな に分ける。分けられなければ None。
 /// 英単語と見なすのは、全体がかなにしきれない (artifact の rt)、英語として確定したことのある語、
 /// または辞書の英単語 (4 文字以上。merge, commit) のいずれか。
-/// ただし辞書の英単語は、そのかな読みが日本語の語なら見なさない (made → まで)。確定済みの語 (knows) にこの除外は掛けない。
+/// ただし、そのかな読みが日本語の語なら見なさない (made → まで)。辞書の英単語にも確定済みの語 (knows) にも掛ける
+/// (done を英語で選んだ後でも donewo を done + を にしない)。かなにしきれない語 (git) は確定済みなら分ける。
 /// 上の分け方で見つからず、全体がかなにしきれて、頭に l q v x を含む語 (login) のときに限り、助詞で始まらない続きでも分ける (loginjinihiraku → login + じに…)。
 /// 全体がまだ英単語の途中 (informa) なら分けない。
 /// 「全体がかなにしきれる」は、打ちかけ (finished でない) なら末尾の未確定ローマ字 (loginj の j) を含んでよい。
@@ -134,7 +136,7 @@ pub fn split(
         });
         starts_with_tail.then(|| Split { head: head.to_string(), tail, pending })
     };
-    let is_word = |head: &str| knows(head) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
+    let is_word = |head: &str| (knows(head) && not_japanese(head, &is_japanese_reading)) || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
     // 助詞で始まらない続きを許す分け方。外来語の綴りらしい頭と、日本語として自然な続きだけに絞る。
     // 打ちかけの未確定ローマ字 (loginj の j) は、かなにしきれない印にしない。
     // 全体の変換で かな 1 つ分の途中 (leann の lean|n は ん=nn の内側) になる位置では切らない。
@@ -143,7 +145,7 @@ pub fn split(
         if !boundaries.contains(&i) || !head.contains(FOREIGN_LETTERS) || rest.contains(FOREIGN_TAIL_LETTERS) {
             return None;
         }
-        let word = (knows(head) && head.len() >= DICTIONARY_MIN_LEN)
+        let word = (knows(head) && head.len() >= DICTIONARY_MIN_LEN && not_japanese(head, &is_japanese_reading))
             || dictionary_head(head, &is_dictionary_word, &is_japanese_reading);
         if !word {
             return None;
@@ -276,9 +278,20 @@ mod tests {
     }
 
     #[test]
-    fn 確定済みの語は読みが日本語の語でも分ける() {
+    fn 確定済みの語も読みが日本語の語なら分けない() {
         let s = split("madeni", false, |w| w == "made", |_| false, |_| false, |_| true);
+        assert_eq!(s, None);
+        let s = split("donewo", false, |w| w == "done", |_| false, |_| false, |_| true);
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn 確定済みの語は読みが日本語の語でなければ分ける() {
+        let s = split("madeni", false, |w| w == "made", |_| false, |_| false, |_| false);
         assert_eq!(s.map(|s| s.display()).as_deref(), Some("madeに"));
+        // git は ぎt になり、かなにしきれないので日本語の語になりえない。
+        let s = split("gitni", false, |w| w == "git", |_| false, |_| false, |_| true);
+        assert_eq!(s.map(|s| s.display()).as_deref(), Some("gitに"));
     }
 
     /// 辞書の語 words と、前方一致の語 prefixes を持つ語彙で分ける。

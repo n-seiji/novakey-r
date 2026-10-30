@@ -59,7 +59,7 @@ Versions published less than 7 days ago must not be used (like pnpm's `minimumRe
 
 ### Rules worth remembering
 - Never log or print user text (readings, candidates, surrounding text).
-- Learning data lives in `~/Library/Application Support/Shizuku/rust-learning/learning.tsv` (`SHIZUKU_MEMORY_DIR` to override, `SHIZUKU_DISABLE_LEARNING=1` to turn off). Concurrent IME processes are last-writer-wins. Words committed as English (Dangling) go to `english.txt` in the same directory (`src/english_memory.rs`).
+- Learning data lives in `~/Library/Application Support/Shizuku/rust-learning/learning.tsv` (`SHIZUKU_MEMORY_DIR` to override, `SHIZUKU_DISABLE_LEARNING=1` to turn off). Concurrent IME processes are last-writer-wins. Words committed as English (Dangling) go to `english.txt` in the same directory (`src/english_memory.rs`). Picking the raw-typed English word (`done`, `the`: 3+ lowercase letters, a dictionary word, not Mixed / Judged) from the candidate list also learns it (`Committed.picked`; not on commitComposition). A learned word whose kana is a headword (done -> どね) then types as English unless the judge vetoes (no judge loaded = always English), and `english_split` still refuses it as a head when its kana is a Japanese word (`donewo`, `madeni`). Space on such a word commits `done ` at once; Shift+Space converts. Known flicker: a learned word that begins a longer Japanese word (kite -> kitekudasai) shows English for one key. F10 commits are not learned.
 - Live conversion is one process-wide setting (`ShizukuLiveConversionEnabled`, default off = Space); every controller follows it on its next key / menu open.
 
 ### Dependencies

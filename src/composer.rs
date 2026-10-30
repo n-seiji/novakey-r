@@ -56,6 +56,9 @@ pub struct Committed {
     pub engine: Option<(u64, EngineRank)>,
     /// 英語として確定した語。
     pub english: Vec<String>,
+    /// 候補一覧から英字そのもの (done, the) を選んで確定した語。以後その語を英語で打つ合図 (`Composer::picked_english`)。
+    /// `english` と分けるのは、commitComposition (フォーカス喪失など) では「選んだ」とは見なさず学習しないため。
+    pub picked: Option<String>,
 }
 
 pub trait CandidateEngine {
@@ -137,7 +140,7 @@ enum Verdict {
     Kana,
     /// かなの読みが辞書の見出しでない語。審判が読みを選ばない限り英語。
     Word,
-    /// かなの読みが辞書の見出しでもある語を、審判が英語と決めた。学習しない (見出しの除外を `knows_english` が素通りさせるため)。
+    /// かなの読みが辞書の見出しでもある語を、審判が英語と決めた。学習しない (Judged の語を覚えると、審判の推測が規則 1 の英語として固定されてしまうため)。
     Judged,
 }
 
@@ -763,6 +766,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 組成全体が英単語なら、英語として打つかを判定して持つ。そうでなければ持たない。
     /// かなの読みが辞書の見出しでない語 (issue → いっすえ) は、審判が読みの方をはっきり選ばない限り英語 (審判がなくても英語)。
     /// 見出しでもある語 (made, home) は、審判が英語を選んだときだけ英語。比べる相手は engine の第 1 候補。
+    /// ただし、候補一覧から選んで英語として確定したことのある語 (done → どね) は見出しでも前者と同じ扱い: 審判が読みをはっきり選ばない限り英語。
+    /// 審判がまだ読み込めていない間は却下しないので、そのときは必ず英語になる。
     /// 固定中は表示と比べ、英語になるときだけ固定が外れる (`enter_english`)。raw が変わりうる所 (refresh / track_english / unpin) で呼ぶ。
     fn judge_word(&mut self) {
         let raw = self.raw();
@@ -780,7 +785,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Some(pin) => Some(pin.surface() + converted.as_deref().unwrap_or_else(|| self.rest())),
             None => converted,
         };
-        let verdict = if self.engine.has_reading(&self.hiragana) {
+        let verdict = if self.engine.has_reading(&self.hiragana) && !self.lexicon.knows_english(&raw) {
             match first {
                 Some(over) if self.engine.prefers_text(&raw, &over) => Verdict::Judged,
                 _ => Verdict::Kana,
@@ -1180,6 +1185,19 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.stage = Stage::Reverted { kept };
     }
 
+    /// 候補一覧で選んでいる候補が、打鍵列そのままの英単語 (done, the) なら、その語。確定するとき「英語として選んだ」と見なして学習する。
+    /// 英単語 (3 文字以上の辞書の語) だけに絞り、kazu や donewo のような読みの打ちかけは覚えない。
+    /// かな混じり (Mixed) と、審判が決めた分 (Judged) は対象外 (Mixed は確定文字列が raw と一致しないので text == raw で外れる)。
+    fn picked_english(&self) -> Option<String> {
+        let Stage::Selecting(s) = &self.stage else {
+            return None;
+        };
+        let raw = self.raw();
+        let chosen = &s.list[s.cursor];
+        let memorable = raw.len() >= 3 && raw.bytes().all(|b| b.is_ascii_lowercase()) && self.lexicon.is_english_word(&raw);
+        (memorable && chosen.text == raw && chosen.engine_rank().is_none() && !self.is_verdict(&raw, Verdict::Judged)).then_some(raw)
+    }
+
     /// 確定する。学習は実行せず、何を学習すべきかを返すだけ。実行と可否の判定は Session が行う。
     pub fn commit(&mut self) -> Committed {
         let phase = self.phase();
@@ -1190,6 +1208,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             english.push(text.clone());
         }
         english.extend(self.segments.iter().filter(|s| s.is_literal()).map(|s| s.keys().to_string()));
+        let picked = self.picked_english();
         // 固定した先頭部分を含む確定は、1 つの候補の順位では表せないので学習しない。
         let engine = match &self.stage {
             _ if self.pin.is_some() => None,
@@ -1206,7 +1225,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.stage = Stage::Editing;
         self.typing = Typing::Empty;
         self.word_verdict = None;
-        Committed { text, engine, english }
+        Committed { text, engine, english, picked }
     }
 
     /// 学習の実行 (engine.select / cancel) のために Session が使う。
@@ -1325,7 +1344,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deps::FakeLexicon;
+    use crate::deps::{EnglishMemory, FakeLexicon};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3027,6 +3046,118 @@ mod tests {
         let committed = c.commit();
         assert_eq!(committed.text, "made");
         assert!(committed.english.is_empty());
+    }
+
+    /// 英単語 done / the / made / to (辞書の語として) と `headwords` を持ち、覚えた語を見られる Composer。
+    fn learn_composer(headwords: &[&str]) -> (Composer<MockEngine, FakeLexicon>, Log, crate::deps::FakeMemory) {
+        let log = Log::default();
+        *log.headwords.borrow_mut() = headwords.iter().map(ToString::to_string).collect();
+        let engine = MockEngine { log: log.clone(), table: vec![] };
+        let lexicon = FakeLexicon::default().with_english_word(|w| matches!(w, "done" | "the" | "made" | "to"));
+        let memory = lexicon.memory();
+        (Composer::new(engine, lexicon), log, memory)
+    }
+
+    /// raw を打って変換を始め、候補の text を選んだ状態にする。
+    fn pick(c: &mut Composer<MockEngine, FakeLexicon>, raw: &str, text: &str) {
+        type_keys(c, raw);
+        assert!(c.begin_conversion());
+        assert!(c.select_candidate_text(text), "{text} is not a candidate");
+    }
+
+    #[test]
+    fn 候補から選んだ英字そのものは英語として選んだことになる() {
+        for raw in ["done", "the"] {
+            let (mut c, _, _) = learn_composer(&["どね", "てぇ"]);
+            pick(&mut c, raw, raw);
+            let committed = c.commit();
+            assert_eq!(committed.text, raw);
+            assert_eq!(committed.picked.as_deref(), Some(raw));
+            assert!(committed.english.is_empty());
+        }
+    }
+
+    #[test]
+    fn 候補から選んだのが英字そのものでなければ英語として選んだことにならない() {
+        let (mut c, _, _) = learn_composer(&["どね"]);
+        pick(&mut c, "done", "どねK1");
+        assert_eq!(c.commit().picked, None);
+        // 読みのまま確定 (Enter) も選んだことにならない
+        let (mut c, _, _) = learn_composer(&["どね"]);
+        type_keys(&mut c, "done");
+        assert_eq!(c.commit().picked, None);
+    }
+
+    #[test]
+    fn 英単語でない読みの打ちかけは英語として選んでも覚えない() {
+        // donewo や kazu は辞書の英単語ではないので、その raw 候補を選んでも覚えない。to は辞書の語でも 3 文字未満なので対象外。
+        let (mut c, _, _) = learn_composer(&[]);
+        pick(&mut c, "donewo", "donewo");
+        assert_eq!(c.commit().picked, None);
+        let (mut c, _, _) = learn_composer(&[]);
+        pick(&mut c, "to", "to");
+        assert_eq!(c.commit().picked, None);
+        let (mut c, _, _) = learn_composer(&[]);
+        pick(&mut c, "kazu", "kazu");
+        assert_eq!(c.commit().picked, None);
+    }
+
+    #[test]
+    fn 審判が英語と決めた語は候補から選び直しても覚えない() {
+        let (mut c, _, _) = learn_composer(&["まで"]);
+        *c.engine.log.prefers.borrow_mut() = true;
+        type_keys(&mut c, "made");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert!(c.begin_conversion());
+        assert!(c.select_candidate_text("made"));
+        assert_eq!(c.commit().picked, None);
+    }
+
+    #[test]
+    fn 英単語と助詞に分けたかな混じりは英語として選んだことにならない() {
+        // かな混じりの確定文字列は raw と一致しないので、text == raw の条件だけで学習の対象から外れる。
+        let (mut c, _, _) = learn_composer(&[]);
+        type_keys(&mut c, "doneni");
+        assert!(c.begin_conversion());
+        assert_eq!(c.commit().picked, None);
+    }
+
+    #[test]
+    fn 英語として選んだ語は見出しの読みがあっても以後英語で打つ() {
+        let (mut c, log, mut memory) = learn_composer(&["どね"]);
+        memory.learn("done");
+        type_keys(&mut c, "done");
+        assert_eq!(c.phase(), Phase::Dangling);
+        assert_eq!(c.preedit(), "done");
+        assert_eq!(c.commit_preview(), "done");
+        assert!(log.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn 英語として選んだ語でも審判が却下すれば読みのまま() {
+        let (mut c, log, mut memory) = learn_composer(&["どね"]);
+        memory.learn("done");
+        *log.rejects.borrow_mut() = true;
+        type_keys(&mut c, "done");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.preedit(), "どね");
+    }
+
+    #[test]
+    fn 英語として選んだことのない見出しの語はゲートと審判のまま() {
+        let (mut c, _, _) = learn_composer(&["どね"]);
+        type_keys(&mut c, "done");
+        assert_eq!(c.phase(), Phase::Composing);
+        assert_eq!(c.preedit(), "どね");
+    }
+
+    #[test]
+    fn 英語として選んだ語の続きに読みを打つと分割しない() {
+        // 見出しのある語は、覚えていても donewo を done + を に切らない。
+        let (mut c, _, mut memory) = learn_composer(&["どね"]);
+        memory.learn("done");
+        type_keys(&mut c, "donewo");
+        assert_eq!(c.english_split(true), None);
     }
 
     #[test]
