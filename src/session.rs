@@ -35,7 +35,7 @@ pub enum ConversionMode {
 }
 
 /// 1 回の入力処理で許される外向きの動き。入口で必ず渡す (既定値は持たない。本番では Controller が毎回作る)。
-/// bundle id が取れないときは学習を許可する (outbound::learning_allowed の現仕様)。
+/// 本番では `learning` は `direct` の否定 (outbound::direct_input)。bundle id が取れないときは学習を許可する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。

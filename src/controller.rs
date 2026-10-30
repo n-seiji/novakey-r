@@ -229,11 +229,8 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
     fn gates(&self, client: Option<&C>) -> Gates {
         let bundle_id = self.bundle_id(client);
-        let secure = self.env.secure_input();
-        Gates {
-            learning: outbound::learning_allowed(secure, bundle_id),
-            direct: outbound::direct_input(secure, bundle_id),
-        }
+        let direct = outbound::direct_input(self.env.secure_input(), bundle_id);
+        Gates { learning: !direct, direct }
     }
 
     /// クライアントの bundle id (学習判定に使う)。最初に取れたものを使い回す。
@@ -252,8 +249,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
 
     /// 文脈を覚えて使ってよいアプリの bundle id。取れない・学習が許されない・素通し (セキュア入力・パスワード管理アプリ) のときは None。
     fn context_app(&self, client: Option<&C>) -> Option<String> {
-        let gates = self.gates(client);
-        let allowed = gates.learning && !gates.direct;
+        let allowed = !self.gates(client).direct;
         self.bundle_id(client).filter(|_| allowed).map(str::to_string)
     }
 
