@@ -475,7 +475,7 @@ impl Model {
             return Err("unexpected embedding shape");
         }
         mat(&self.wte, self.wte.rows, DM)?;
-        if self.wpe.len() % DM != 0 || self.wpe.len() / DM <= MAX_TOKENS + 1 {
+        if !self.wpe.len().is_multiple_of(DM) || self.wpe.len() / DM <= MAX_TOKENS + 1 {
             return Err("unexpected position table");
         }
         Ok(())
@@ -497,8 +497,13 @@ impl Model {
         }
         // 作業領域は長さが固定 (作り直さない) なので、ここで留めた番地が使われ続ける。
         let bytes = f32s.iter().map(|v| std::mem::size_of_val(*v)).chain(u8s.iter().map(|v| v.len())).sum();
-        let ok = f32s.iter().fold(true, |ok, v| crate::platform::lock_memory(v) && ok);
-        let ok = u8s.iter().fold(ok, |ok, v| crate::platform::lock_memory(v) && ok);
+        let mut ok = true;
+        for v in &f32s {
+            ok &= crate::platform::lock_memory(v);
+        }
+        for v in &u8s {
+            ok &= crate::platform::lock_memory(v);
+        }
         (bytes, ok)
     }
 
@@ -673,7 +678,7 @@ impl Model {
     fn logits_small(&self, xs: &[f32], r: usize, wants: &[(usize, u32)]) -> (Vec<(f32, f32)>, Vec<f32>) {
         let xq = quantize_rows(xs, r, DM);
         let nchunk = self.wte.rows.div_ceil(VOCAB_SMALL_CHUNK);
-        let parts: Vec<(Vec<(f32, f32)>, Vec<(usize, f32)>)> = (0..nchunk)
+        let parts: Vec<_> = (0..nchunk)
             .into_par_iter()
             .map(|ci| {
                 let (v0, v1) = (ci * VOCAB_SMALL_CHUNK, ((ci + 1) * VOCAB_SMALL_CHUNK).min(self.wte.rows));
@@ -688,7 +693,7 @@ impl Model {
                         (mx, col.map(|&v| (v - mx).exp()).sum())
                     })
                     .collect();
-                let hits = wants
+                let hits: Vec<_> = wants
                     .iter()
                     .enumerate()
                     .filter(|(_, w)| (v0..v1).contains(&(w.1 as usize)))
