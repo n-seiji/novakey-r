@@ -76,7 +76,7 @@ impl KkcCore {
         self.headwords(katakana).iter().any(|e| e.word == kanji)
     }
 
-    /// カタカナの読みがちょうど一致する辞書の見出し (派生候補の連濁の語探し用)。学習・動的な語は見ない。辞書が読めなければ空。
+    /// カタカナの読みがちょうど一致する辞書の見出し。学習・動的な語は見ない。辞書が読めなければ空。
     fn headwords(&self, katakana: &str) -> Vec<dict::Entry> {
         self.dict.prefix_entries(katakana).map(|v| v.into_iter().filter(|e| e.ruby == katakana).collect()).unwrap_or_default()
     }
