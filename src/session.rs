@@ -869,6 +869,51 @@ mod tests {
         assert!(pick_done(&denied, enter).learned().is_empty());
     }
 
+    /// done の raw 候補の 1 始まりの番号。
+    fn done_number(session: &Session<HeadwordEngine, FakeLexicon, FakeMemory>) -> char {
+        let index = session.composer.candidates().iter().position(|c| c.text == "done").expect("done is a candidate");
+        char::from_digit(index as u32 + 1, 10).expect("done is within the digit picks")
+    }
+
+    /// done を打って Space で候補を出し、done に移ってから keys を打つ (選択の確定は keys に任せる)。
+    fn pick_done_with_keys(gates: &Gates, pick: impl FnOnce(&mut Session<HeadwordEngine, FakeLexicon, FakeMemory>, &Gates), keys: &str) -> FakeMemory {
+        pick_done(gates, |s, g| {
+            pick(s, g);
+            for ch in keys.chars() {
+                s.handle(g, classify(ch), &ch.to_string());
+            }
+        })
+    }
+
+    #[test]
+    fn 数字キーで選んだ英字も学習が許されるときだけ英語として覚える() {
+        // 候補ウィンドウが開いている (pick_done が done を選んだ) 状態から、先頭へ戻して done の番号キーで選び直す。
+        let by_digit = |s: &mut Session<_, _, _>, g: &Gates| {
+            assert!(s.composer.select_candidate(0));
+            let number = done_number(s);
+            s.handle(g, classify(number), &number.to_string());
+        };
+        assert_eq!(pick_done(&ALLOW, by_digit).learned(), ["done"]);
+        let denied = Gates { learning: false, direct: false };
+        assert!(pick_done(&denied, by_digit).learned().is_empty());
+    }
+
+    #[test]
+    fn 英字を選んだまま文字や記号を打って確定しても英語として覚える() {
+        for keys in ["a", "."] {
+            assert_eq!(pick_done_with_keys(&ALLOW, |_, _| {}, keys).learned(), ["done"], "{keys}");
+        }
+    }
+
+    #[test]
+    fn 直接入力では英字を選んでいても覚えない() {
+        let direct = Gates { learning: true, direct: true };
+        let memory = pick_done(&ALLOW, |s, _| {
+            s.handle(&direct, classify('a'), "a");
+        });
+        assert!(memory.learned().is_empty());
+    }
+
     #[test]
     fn 入力ソース切り替えなどの確定では英字を選んだことにしない() {
         let memory = pick_done(&ALLOW, |s, g| drop(s.commit_composition(g)));

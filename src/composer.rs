@@ -140,7 +140,7 @@ enum Verdict {
     Kana,
     /// かなの読みが辞書の見出しでない語。審判が読みを選ばない限り英語。
     Word,
-    /// かなの読みが辞書の見出しでもある語を、審判が英語と決めた。学習しない (見出しの除外を `knows_english` が素通りさせるため)。
+    /// かなの読みが辞書の見出しでもある語を、審判が英語と決めた。学習しない (Judged の語を覚えると、審判の推測が規則 1 の英語として固定されてしまうため)。
     Judged,
 }
 
@@ -1187,7 +1187,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 候補一覧で選んでいる候補が、打鍵列そのままの英単語 (done, the) なら、その語。確定するとき「英語として選んだ」と見なして学習する。
     /// 英単語 (3 文字以上の辞書の語) だけに絞り、kazu や donewo のような読みの打ちかけは覚えない。
-    /// かな混じり (Mixed) と、審判が決めた分 (Judged) は対象外。
+    /// かな混じり (Mixed) と、審判が決めた分 (Judged) は対象外 (Mixed は確定文字列が raw と一致しないので text == raw で外れる)。
     fn picked_english(&self) -> Option<String> {
         let Stage::Selecting(s) = &self.stage else {
             return None;
@@ -1195,8 +1195,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let raw = self.raw();
         let chosen = &s.list[s.cursor];
         let memorable = raw.len() >= 3 && raw.bytes().all(|b| b.is_ascii_lowercase()) && self.lexicon.is_english_word(&raw);
-        let plain = self.pin.is_none() && self.split_origin.is_none() && !self.segments.iter().any(Segment::is_literal);
-        (memorable && plain && chosen.text == raw && chosen.engine_rank().is_none() && !self.is_verdict(&raw, Verdict::Judged)).then_some(raw)
+        (memorable && chosen.text == raw && chosen.engine_rank().is_none() && !self.is_verdict(&raw, Verdict::Judged)).then_some(raw)
     }
 
     /// 確定する。学習は実行せず、何を学習すべきかを返すだけ。実行と可否の判定は Session が行う。
@@ -3049,12 +3048,12 @@ mod tests {
         assert!(committed.english.is_empty());
     }
 
-    /// 英単語 done / the / made / kazu (辞書の語として) と `headwords` を持ち、覚えた語を見られる Composer。
+    /// 英単語 done / the / made / to (辞書の語として) と `headwords` を持ち、覚えた語を見られる Composer。
     fn learn_composer(headwords: &[&str]) -> (Composer<MockEngine, FakeLexicon>, Log, crate::deps::FakeMemory) {
         let log = Log::default();
         *log.headwords.borrow_mut() = headwords.iter().map(ToString::to_string).collect();
         let engine = MockEngine { log: log.clone(), table: vec![] };
-        let lexicon = FakeLexicon::default().with_english_word(|w| matches!(w, "done" | "the" | "made" | "kazu" | "to"));
+        let lexicon = FakeLexicon::default().with_english_word(|w| matches!(w, "done" | "the" | "made" | "to"));
         let memory = lexicon.memory();
         (Composer::new(engine, lexicon), log, memory)
     }
@@ -3091,12 +3090,15 @@ mod tests {
 
     #[test]
     fn 英単語でない読みの打ちかけは英語として選んでも覚えない() {
-        // donewo は辞書の語ではない。kazu / to は辞書の語でも、3 文字未満 (to) や全部が単語でない raw は対象外にする。
+        // donewo や kazu は辞書の英単語ではないので、その raw 候補を選んでも覚えない。to は辞書の語でも 3 文字未満なので対象外。
         let (mut c, _, _) = learn_composer(&[]);
         pick(&mut c, "donewo", "donewo");
         assert_eq!(c.commit().picked, None);
         let (mut c, _, _) = learn_composer(&[]);
         pick(&mut c, "to", "to");
+        assert_eq!(c.commit().picked, None);
+        let (mut c, _, _) = learn_composer(&[]);
+        pick(&mut c, "kazu", "kazu");
         assert_eq!(c.commit().picked, None);
     }
 
@@ -3113,6 +3115,7 @@ mod tests {
 
     #[test]
     fn 英単語と助詞に分けたかな混じりは英語として選んだことにならない() {
+        // かな混じりの確定文字列は raw と一致しないので、text == raw の条件だけで学習の対象から外れる。
         let (mut c, _, _) = learn_composer(&[]);
         type_keys(&mut c, "doneni");
         assert!(c.begin_conversion());
