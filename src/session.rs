@@ -367,13 +367,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             Action::Transliterate(form) => {
                 self.composer.transliterate(form) && self.show_typing(fx)
             }
-            Action::DeleteBack => {
-                let deleted = self.composer.backspace();
-                if deleted {
-                    self.show_typing(fx);
-                }
-                deleted
-            }
+            Action::DeleteBack => self.composer.backspace() && self.show_typing(fx),
         }
     }
 }

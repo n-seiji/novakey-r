@@ -261,16 +261,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         })
     }
 
-    #[cfg(test)]
-    fn context(&self, client: Option<&C>) -> String {
-        self.context_state(client).0
-    }
-
-    #[cfg(test)]
-    fn english_app(&self, client: Option<&C>) -> bool {
-        self.context_state(client).1
-    }
-
     /// アプリに入った文字列を文脈に足す。
     fn remember(&self, text: &str, client: Option<&C>) {
         if let Some(app) = self.context_app(client) {
@@ -1021,7 +1011,7 @@ mod tests {
         assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
         assert!(!rec_press(&c, &client, Key::Backspace, "\u{7f}"));
         assert_eq!(context_of("app.one"), "@", "セキュア入力中は記録も削除もしない");
-        assert_eq!(c.context(Some(&client)), "", "セキュア入力中は文脈を使わない");
+        assert_eq!(c.context_state(Some(&client)).0, "", "セキュア入力中は文脈を使わない");
         assert!(!c.on_key(Route::PassThrough, client.clone()));
         assert_eq!(context_of("app.one"), "@", "セキュア入力中は捨てもしない");
     }
@@ -1145,7 +1135,7 @@ mod tests {
             commit_hello(&f);
         }
         assert!(english_app_of("app.eng"));
-        assert!(f.0.english_app(Some(&f.1)));
+        assert!(f.0.context_state(Some(&f.1)).1);
         assert!(!english_app_of("app.other"));
         for _ in 0..12 {
             type_letters(&f, "a");
@@ -1164,7 +1154,7 @@ mod tests {
         }
         env.secure.set(false);
         assert!(!english_app_of("app.vote"));
-        assert!(!c.english_app(Some(&client)));
+        assert!(!c.context_state(Some(&client)).1);
         client.set_bundle(Some("com.1password.1password"));
         for _ in 0..12 {
             rec_press(&c, &client, Key::Letter { upper: false }, "a");
