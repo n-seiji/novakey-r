@@ -89,7 +89,7 @@ impl KkcCore {
         let katakana = dict::to_katakana(reading);
         let chars: Vec<char> = katakana.chars().collect();
         let learning = self.learning.borrow();
-        let mut lat = lattice::Lattice::build_with_memory(&self.dict, &mut self.cache.borrow_mut(), Some(&learning), &chars);
+        let mut lat = lattice::Lattice::build(&self.dict, &mut self.cache.borrow_mut(), &learning, &chars);
         lat.run(&self.dict, N_BEST);
         result::process(&self.dict, &lat, &katakana)
     }
