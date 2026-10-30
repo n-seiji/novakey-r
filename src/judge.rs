@@ -288,6 +288,13 @@ struct Node {
     eos_lp: f32,
 }
 
+/// 未計算のノード (`lp` と `eos_lp` は NaN)。捨てた枠の初期化にも使う。
+impl Default for Node {
+    fn default() -> Self {
+        Self { parent: 0, tok: 0, depth: 0, stamp: 0, children: Vec::new(), kv: Vec::new(), lp: f32::NAN, eos_lp: f32::NAN }
+    }
+}
+
 const KV_LEN: usize = NL * 2 * DM + DM;
 
 /// 過去に採点した系列の木 (共通の接頭辞の K / V と対数確率を使い回す)。
@@ -324,16 +331,7 @@ impl Cache {
             Some(id) => id,
             None => {
                 let depth = self.nodes[parent as usize].depth + 1;
-                let id = self.alloc(Node {
-                    parent,
-                    tok,
-                    depth,
-                    stamp,
-                    children: Vec::new(),
-                    kv: Vec::new(),
-                    lp: f32::NAN,
-                    eos_lp: f32::NAN,
-                });
+                let id = self.alloc(Node { parent, tok, depth, stamp, ..Node::default() });
                 self.nodes[parent as usize].children.push((tok, id));
                 pending.push(id);
                 id
@@ -378,16 +376,7 @@ impl Cache {
                 }
                 let parent = self.nodes[id as usize].parent;
                 self.nodes[parent as usize].children.retain(|c| c.1 != id);
-                self.nodes[id as usize] = Node {
-                    parent: 0,
-                    tok: 0,
-                    depth: 0,
-                    stamp: 0,
-                    children: Vec::new(),
-                    kv: Vec::new(),
-                    lp: f32::NAN,
-                    eos_lp: f32::NAN,
-                };
+                self.nodes[id as usize] = Node::default();
                 self.free.push(id);
             }
         }
@@ -550,16 +539,7 @@ impl Model {
         cache.stamp += 1;
         let mut pending: Vec<u32> = Vec::new();
         if cache.nodes.is_empty() {
-            cache.nodes.push(Node {
-                parent: 0,
-                tok: BOS,
-                depth: 0,
-                stamp: 0,
-                children: Vec::new(),
-                kv: Vec::new(),
-                lp: 0.0,
-                eos_lp: f32::NAN,
-            });
+            cache.nodes.push(Node { tok: BOS, lp: 0.0, ..Node::default() });
             pending.push(0);
         }
         let stamp = cache.stamp;
@@ -1247,7 +1227,7 @@ mod tests {
     }
 
     fn leaf(parent: u32, tok: u32, depth: u32, stamp: u64) -> Node {
-        Node { parent, tok, depth, stamp, children: Vec::new(), kv: vec![0.0], lp: 0.0, eos_lp: f32::NAN }
+        Node { parent, tok, depth, stamp, kv: vec![0.0], lp: 0.0, ..Node::default() }
     }
 
     /// 共通の接頭辞は同じノードを通り、上限を超えたら古い葉から捨てる (根と今回のノードは残る)。
