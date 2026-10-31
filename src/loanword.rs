@@ -55,12 +55,12 @@ pub fn words(table: &Table) -> HashSet<&str> {
         .collect()
 }
 
-/// 1 行 1 語の一覧 (`resources/dev_words.txt`)。`#` 始まりと空行は読み飛ばし、小文字の英字だけの行を語とする。
+/// 1 行 1 語の一覧 (`resources/dev_words.txt`)。`#` 始まりと空行は読み飛ばし、小文字の英字で始まり小文字の英字と数字だけの行を語とする (base64, md5)。
 pub fn parse_words(text: &str) -> HashSet<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter(|w| w.bytes().all(|b| b.is_ascii_lowercase()))
+        .filter(|w| w.bytes().next().is_some_and(|b| b.is_ascii_lowercase()) && w.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
         .map(str::to_string)
         .collect()
 }
@@ -76,9 +76,10 @@ static DEV_WORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
 });
 
 /// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した語の一覧。一覧が無ければ表だけ。
+/// 数字を含む語 (base64) は入れない: 英語分割 (`english_split`) や前方一致は英字だけの語を前提にしていて、数字付きの語は `is_dev_word` / `is_dev_word_prefix` だけで引く。
 /// 完全一致 (binary_search) と前方一致 (partition_point) の両方を引けるよう、整列して重複を除く。
 static WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let mut all: Vec<String> = words(&TABLE).into_iter().map(str::to_string).chain(DEV_WORDS.iter().cloned()).collect();
+    let mut all: Vec<String> = words(&TABLE).into_iter().map(str::to_string).chain(DEV_WORDS.iter().filter(|w| w.bytes().all(|b| b.is_ascii_lowercase())).cloned()).collect();
     all.sort_unstable();
     all.dedup();
     all
@@ -92,6 +93,11 @@ pub fn is_english_word(typed: &str) -> bool {
 /// 打鍵列が開発用語の一覧 (`dev_words.txt`) の語か。表の語と違い、短くても英語と見なしてよい語だけが載る。
 pub fn is_dev_word(typed: &str) -> bool {
     DEV_WORDS.contains(typed)
+}
+
+/// 打鍵列で始まる開発用語の一覧の語があるか (打鍵列そのものが語の場合も含む)。数字を含む語 (base64) の途中 (base6) を見分けるのに使う。
+pub fn is_dev_word_prefix(typed: &str) -> bool {
+    DEV_WORDS.iter().any(|w| w.starts_with(typed))
 }
 
 /// 打鍵列で始まる英単語があるか (打鍵列そのものが語の場合も含む)。
@@ -147,6 +153,12 @@ mod tests {
     fn 一覧はコメントと空行を読み飛ばし小文字の英字だけの語を持つ() {
         let w = parse_words("# dev\n\nmerge\n  commit \nOAuth\nT-shirt\n");
         assert_eq!(w, HashSet::from(["merge".to_string(), "commit".to_string()]));
+    }
+
+    #[test]
+    fn 一覧は英字で始まる数字付きの語を持ち数字で始まる行は捨てる() {
+        let w = parse_words("base64\nmd5\n64bit\n123\nbase-64\n");
+        assert_eq!(w, HashSet::from(["base64".to_string(), "md5".to_string()]));
     }
 
     #[test]

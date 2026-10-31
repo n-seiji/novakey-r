@@ -629,3 +629,27 @@ apito<enter>	あぴと
 kyouhaapi<enter>	きょうはあぴ
 node<enter>	ので
 nodeha<enter>	のでは
+# 開発用語は数字を含んでもよい (dev_words.txt)。打鍵列全体がその語になった時点から英字のまま表示して確定し、手前 (base, base6) は今までどおりかな。
+# 数字を含む語は、数字で日本語の組成を区切らない (md5 は md を確定せず、Enter が改行にならない)。
+base64<enter>	base64
+base6<enter>	ばせ6
+base65<enter>	ばせ65
+base<enter>	ばせ
+base64<space>	base64 
+kyouhabase64<enter>	きょうはばせ64
+md5<enter>	md5
+utf8<enter>	utf8
+sha256<enter>	sha256
+oauth2<enter>	oauth2
+http2<enter>	http2
+s3<enter>	s3
+ec2<enter>	ec2
+k8s<enter>	k8s
+i18n<enter>	i18n
+l10n<enter>	l10n
+# 語でない数字付きの打鍵列は今までどおり。
+kyou1<enter>	きょう1
+2024nen<enter>	2024ねん
+dai1kai<enter>	だい1かい
+sha256x<enter>	しゃ256x
+git1<enter>	git1\n

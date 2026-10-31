@@ -4,9 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# main でも外れる語。ここに無い語が外れたらこのスクリプトが失敗する。
-# base64: 数字を含む打鍵列は英語判定の対象外 (小文字の英字だけを英語として扱う)。
-EXEMPT=" base64 "
+# 外れてよい語 (今は無い)。ここに無い語が外れたらこのスクリプトが失敗する。
+EXEMPT=" "
 
 scenarios="$(mktemp)"
 trap 'rm -f "$scenarios"' EXIT
