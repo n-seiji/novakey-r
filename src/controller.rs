@@ -117,12 +117,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.session.borrow().marked_text()
     }
 
-    /// 未確定ローマ字が無いときの、いま確定した場合の文字列。あれば None (表示と一致しなくてよい)。
-    pub fn commit_preview(&self) -> Option<String> {
-        let session = self.session.borrow();
-        (!session.has_romaji()).then(|| session.commit_preview())
-    }
-
     fn client(&self) -> Option<C> {
         self.last_client.borrow().clone()
     }
@@ -229,11 +223,8 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
     /// 今この場面で許される外向きの動き。呼び出しごとに作り、状態として持ち越さない。
     fn gates(&self, client: Option<&C>) -> Gates {
         let bundle_id = self.bundle_id(client);
-        let secure = self.env.secure_input();
-        Gates {
-            learning: outbound::learning_allowed(secure, bundle_id),
-            direct: outbound::direct_input(secure, bundle_id),
-        }
+        let direct = outbound::direct_input(self.env.secure_input(), bundle_id);
+        Gates { learning: !direct, direct }
     }
 
     /// クライアントの bundle id (学習判定に使う)。最初に取れたものを使い回す。
@@ -252,8 +243,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
 
     /// 文脈を覚えて使ってよいアプリの bundle id。取れない・学習が許されない・素通し (セキュア入力・パスワード管理アプリ) のときは None。
     fn context_app(&self, client: Option<&C>) -> Option<String> {
-        let gates = self.gates(client);
-        let allowed = gates.learning && !gates.direct;
+        let allowed = !self.gates(client).direct;
         self.bundle_id(client).filter(|_| allowed).map(str::to_string)
     }
 
@@ -263,16 +253,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
             let now = std::time::Instant::now();
             crate::context::with(|store| (store.get(&app, now).to_string(), store.is_english_app(&app, now)))
         })
-    }
-
-    #[cfg(test)]
-    fn context(&self, client: Option<&C>) -> String {
-        self.context_state(client).0
-    }
-
-    #[cfg(test)]
-    fn english_app(&self, client: Option<&C>) -> bool {
-        self.context_state(client).1
     }
 
     /// アプリに入った文字列を文脈に足す。
@@ -866,11 +846,12 @@ mod tests {
         let env = RecEnv::default();
         let client = RecClient::default();
         let (c, core, memory) = observing_controller(env.clone());
-        rec_type(&c, &client, "git");
+        // かなにしきれない打鍵 (rg) があるので、語として知られていなくても英語として打っている。
+        rec_type(&c, &client, "merge");
         env.secure.set(secure);
         rec_press(&c, &client, Key::Enter, "\r");
         assert!(!engine_learned(&core));
-        memory.learned().iter().any(|w| w == "git")
+        memory.learned().iter().any(|w| w == "merge")
     }
 
     #[test]
@@ -1025,7 +1006,7 @@ mod tests {
         assert!(!rec_press(&c, &client, Key::Letter { upper: false }, "a"));
         assert!(!rec_press(&c, &client, Key::Backspace, "\u{7f}"));
         assert_eq!(context_of("app.one"), "@", "セキュア入力中は記録も削除もしない");
-        assert_eq!(c.context(Some(&client)), "", "セキュア入力中は文脈を使わない");
+        assert_eq!(c.context_state(Some(&client)).0, "", "セキュア入力中は文脈を使わない");
         assert!(!c.on_key(Route::PassThrough, client.clone()));
         assert_eq!(context_of("app.one"), "@", "セキュア入力中は捨てもしない");
     }
@@ -1149,7 +1130,7 @@ mod tests {
             commit_hello(&f);
         }
         assert!(english_app_of("app.eng"));
-        assert!(f.0.english_app(Some(&f.1)));
+        assert!(f.0.context_state(Some(&f.1)).1);
         assert!(!english_app_of("app.other"));
         for _ in 0..12 {
             type_letters(&f, "a");
@@ -1168,7 +1149,7 @@ mod tests {
         }
         env.secure.set(false);
         assert!(!english_app_of("app.vote"));
-        assert!(!c.english_app(Some(&client)));
+        assert!(!c.context_state(Some(&client)).1);
         client.set_bundle(Some("com.1password.1password"));
         for _ in 0..12 {
             rec_press(&c, &client, Key::Letter { upper: false }, "a");
