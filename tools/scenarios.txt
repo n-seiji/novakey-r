@@ -629,3 +629,17 @@ apito<enter>	あぴと
 kyouhaapi<enter>	きょうはあぴ
 node<enter>	ので
 nodeha<enter>	のでは
+# 〜なそう: 辞書は 翁 が 起き+な に勝つので、〜ない を変換して ない を なそう に替えた動詞形を作り、審判の順の上で先頭に置く (審判なしでも先頭)
+okinasou<space><enter>	起きなそう
+okinasou<space><pick:2>	翁層
+okinasouda<space><enter>	起きなそうだ
+okinasoudesu<space><enter>	起きなそうです
+minasou<space><enter>	見なそう
+konasou<space><enter>	来なそう
+hanasou<space><enter>	話そう
+# 形容詞 + そう は動詞形に取られない (はかない の 吐かなそう など)
+hakanasou<space><enter>	儚そう
+abunasou<space><enter>	危なそう
+kitanasou<space><enter>	汚そう
+wakaranasou<enter>	わからなそう
+wakaranasou<space><enter>	わからなそう
