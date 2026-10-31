@@ -549,3 +549,8 @@ kyou->asita<space><enter>	今日->明日
 <lt><right>-<enter>	<ー
 <lt><up>-<enter>	<ー
 <lt><esc>-<enter>	<ー
+# 漢数字の要素は算用数字の候補も出す (第八世代 → 第8世代。Space で並び、番号は審判なしの engine の順)
+daihachisedai<space><pick:6>	第8世代
+daijuusedai<space><pick:6>	第10世代
+hachisedai<space><pick:6>	8世代
+daikyuusedai<space><pick:6>	第9世代
