@@ -40,7 +40,7 @@ pub enum ConversionMode {
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
     pub learning: bool,
-    /// 変換せず打鍵をそのまま素通しする (セキュア入力中・パスワード管理アプリでは true)。
+    /// 変換せず打鍵をそのまま素通しする (セキュア入力中だけ true。パスワード管理アプリは学習と文脈だけ止める)。
     pub direct: bool,
 }
 
