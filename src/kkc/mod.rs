@@ -59,6 +59,19 @@ impl KkcCore {
         &self.learning
     }
 
+    /// 候補の語のうち、かなだけではない語 (翁・皆) が学習済みか。そう・だ のような頻出のかなは数えない。
+    pub fn has_learned(&self, data: &[Rc<elem::Elem>]) -> bool {
+        let learning = self.learning.borrow();
+        let mut found = Vec::new();
+        data.iter().any(|e| {
+            found.clear();
+            learning.lookup(&e.ruby, &mut found);
+            let ruby_chars = e.ruby.chars().count();
+            e.word.chars().any(|c| !('\u{3041}'..='\u{309F}').contains(&c))
+                && found.iter().any(|f| f.ruby_chars == ruby_chars && f.elem.word == e.word && f.elem.lcid == e.lcid && f.elem.rcid == e.rcid)
+        })
+    }
+
     /// 確定した候補のデータを学習する。
     pub fn learn(&self, data: &[Rc<elem::Elem>]) {
         self.learning.borrow_mut().learn(data, &|c| self.dict.char_id(c) != 255);
@@ -228,10 +241,11 @@ fn is_permutation(order: &[usize], n: usize) -> bool {
 /// 上位の全文候補から派生候補 (`variants`) を作り、最後の全文候補の直後に全文候補として足す。
 /// 先頭の `top` (打ち切り済み) は動かさない。スコアは元の候補から `PENALTY` 引く。審判がなければ元の全文候補の後ろに並ぶ。
 /// 読みが 〜なそう (+ 短い続き) で終わるときは、〜ない を変換して ない を なそう に替えた候補も足す (`nasou_candidates`)。
-fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>, katakana: &str) {
+/// 戻り値は 〜なそう の動詞形 (すでにあるものも含む) の表記を、最優先の順に並べたもの (`promote_derived` が使う)。
+fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>, katakana: &str) -> Vec<String> {
     let full: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
     let Some(&last_full) = full.last() else {
-        return;
+        return Vec::new();
     };
     let origins: Vec<&[Rc<elem::Elem>]> = full.iter().take(variants::ORIGINS).map(|&i| top[i].data.as_slice()).collect();
     let mut exclude: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
@@ -244,16 +258,19 @@ fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>, katakana: &str) {
         })
         .collect();
     exclude.extend(cands.iter().map(|c| c.text.replace('\u{1F}', "")));
-    cands.extend(nasou_candidates(core, katakana, &exclude));
+    let (added, preferred) = nasou_candidates(core, katakana, &exclude);
+    cands.extend(added);
     top.splice(last_full + 1..last_full + 1, cands);
+    preferred
 }
 
 /// 読みが 〜なそう (+ 続き) で終わるとき、同じ読みの なそう を ない にして変換し、動詞+ない の候補の ない を なそう に替える。
 /// 辞書は 翁 (おきな) が 起き+な より強く、おきなそう の候補に 起きなそう が出ないため。エンジンの順位は変えず、審判が他の全文候補と並べる。
 /// 該当する読みのときだけ余分に 1 回変換する。`MAX_VARIANTS` とは別枠なので他の派生に押し出されない。
-fn nasou_candidates(core: &KkcCore, katakana: &str, exclude: &HashSet<String>) -> Vec<result::Cand> {
+/// 戻り値の 2 つ目は、動詞形の表記を ない 変換の順に並べたもの。`exclude` にある (エンジンがすでに出している) ものも含む。
+fn nasou_candidates(core: &KkcCore, katakana: &str, exclude: &HashSet<String>) -> (Vec<result::Cand>, Vec<String>) {
     let Some((negative, tail)) = variants::nasou_split(katakana) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let converted = core.convert_all(&negative);
     let alt: Vec<(f32, &[Rc<elem::Elem>])> = converted
@@ -264,10 +281,39 @@ fn nasou_candidates(core: &KkcCore, katakana: &str, exclude: &HashSet<String>) -
         .take(variants::ORIGINS)
         .map(|c| (c.value, c.data.as_slice()))
         .collect();
-    variants::nasou_variants(&alt, tail, exclude, &|ruby| core.headwords(ruby))
+    let lookup = |ruby: &str| core.headwords(ruby);
+    let mut preferred: Vec<String> = variants::nasou_variants(&alt, tail, &HashSet::new(), variants::ORIGINS, &lookup).into_iter().map(|(_, v)| v.text).collect();
+    let added: Vec<result::Cand> = variants::nasou_variants(&alt, tail, exclude, variants::NASOU_MAX, &lookup)
         .into_iter()
         .map(|(score, v)| result::Cand::new(v.text, score - variants::PENALTY, v.data, result::Source::Full))
-        .collect()
+        .collect();
+    for c in &added {
+        if !preferred.contains(&c.text) {
+            preferred.push(c.text.clone());
+        }
+    }
+    (added, preferred)
+}
+
+/// 〜なそう の動詞形 (`preferred`) がある読みで、先頭が動詞形でも学習した候補でもないとき、動詞形を先頭にする。
+/// 審判は 翁草 > 起きなそう と見るが、〜なそう で終わる読みは動詞の否定の方が普通なので審判の上に置く。残りは今の並びのまま。
+/// `ranked[j]` は j 番目の全文枠に入る候補の添字 (`texts` の添字)。審判があれば動詞形のうち審判の順で最初のもの、なければ `preferred` の順で最初のもの。
+fn promote_derived(ranked: &mut Vec<usize>, texts: &[String], preferred: &[String], judged: bool, learned: &dyn Fn(usize) -> bool) {
+    let Some(&top) = ranked.first() else {
+        return;
+    };
+    if preferred.is_empty() || preferred.contains(&texts[top]) || learned(top) {
+        return;
+    }
+    let pick = if judged {
+        ranked.iter().position(|&k| preferred.contains(&texts[k]))
+    } else {
+        preferred.iter().find_map(|p| texts.iter().position(|t| t == p)).and_then(|k| ranked.iter().position(|&r| r == k))
+    };
+    if let Some(p) = pick {
+        let k = ranked.remove(p);
+        ranked.insert(0, k);
+    }
 }
 
 /// 先頭の後ろに、`rest` のうち読み全体を覆う候補 (語の読みをつないだものが `katakana` と一致) を engine の順で足す。
@@ -307,7 +353,7 @@ impl CandidateEngine for RustEngine {
         let converted = core.convert_all(hiragana);
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
         let katakana = dict::to_katakana(hiragana);
-        add_variants(core, &mut top, &katakana);
+        let preferred = add_variants(core, &mut top, &katakana);
         let head_len = top.len();
         append_tail(&mut top, &converted.main[converted.main.len().min(TOP_N)..], &katakana);
         let mut order: Vec<usize> = (0..top.len()).collect();
@@ -315,10 +361,11 @@ impl CandidateEngine for RustEngine {
         let texts: Vec<String> = slots.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let scores: Vec<f32> = slots.iter().map(|&i| top[i].value).collect();
-        if let Some(ranked) = (self.judge)(&self.context, &refs, &scores).filter(|r| is_permutation(r, slots.len())) {
-            for (&slot, k) in slots.iter().zip(ranked) {
-                order[slot] = slots[k];
-            }
+        let judged = (self.judge)(&self.context, &refs, &scores).filter(|r| is_permutation(r, slots.len()));
+        let mut ranked = judged.clone().unwrap_or_else(|| (0..slots.len()).collect());
+        promote_derived(&mut ranked, &texts, &preferred, judged.is_some(), &|k| core.has_learned(&top[slots[k]].data));
+        for (&slot, k) in slots.iter().zip(ranked) {
+            order[slot] = slots[k];
         }
         let texts: Vec<String> = order.iter().map(|&i| top[i].text.replace('\u{1F}', "")).collect();
         self.last = Some((revision, order.iter().map(|&i| top[i].data.clone()).collect()));
@@ -808,8 +855,7 @@ mod tests {
         let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
         let cands = e.convert(1, "おきなそう");
         let i = index_of(&cands, "起きなそう");
-        let n_full = base.main.iter().take(TOP_N).filter(|c| c.source == result::Source::Full).count();
-        assert!(i >= n_full, "元の全文候補より前には出ない");
+        assert_eq!(i, 0, "動詞形は先頭に出る: {cands:?}");
         assert_eq!(cands.iter().filter(|c| *c == "起きなそう").count(), 1);
         let words = e.words(1, i).unwrap();
         assert_eq!(words.iter().map(|(w, _)| w.as_str()).collect::<String>(), "起きなそう");
@@ -831,6 +877,88 @@ mod tests {
         assert!(e.select(1, 0));
         let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "おきなそう");
         assert_eq!(after[0], "起きなそう", "{after:?}");
+    }
+
+    /// 名詞形 (翁草・翁そうだ・皆そう) を先頭にする審判。動詞形は後ろへ回す。
+    fn noun_first_judge(_context: &str, texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        let is_noun = |t: &str| t.starts_with('翁') || t.starts_with("皆");
+        let mut order: Vec<usize> = (0..texts.len()).collect();
+        order.sort_by_key(|&i| !is_noun(texts[i]));
+        Some(order)
+    }
+
+    #[test]
+    fn 審判が名詞形を好んでも_動詞形が先頭で_残りは審判の順() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        for (reading, want, noun) in [("おきなそう", "起きなそう", "翁草"), ("おきなそうだ", "起きなそうだ", "翁そうだ"), ("おきなそうです", "起きなそうです", "翁そうです"), ("みなそう", "見なそう", "皆そう")] {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(noun_first_judge);
+            let shown = e.convert(1, reading);
+            assert_eq!(shown[0], want, "{reading}: {shown:?}");
+            assert!(index_of(&shown, noun) >= 1, "{reading}: {shown:?}");
+            assert_eq!(shown.iter().filter(|t| *t == want).count(), 1, "{reading}");
+        }
+    }
+
+    #[test]
+    fn 先頭を替えても学習用の添字は表示とずれない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core).with_judge(noun_first_judge);
+        let shown = e.convert(1, "おきなそう");
+        for (i, text) in shown.iter().enumerate() {
+            let words = e.words(1, i).unwrap();
+            assert_eq!(words.iter().map(|(w, _)| w.as_str()).collect::<String>(), *text, "{i}");
+        }
+    }
+
+    #[test]
+    fn 翁草を選ぶと_次からは動詞形ではなく翁草が先頭() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let mut e = RustEngine::with_core(core.clone()).with_judge(noun_first_judge);
+        let shown = e.convert(1, "おきなそう");
+        assert_eq!(shown[0], "起きなそう");
+        assert!(e.select(1, index_of(&shown, "翁草")));
+        let mut e = RustEngine::with_core(core).with_judge(noun_first_judge);
+        assert_eq!(e.convert(2, "おきなそう")[0], "翁草");
+    }
+
+    #[test]
+    fn 形容詞の読みには動詞形を足さず_先頭も変えない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        for reading in ["はかなそう", "あぶなそう", "きたなそう", "すくなそう", "おさなそう", "つたなそう", "はなそう"] {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+            let shown = e.convert(1, reading);
+            let top = core.convert_all(reading).main[0].text.replace('\u{1F}', "");
+            assert_eq!(shown[0], top, "{reading}: {shown:?}");
+            assert!(!shown.iter().any(|t| t == "吐かなそう"), "{reading}: {shown:?}");
+        }
+    }
+
+    #[test]
+    fn 動詞形が先頭か無いときは並びを変えない() {
+        let texts: Vec<String> = ["翁草", "起きなそう", "翁そう"].iter().map(|s| s.to_string()).collect();
+        let pref = vec!["起きなそう".to_string()];
+        let mut r = vec![1, 0, 2];
+        promote_derived(&mut r, &texts, &pref, true, &|_| false);
+        assert_eq!(r, [1, 0, 2]);
+        let mut r = vec![0, 1, 2];
+        promote_derived(&mut r, &texts, &[], true, &|_| false);
+        assert_eq!(r, [0, 1, 2]);
+        promote_derived(&mut r, &texts, &pref, true, &|_| true);
+        assert_eq!(r, [0, 1, 2], "学習した候補が先頭ならそのまま");
+        promote_derived(&mut r, &texts, &pref, true, &|_| false);
+        assert_eq!(r, [1, 0, 2]);
+    }
+
+    #[test]
+    fn 動詞形が複数あれば_審判の順で最初のもの_審判がなければ_ない変換の順で最初のもの() {
+        let texts: Vec<String> = ["翁草", "置きなそう", "起きなそう"].iter().map(|s| s.to_string()).collect();
+        let pref = vec!["起きなそう".to_string(), "置きなそう".to_string()];
+        let mut r = vec![0, 1, 2];
+        promote_derived(&mut r, &texts, &pref, true, &|_| false);
+        assert_eq!(r, [1, 0, 2]);
+        let mut r = vec![0, 1, 2];
+        promote_derived(&mut r, &texts, &pref, false, &|_| false);
+        assert_eq!(r, [2, 0, 1]);
     }
 
     #[test]

@@ -207,6 +207,8 @@ pub const NASOU_MAX: usize = 2;
 /// 動詞の未然形などの要素 (起き・食べ・行か・知ら) の `rcid` の範囲。ない の前がこの範囲のときだけ、ない を なそう に替える
 /// (歯ない・内 など名詞や助詞に続く ない を動詞の否定と取り違えないため)。
 const VERB_RCIDS: std::ops::Range<usize> = 570..1000;
+/// 形容詞 1 語 (儚い・危ない・少ない) の `rcid`
+const ADJECTIVE_RCID: usize = 19;
 
 /// 読み (カタカナ) が `〜ナソウ` + 短い続き で終わるとき、`ナソウ` を `ナイ` に替えた続きなしの読みと、その続き。
 pub fn nasou_split(katakana: &str) -> Option<(String, (&'static str, &'static str))> {
@@ -218,7 +220,11 @@ pub fn nasou_split(katakana: &str) -> Option<(String, (&'static str, &'static st
 
 /// `negative` (〜ナイ の変換結果の全文候補。(スコア, 語列)) のうち 動詞+ない で終わるものの ない を なそう に替え、`tail` を付けた派生候補。
 /// スコアは元の候補のスコアに続きの辞書のスコアを足したもの。
-pub fn nasou_variants(negative: &[(f32, &[Rc<Elem>])], tail: (&str, &str), exclude: &HashSet<String>, lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<(f32, Variant)> {
+pub fn nasou_variants(negative: &[(f32, &[Rc<Elem>])], tail: (&str, &str), exclude: &HashSet<String>, max: usize, lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<(f32, Variant)> {
+    // はかない には 儚い (形容詞 1 語) の候補があるので、吐かない (動詞) 由来の 吐かなそう を作らない。形容詞 + そう は 動詞の否定の ない を替えた形ではないため。
+    if negative.iter().any(|(_, d)| d.len() == 1 && d[0].rcid == ADJECTIVE_RCID && d[0].ruby.ends_with("ナイ")) {
+        return Vec::new();
+    }
     let tail_elem = if tail.0.is_empty() {
         None
     } else {
@@ -246,7 +252,7 @@ pub fn nasou_variants(negative: &[(f32, &[Rc<Elem>])], tail: (&str, &str), exclu
         }
         let text = surface(&d);
         // 全部ひらがな (おきなそう) は読みそのものなので足さない。審判が好んで漢字の候補を押しのけるため。
-        if out.len() < NASOU_MAX && text.chars().any(|c| !is_hiragana(c)) && seen.insert(text.clone()) {
+        if out.len() < max && text.chars().any(|c| !is_hiragana(c)) && seen.insert(text.clone()) {
             out.push((score, Variant { text, data: d }));
         }
     }
@@ -482,7 +488,7 @@ mod tests {
     #[test]
     fn 起きないの_ないを_なそうに替えて読みも揃える() {
         let neg = verb_nai("起き", "オキ");
-        let v = nasou_variants(&[(-16.6, &neg)], ("", ""), &HashSet::new(), &no_dict);
+        let v = nasou_variants(&[(-16.6, &neg)], ("", ""), &HashSet::new(), NASOU_MAX, &no_dict);
         assert_eq!(texts(&v.iter().map(|(_, v)| (0, v.clone())).collect::<Vec<_>>()), ["起きなそう"]);
         let ruby: String = v[0].1.data.iter().map(|e| e.ruby.as_str()).collect();
         assert_eq!(ruby, "オキナソウ");
@@ -492,17 +498,17 @@ mod tests {
     #[test]
     fn 続きは辞書の語を付け_スコアに足す() {
         let neg = verb_nai("起き", "オキ");
-        let v = nasou_variants(&[(-16.0, &neg)], ("ダ", "だ"), &HashSet::new(), &tail_dict);
+        let v = nasou_variants(&[(-16.0, &neg)], ("ダ", "だ"), &HashSet::new(), NASOU_MAX, &tail_dict);
         assert_eq!(v[0].1.text, "起きなそうだ");
         assert_eq!(v[0].1.data.iter().map(|e| e.ruby.as_str()).collect::<String>(), "オキナソウダ");
         assert_eq!(v[0].0, -18.0);
-        assert!(nasou_variants(&[(-16.0, &neg)], ("ダッタ", "だった"), &HashSet::new(), &tail_dict).is_empty(), "続きが辞書になければ作らない");
+        assert!(nasou_variants(&[(-16.0, &neg)], ("ダッタ", "だった"), &HashSet::new(), NASOU_MAX, &tail_dict).is_empty(), "続きが辞書になければ作らない");
     }
 
     #[test]
     fn 全部ひらがなの候補は作らない() {
         let neg = verb_nai("おき", "オキ");
-        assert!(nasou_variants(&[(-1.0, &neg)], ("", ""), &HashSet::new(), &no_dict).is_empty());
+        assert!(nasou_variants(&[(-1.0, &neg)], ("", ""), &HashSet::new(), NASOU_MAX, &no_dict).is_empty());
     }
 
     #[test]
@@ -510,7 +516,7 @@ mod tests {
         let particle = vec![Rc::new(Elem::new("は".into(), "ハ".into(), 261, 261, 468, -1.4)), Rc::new(Elem::new("ない".into(), "ナイ".into(), 473, 473, 468, -1.9))];
         let noun = vec![Rc::new(Elem::new("お".into(), "オ".into(), 560, 560, 437, -3.5)), Rc::new(Elem::new("内".into(), "ナイ".into(), 1285, 1285, 397, -7.1))];
         let single = vec![Rc::new(Elem::new("ない".into(), "ナイ".into(), 473, 473, 468, -1.9))];
-        assert!(nasou_variants(&[(-1.0, &particle), (-1.0, &noun), (-1.0, &single)], ("", ""), &HashSet::new(), &no_dict).is_empty());
+        assert!(nasou_variants(&[(-1.0, &particle), (-1.0, &noun), (-1.0, &single)], ("", ""), &HashSet::new(), NASOU_MAX, &no_dict).is_empty());
     }
 
     #[test]
@@ -519,8 +525,16 @@ mod tests {
         let b = verb_nai("置き", "オキ");
         let c = verb_nai("沖", "オキ");
         let all: Vec<(f32, &[Rc<Elem>])> = vec![(-1.0, &a), (-2.0, &b), (-3.0, &c)];
-        assert_eq!(nasou_variants(&all, ("", ""), &HashSet::new(), &no_dict).len(), NASOU_MAX);
+        assert_eq!(nasou_variants(&all, ("", ""), &HashSet::new(), NASOU_MAX, &no_dict).len(), NASOU_MAX);
         let exclude: HashSet<String> = ["起きなそう".to_string()].into();
-        assert_eq!(nasou_variants(&all, ("", ""), &exclude, &no_dict)[0].1.text, "置きなそう");
+        assert_eq!(nasou_variants(&all, ("", ""), &exclude, NASOU_MAX, &no_dict)[0].1.text, "置きなそう");
+    }
+
+    #[test]
+    fn 形容詞が1語で出る読みは_動詞の否定が混じっても_なそうにしない() {
+        let adj = vec![Rc::new(Elem::new("儚い".into(), "ハカナイ".into(), 19, 19, 468, -7.0))];
+        let verb = verb_nai("吐か", "ハカ");
+        assert!(nasou_variants(&[(-7.0, &adj), (-9.0, &verb)], ("", ""), &HashSet::new(), NASOU_MAX, &no_dict).is_empty());
+        assert_eq!(nasou_variants(&[(-9.0, &verb)], ("", ""), &HashSet::new(), NASOU_MAX, &no_dict).len(), 1);
     }
 }

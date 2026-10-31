@@ -26,6 +26,7 @@ shinbun<bs><space><space><space><enter>	しん部
 shinbu<space><enter>	しん部
 <live>shinbu<enter>	しん部
 <live>shinbun<bs><enter>	しん部
-# 派生した 起きなそう も覚える
-okinasou<space><pick:6>	起きなそう
+# 派生した 起きなそう は先頭に出て、覚える。先頭を替えても候補の添字は学習データとずれず、選んだ 翁層 が次から先頭になる
 okinasou<space><enter>	起きなそう
+okinasou<space><pick:2>	翁層
+okinasou<space><enter>	翁層
