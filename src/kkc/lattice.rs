@@ -9,8 +9,49 @@ use std::rc::Rc;
 
 use super::dict::{Dictionary, CC_MISSING};
 use super::learning::Learning;
-use super::elem::{include_mm_value_calculation, is_clause, Elem, MID_BOS_EOS};
+use super::elem::{include_mm_value_calculation, is_clause, Elem, CID_PROPER_NOUN, MID_BOS_EOS, MID_GENERAL};
 use super::wise::wise_dicdata;
+
+/// 辞書にない語 (開発用語のカタカナ語) を、辞書の語と同じようにラティスへ足すための表。語は読み (カタカナ) と表記が同じ。
+#[derive(Debug, Default)]
+pub struct ExtraWords {
+    map: HashMap<String, Rc<Elem>>,
+    /// 最長の語の文字数 (これより長い切り出しは引かない)
+    max_chars: usize,
+}
+
+/// 一覧の語のスコア。リファクタリング (-13.58) と同じ帯。
+const EXTRA_WORD_VALUE: f32 = -13.5;
+
+impl ExtraWords {
+    /// 1 行 1 語の一覧 (`resources/dev_kana_words.txt`)。`#` 始まりと空行は読み飛ばし、カタカナと長音だけの行を語とする。
+    pub fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for w in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let n = w.chars().count();
+            if n > MAX_LENGTH || !w.chars().all(|c| ('\u{30A1}'..='\u{30FA}').contains(&c) || c == 'ー') {
+                continue;
+            }
+            out.max_chars = out.max_chars.max(n);
+            let elem = Elem::new(w.to_string(), w.to_string(), CID_PROPER_NOUN, CID_PROPER_NOUN, MID_GENERAL, EXTRA_WORD_VALUE);
+            out.map.insert(w.to_string(), Rc::new(elem));
+        }
+        out
+    }
+
+    /// 一覧のファイルから。無い・読めないときは空 (ログも出さない)。
+    pub fn from_file(path: Option<&std::path::Path>) -> Self {
+        path.and_then(|p| std::fs::read_to_string(p).ok()).map(|s| Self::parse(&s)).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn get(&self, katakana: &str) -> Option<&Rc<Elem>> {
+        self.map.get(katakana)
+    }
+}
 
 /// 辞書のエントリの最大長さ (`DicdataStore.maxlength`)
 pub const MAX_LENGTH: usize = 20;
@@ -156,8 +197,8 @@ pub struct Lattice {
 }
 
 impl Lattice {
-    /// `memory` の学習エントリも辞書の語と同じようにノードにする (辞書の語のあとに並べる)。`chars` はカタカナ化済みの読み。
-    pub fn build(dict: &Dictionary, cache: &mut LookupCache, memory: &Learning, chars: &[char]) -> Self {
+    /// `memory` の学習エントリと `extra` の語も辞書の語と同じようにノードにする (辞書の語のあとに並べる。`extra` は同じ語・読みが辞書にあれば足さない)。`chars` はカタカナ化済みの読み。
+    pub fn build(dict: &Dictionary, cache: &mut LookupCache, memory: &Learning, extra: &ExtraWords, chars: &[char]) -> Self {
         let n = chars.len();
         let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, false)];
         let mut ranges = Vec::with_capacity(n);
@@ -181,6 +222,18 @@ impl Lattice {
                     continue;
                 }
                 nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
+            }
+            if !extra.is_empty() {
+                let mut word = String::new();
+                for len in 1..=extra.max_chars.min(upper - start) {
+                    word.push(chars[start + len - 1]);
+                    let Some(elem) = extra.get(&word) else { continue };
+                    let end = start + len;
+                    if nodes[from..].iter().any(|n| n.end == end && n.elem.word == elem.word && n.elem.ruby == elem.ruby) {
+                        continue;
+                    }
+                    nodes.push(Node::new(elem.clone(), end, false));
+                }
             }
             // 機械的に作るエントリ
             let mut segment = String::new();

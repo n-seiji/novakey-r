@@ -38,6 +38,8 @@ pub struct KkcCore {
     dict: Dictionary,
     cache: RefCell<lattice::LookupCache>,
     learning: RefCell<learning::Learning>,
+    /// 辞書にない開発用語のカタカナ語 (`dev_kana_words.txt`)。`open` は空のまま (azooKey と同じ結果を保つ)。
+    extra: lattice::ExtraWords,
 }
 
 impl KkcCore {
@@ -47,11 +49,32 @@ impl KkcCore {
     }
 
     pub fn open_with_learning(learning: learning::Learning) -> Result<Self, DictError> {
+        Self::open_with_extra(learning, lattice::ExtraWords::default())
+    }
+
+    /// 学習に加えて、辞書にないカタカナ語の一覧 (設定の `dev_kana_words_path`) も使って開く。IME 本体用。
+    pub fn open_with_config(learning: learning::Learning, config: &crate::config::Config) -> Result<Self, DictError> {
+        Self::open_with_extra(learning, lattice::ExtraWords::from_file(config.dev_kana_words_path.as_deref()))
+    }
+
+    fn open_with_extra(learning: learning::Learning, extra: lattice::ExtraWords) -> Result<Self, DictError> {
         Ok(Self {
             dict: Dictionary::open_default()?,
             cache: RefCell::new(lattice::LookupCache::new()),
             learning: RefCell::new(learning),
+            extra,
         })
+    }
+
+    /// 一覧の語を文字列で渡して開く (テスト用)。
+    #[cfg(test)]
+    pub fn open_with_words(learning: learning::Learning, words: &str) -> Result<Self, DictError> {
+        Self::open_with_extra(learning, lattice::ExtraWords::parse(words))
+    }
+
+    #[cfg(test)]
+    pub fn has_extra_words(&self) -> bool {
+        !self.extra.is_empty()
     }
 
     #[cfg(test)]
@@ -107,7 +130,7 @@ impl KkcCore {
         let katakana = dict::to_katakana(reading);
         let chars: Vec<char> = katakana.chars().collect();
         let learning = self.learning.borrow();
-        let mut lat = lattice::Lattice::build(&self.dict, &mut self.cache.borrow_mut(), &learning, &chars);
+        let mut lat = lattice::Lattice::build(&self.dict, &mut self.cache.borrow_mut(), &learning, &self.extra, &chars);
         lat.run(&self.dict, N_BEST);
         result::process(&self.dict, &lat, &katakana)
     }
@@ -175,7 +198,7 @@ pub fn shared_core() -> Option<Rc<KkcCore>> {
     CORE.with(|c| {
         c.borrow_mut().get(
             std::time::Instant::now(),
-            || KkcCore::open_with_learning(learning::Learning::from_config(crate::config::get())).map_err(|e| e.to_string()),
+            || KkcCore::open_with_config(learning::Learning::from_config(crate::config::get()), crate::config::get()).map_err(|e| e.to_string()),
             crate::platform::log,
         )
     })
@@ -1099,5 +1122,49 @@ mod tests {
         let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "かんじ");
         let now = after.iter().position(|t| *t == shown[i]).expect("まだ表示される");
         assert!(now < i, "{now} < {i}");
+    }
+    const KANA_WORDS: &str = "# 注釈\nリファクタ\nリベース\nabc\n";
+
+    fn words_engine(words: &str) -> RustEngine {
+        RustEngine::with_core(Rc::new(KkcCore::open_with_words(Learning::in_memory(), words).unwrap())).with_judge(no_judge)
+    }
+
+    #[test]
+    fn 一覧のカタカナ語は辞書の語と同じく先頭の候補になる() {
+        let mut e = words_engine(KANA_WORDS);
+        assert_eq!(e.convert(1, "りふぁくた")[0], "リファクタ");
+        assert_eq!(e.convert(2, "りふぁくたする")[0], "リファクタする");
+        let core = KkcCore::open_with_words(Learning::in_memory(), KANA_WORDS).unwrap();
+        let converted = core.convert_all("りふぁくた");
+        assert_eq!(converted.main[0].source, result::Source::Full, "審判の対象になる全文候補");
+        assert_eq!(converted.main.iter().filter(|c| c.text == "リファクタ").count(), 1, "重複しない");
+    }
+
+    #[test]
+    fn 一覧を入れても一覧にない読みの結果は変わらない() {
+        let with = KkcCore::open_with_words(Learning::disabled(), KANA_WORDS).unwrap();
+        let without = KkcCore::open().unwrap();
+        for reading in ["きょうはいいてんきですね", "かんじ", "ふぁいるをひらく"] {
+            let texts = |c: &KkcCore| c.convert_all(reading).main.iter().map(|x| (x.text.clone(), x.value.to_bits())).collect::<Vec<_>>();
+            assert_eq!(texts(&with), texts(&without), "{reading}");
+        }
+    }
+
+    #[test]
+    fn 一覧のカタカナ語を選ぶと学習され_open_は一覧を持たない() {
+        let core = Rc::new(KkcCore::open_with_words(Learning::in_memory(), KANA_WORDS).unwrap());
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+        e.convert(1, "りふぁくた");
+        assert!(e.select(1, 0));
+        assert_eq!(RustEngine::with_core(core).with_judge(no_judge).convert(2, "りふぁくた")[0], "リファクタ");
+        assert!(!KkcCore::open().unwrap().has_extra_words());
+        assert_ne!(KkcCore::open().unwrap().convert_all("りふぁくた").main[0].text, "リファクタ");
+    }
+
+    #[test]
+    fn 一覧が無い_読めないときは空のまま() {
+        let missing = std::path::Path::new("/nonexistent/dev_kana_words.txt");
+        assert!(lattice::ExtraWords::from_file(Some(missing)).is_empty());
+        assert!(lattice::ExtraWords::from_file(None).is_empty());
     }
 }

@@ -16,6 +16,8 @@ pub struct Config {
     pub loanwords_path: Option<PathBuf>,
     /// 開発用語の英単語の一覧 (`SHIZUKU_DEV_WORDS`、無ければアプリバンドルの Resources)。
     pub dev_words_path: Option<PathBuf>,
+    /// 辞書にない開発用語のカタカナ語の一覧 (`SHIZUKU_DEV_KANA_WORDS`、無ければアプリバンドルの Resources)。
+    pub dev_kana_words_path: Option<PathBuf>,
     /// 読み -> 絵文字の表 (`SHIZUKU_EMOJI`、無ければアプリバンドルの Resources)。
     pub emoji_path: Option<PathBuf>,
     /// ライブ変換の審判モデルの置き場所 (`SHIZUKU_JUDGE_DIR`、無ければアプリバンドルの Resources/judge)。
@@ -25,7 +27,7 @@ pub struct Config {
 impl Config {
     /// 何も読み書きしない設定 (`init` されていないテストの既定)。
     pub fn inert() -> Self {
-        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, dev_words_path: None, emoji_path: None, judge_dir: None }
+        Self { memory_dir: None, learning_enabled: false, loanwords_path: None, dev_words_path: None, dev_kana_words_path: None, emoji_path: None, judge_dir: None }
     }
 
     pub fn from_env() -> Self {
@@ -38,6 +40,7 @@ impl Config {
             learning_enabled: !std::env::var("SHIZUKU_DISABLE_LEARNING").is_ok_and(|v| v == "1"),
             loanwords_path: std::env::var_os("SHIZUKU_LOANWORDS").map(PathBuf::from).or_else(|| bundled("loanwords.tsv")),
             dev_words_path: std::env::var_os("SHIZUKU_DEV_WORDS").map(PathBuf::from).or_else(|| bundled("dev_words.txt")),
+            dev_kana_words_path: std::env::var_os("SHIZUKU_DEV_KANA_WORDS").map(PathBuf::from).or_else(|| bundled("dev_kana_words.txt")),
             emoji_path: std::env::var_os("SHIZUKU_EMOJI").map(PathBuf::from).or_else(|| bundled("emoji.tsv")),
             judge_dir: std::env::var_os("SHIZUKU_JUDGE_DIR").map(PathBuf::from).or_else(|| bundled("judge")),
         }
@@ -79,7 +82,7 @@ mod tests {
     fn init_されていない間は何も読み書きしない設定を返す() {
         let c = get();
         assert!(!c.learning_enabled);
-        assert!(c.memory_dir.is_none() && c.loanwords_path.is_none() && c.dev_words_path.is_none() && c.emoji_path.is_none());
+        assert!(c.memory_dir.is_none() && c.loanwords_path.is_none() && c.dev_words_path.is_none() && c.dev_kana_words_path.is_none() && c.emoji_path.is_none());
     }
 
     #[test]
