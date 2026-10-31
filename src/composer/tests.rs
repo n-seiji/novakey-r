@@ -1314,12 +1314,14 @@ fn live中の英語分割を表示している間は候補を選んでも確定�
 }
 
 #[test]
-fn live中でも英語分割に戻れない末尾の子音はrawのまま確定する() {
+fn live中の英語分割に付いた末尾の子音は_見えている分割のまま確定する() {
     let (mut c, _) = live_split_composer();
+    c.set_live(false);
     type_keys(&mut c, "artifactwok");
-    c.flush_romaji();
-    assert_eq!(c.phase(), Phase::Dangling);
-    assert_eq!(commit_learning(&mut c), "artifactwok");
+    let shown = c.preedit();
+    assert_eq!(shown, "artifactをk");
+    c.flush_romaji_for_commit();
+    assert_eq!(commit_learning(&mut c), shown);
 }
 
 #[test]
@@ -1586,11 +1588,11 @@ fn typed_romaji(keys: &str) -> Composer<MockEngine, FakeLexicon> {
 }
 
 #[test]
-fn 未確定のローマ字は_preedit_に出るが_commit_preview_には入らない() {
+fn 未確定のローマ字は_preedit_にも_commit_preview_にも同じに入る() {
     let c = typed_romaji("kyout");
     assert!(c.has_romaji());
     assert_eq!(c.preedit(), "きょうt");
-    assert_eq!(c.commit_preview(), "きょう");
+    assert_eq!(c.commit_preview(), "きょうt");
 }
 
 #[test]
@@ -1908,7 +1910,6 @@ fn かなの入力中に未確定のローマ字が_n_だけなら_ん_として
         assert_eq!(c.preedit(), shown, "{keys}: 打鍵の n を重ねて出さない");
         assert_eq!(c.commit_preview(), shown, "{keys}");
         assert_eq!(c.raw(), keys, "{keys}");
-        assert!(!c.has_unfolded_romaji(), "{keys}: 表示が確定と一致する");
     }
 }
 
@@ -1925,22 +1926,79 @@ fn n_のあとの打鍵で_ん_は差し替わる() {
     ] {
         let c = typed_romaji(keys);
         assert_eq!(c.preedit(), shown, "{keys}");
-        assert_eq!(c.commit_preview(), c.display(), "{keys}");
+        assert_eq!(c.commit_preview(), shown, "{keys}");
     }
 }
 
 #[test]
-fn n_以外の未確定のローマ字と単独の_n_は今までどおり() {
+fn n_以外の未確定のローマ字と単独の_n_は打鍵のまま見せて確定する() {
     let c = typed_romaji("kyout");
     assert_eq!(c.preedit(), "きょうt");
-    assert_eq!(c.commit_preview(), "きょう");
-    assert!(c.has_unfolded_romaji());
+    assert_eq!(c.commit_preview(), "きょうt");
     let c = typed_romaji("n");
     assert_eq!(c.phase(), Phase::Empty);
     assert_eq!(c.preedit(), "n");
-    assert!(c.has_unfolded_romaji());
+    assert_eq!(c.commit_preview(), "n", "かなが 1 つも無い n は ん にしない");
     let c = typed_romaji("kyonk");
     assert_eq!(c.preedit(), "きょんk");
+    assert_eq!(c.commit_preview(), "きょんk");
+}
+
+#[test]
+fn 表示は未確定の子音を足したかなで_確定も同じ文字列() {
+    for (keys, shown) in [("kyout", "きょうt"), ("nek", "ねk"), ("watashih", "わたしh"), ("kyouh", "きょうh"), ("kyonk", "きょんk")] {
+        let c = typed_romaji(keys);
+        assert_eq!(c.preedit(), shown, "{keys}");
+        assert_eq!(c.commit_preview(), shown, "{keys}");
+    }
+}
+
+#[test]
+fn かなが無く子音だけの打鍵は_打鍵のまま見せて確定する() {
+    for keys in ["k", "nk", "kk", "zz", "tt"] {
+        let c = typed_romaji(keys);
+        assert_eq!(c.preedit(), keys, "{keys}: かなにする意図が無いので raw");
+        assert_eq!(c.commit_preview(), keys, "{keys}");
+    }
+    let c = typed_romaji("nka");
+    assert_eq!(c.preedit(), "んか", "母音が来ればかなになる");
+    let c = typed_romaji("kka");
+    assert_eq!(c.preedit(), "っか");
+}
+
+#[test]
+fn 開発用語は短くても英字で見せて確定する_日本語の打ちかけは戻る() {
+    let lexicon = || FakeLexicon::default().with_dev_word(|w| w == "git");
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, lexicon());
+    type_keys(&mut c, "git");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "git");
+    assert_eq!(c.commit_preview(), "git");
+    type_keys(&mut c, "a");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "ぎた");
+    // 表の語 (4 文字以上のみ使う) と違い、一覧の語は 3 文字でも使う。一覧に無い短い語は使わない。
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, FakeLexicon::default().with_english_word(|w| w == "in"));
+    type_keys(&mut c, "in");
+    assert_eq!(c.preedit(), "いん");
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, lexicon());
+    type_keys(&mut c, "ok");
+    assert_eq!(c.preedit(), "おk");
+    assert_eq!(c.commit_preview(), "おk");
+}
+
+#[test]
+fn スラッシュで始まる英単語は_スラッシュごと英字で見せて確定する() {
+    let mut c = english_composer(|w| matches!(w, "post" | "posts"));
+    c.type_text("/");
+    type_keys(&mut c, "posts");
+    assert_eq!(c.preedit(), "/posts");
+    assert_eq!(c.commit_preview(), "/posts");
+    let mut c = english_composer(|w| matches!(w, "post" | "posts"));
+    c.type_text("/");
+    type_keys(&mut c, "kyou");
+    assert_eq!(c.preedit(), "・きょう");
+    assert_eq!(c.commit_preview(), "・きょう");
 }
 
 #[test]
@@ -1952,7 +2010,7 @@ fn 読みに戻した後の入力中は_n_を今までどおり打鍵のまま�
     assert_eq!(c.phase(), Phase::Reverted);
     c.type_romaji("n");
     assert_eq!(c.preedit(), "きょうn");
-    assert!(c.has_unfolded_romaji());
+    assert_eq!(c.commit_preview(), "きょうn");
 }
 
 #[test]
@@ -2008,7 +2066,7 @@ fn n_の有無が変わる打鍵でだけ変換し直す() {
     type_keys(&mut c, "n");
     assert_eq!(converts(), base + 1, "n で ん を足した読みを 1 回変換する");
     for _ in 0..3 {
-        let _ = (c.preedit(), c.display().into_owned(), c.commit_preview(), c.candidates().len(), c.phase(), c.raw(), c.has_unfolded_romaji());
+        let _ = (c.preedit(), c.display().into_owned(), c.commit_preview(), c.candidates().len(), c.phase(), c.raw());
     }
     assert_eq!(converts(), base + 1, "読み取りでは変換しない");
     c.backspace_romaji();
@@ -2091,7 +2149,6 @@ fn 英語を打っている間の_n_は今までどおり英字で見せる() {
     assert_eq!(c.phase(), Phase::Dangling);
     assert_eq!(c.preedit(), "open");
     assert_eq!(c.commit_preview(), "open");
-    assert!(c.has_unfolded_romaji());
     let (mut c, _, mut memory) = learn_composer(&[]);
     memory.learn("man");
     type_keys(&mut c, "man");
@@ -2114,13 +2171,13 @@ fn 英単語から読みに戻った_n_は_ん_として見せ_英語に戻れ�
 }
 
 #[test]
-fn 英語分割が見えている間の_n_は今までどおり() {
+fn 英語分割が見えている間の_n_は_ん_で見せて_enter_と一致する() {
     let mut c = english_composer(|w| w == "login");
     type_keys(&mut c, "loginjinihirakun");
     assert_eq!(c.phase(), Phase::Composing);
     assert!(c.english_split(false).is_some());
-    assert_eq!(c.preedit(), "loginじにひらくn");
-    assert!(c.has_unfolded_romaji());
+    assert_eq!(c.preedit(), "loginじにひらくん");
+    assert_eq!(c.commit_preview(), c.preedit());
     assert_eq!(c.hiragana, "ぉぎんじにひらく");
 }
 
@@ -2132,7 +2189,6 @@ fn enterで英語として扱い直す組成の_n_は_ん_にせず打鍵のま�
     type_keys(&mut c, "ymn");
     assert_eq!(c.phase(), Phase::Composing);
     assert_eq!(c.preedit(), "。ymn");
-    assert!(c.has_unfolded_romaji());
     c.flush_romaji();
     assert_eq!(c.phase(), Phase::Dangling);
     assert_eq!(c.commit_preview(), ".ymn");

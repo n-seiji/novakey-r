@@ -240,6 +240,14 @@ impl Segment {
         matches!(self, Segment::Literal(_))
     }
 
+    /// 子音 1 打鍵だけから生まれたかな (kk の っ、nk の ん)。母音を打っていないので、かなにする意図があったとは言えない。
+    fn is_bare_consonant(&self) -> bool {
+        match self {
+            Segment::Kana { keys, .. } => matches!(keys.as_bytes(), [b] if b.is_ascii_lowercase() && !b"aiueo".contains(b)),
+            Segment::Literal(_) => false,
+        }
+    }
+
     /// 英語分割の英単語 (Literal) とかな部分 (Kana) を、区切りの並びにする。
     fn from_split(head: String, tail: Vec<(String, String)>) -> impl Iterator<Item = Segment> {
         std::iter::once(Segment::Literal(head)).chain(tail.into_iter().map(|(keys, kana)| Segment::Kana { keys, kana }))
@@ -377,6 +385,8 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 下線付きで見せる文字列。表示の決定はここだけ。
     pub fn preedit(&self) -> String {
         if let Some(split) = self.shown_split() {
+            // 未確定の n だけは、Enter の flush で ん になって分割の読みに入る (commit_preview と同じ分割)。
+            let split = if split.pending == PENDING_N { self.english_split(true).unwrap_or(split) } else { split };
             return match self.live_split_text(&split) {
                 Some(text) => text.to_string() + &split.pending,
                 None => split.display(),
@@ -385,12 +395,21 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if (self.typing == Typing::English && self.is_kana_editing()) || self.is_typing_english() {
             return self.raw();
         }
-        // n だけの未確定のローマ字は、読み (display) が ん として含んでいる。
+        self.kana_view()
+    }
+
+    /// 英語として扱わないときの、見せる文字列と Enter で確定する文字列 (どちらもここから出す)。
+    /// 読み (display) に、未確定のローマ字を足したもの。n だけなら読みが ん として含んでいる (`pending_kana`)。
+    /// ただし、かなが 1 つも無く子音だけ (k, nk, kk) なら、かなにする意図が無いので打鍵のまま見せる。
+    fn kana_view(&self) -> String {
+        if self.has_romaji() && self.segments.iter().all(Segment::is_bare_consonant) {
+            return self.raw();
+        }
         let pending = if self.pending_kana().is_empty() { self.romaji.buffer() } else { "" };
         format!("{}{pending}", self.display())
     }
 
-    /// Enter で確定される文字列 (状態は変えない)。未確定ローマ字は確定済みとして扱わない。ただし n だけなら、読みが ん として含んでいる (`pending_kana`)。
+    /// Enter で確定される文字列 (状態は変えない)。表示 (`preedit`) と同じ判定で、未確定ローマ字は表示のまま足す。
     /// かな入力中は、確定の前に行う flush が局面を英語に変える分 (merge, artifactni) も見込む。
     pub fn commit_preview(&self) -> String {
         match self.settle(self.is_typing_english()) {
@@ -400,7 +419,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             },
             Settle::Dangling => self.raw(),
             Settle::Unchanged if self.phase() == Phase::Dangling => self.raw(),
-            Settle::Unchanged => self.display().into_owned(),
+            Settle::Unchanged => self.kana_view(),
         }
     }
 
@@ -439,12 +458,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 読みに足して見せる、未確定のローマ字のかな。n だけなら ん (次の打鍵で `mina` の な や `ny` に差し替わる)、それ以外は空。
     /// かなを入力中 (Typing::Kana の Editing) で、Enter の flush が組成を英語として扱い直さない (raw で確定しない) ときだけ。
-    /// 扱い直す組成 (英語分割が見えている、ASCII のまま残ったかながある) は、n も打鍵のまま見せる。この条件を決めるのはここだけ。
+    /// 扱い直す組成 (ASCII のまま残ったかながある) は、n も打鍵のまま見せる。英語分割は読みに ん を足す側で、`preedit` が分割ごと作り直す。この条件を決めるのはここだけ。
     fn pending_kana(&self) -> &'static str {
         let folded = matches!(self.stage, Stage::Editing)
             && self.typing == Typing::Kana
             && !self.segments.is_empty()
             && self.romaji.buffer() == PENDING_N
+            && !self.segments.iter().all(Segment::is_bare_consonant)
             && matches!(self.settle(self.is_typing_english()), Settle::Unchanged);
         if folded { PENDING_N_KANA } else { "" }
     }
@@ -633,6 +653,27 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.absorb_flush(english, keys, flush);
     }
 
+    /// 確定のための flush。表示がかな + 未確定のローマ字のままなら (kyout)、flush しない:
+    /// 子音を ASCII のかなとして取り込むと英語の合図 (`has_ascii_kana`) になり、表示と違う raw で確定してしまう。
+    /// その場合は `commit_preview` が未確定のローマ字を表示のまま足す。英語として扱い直す組成だけ flush する。
+    /// かなが 1 つも無い (子音だけの k, n) ときは、打鍵のまま ASCII のかなとして取り込み (n を ん にしない)、raw で確定する。
+    pub fn flush_romaji_for_commit(&mut self) {
+        if self.has_romaji() && self.segments.is_empty() {
+            let english = self.is_typing_english();
+            let keys = self.romaji.buffer().to_string();
+            self.romaji.clear();
+            self.absorb_flush(english, keys.clone(), Some(keys));
+            return;
+        }
+        let shown_as_kana = self.has_romaji()
+            && matches!(self.stage, Stage::Editing)
+            && self.typing == Typing::Kana
+            && matches!(self.settle(self.is_typing_english()), Settle::Unchanged);
+        if !shown_as_kana {
+            self.flush_romaji();
+        }
+    }
+
     /// english は、未確定のローマ字を残した状態で英語と見なせていたか。
     fn absorb_flush(&mut self, english: bool, keys: String, flush: Option<String>) {
         if let Some(kana) = flush {
@@ -653,6 +694,11 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// ローマ字を確定し終えた組成が、英語として扱い直されるか。
     fn settle(&self, english: bool) -> Settle {
+        // 見えている分割に未確定のローマ字が付いている間 (artifactwok の artifactをk) は、その表示のまま確定する。
+        // n だけは対象外: 確定で ん になり、分割の読みに入る (kousin の n)。
+        if let Some(split) = self.english_split(false).filter(|s| !s.pending.is_empty() && s.pending != PENDING_N) {
+            return Settle::Mixed(split.pending_as_kana());
+        }
         if let Some(split) = self.english_split(true) {
             return Settle::Mixed(split);
         }
@@ -799,15 +845,17 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.reading.list = self.convert_mixed(&head_text, &tail);
     }
 
-    /// 英語を打っていると見なせる局面。英字のまま表示し、確定も英字にする。
+    /// 英語を打っていると見なせる局面。英字のまま表示し、Enter の確定もその英字にする (表示と確定は同じ判定を共有する)。
     /// かなの途中に変換できない子音が挟まった (merge の めrげ) か、かなにしきれない打鍵が残り、
-    /// 打鍵列全体が英語として確定したことのある語 (git) か 4 文字以上の英単語 (enter) になっている。
-    /// 表の短い語は日本語の打ちかけ (in, den) と紛れるので外す。
+    /// 打鍵列全体が英語として確定したことのある語・開発用語の一覧の語 (git) か 4 文字以上の英単語 (enter) になっている。
+    /// 先頭が `/` でも、残りがその語なら同じ (/posts)。表の短い語は日本語の打ちかけ (in, den) と紛れるので外す。
+    /// 語でない打鍵列に子音が残っただけ (kyout) は英語とせず、かな表示のまま確定する (`kana_view`)。
     pub fn is_typing_english(&self) -> bool {
         let raw = self.raw();
-        let word = || !self.romaji.buffer().is_empty() && self.is_english_word_raw(&raw);
+        let typed = raw.strip_prefix('/').unwrap_or(&raw);
+        let word = || !self.romaji.buffer().is_empty() && self.is_english_word_raw(typed);
         self.is_kana_editing()
-            && raw.bytes().all(|b| b.is_ascii_lowercase())
+            && typed.bytes().all(|b| b.is_ascii_lowercase())
             && (self.has_ascii_kana() || word() || self.is_verdict(&raw, Verdict::Word) || self.is_verdict(&raw, Verdict::Judged))
     }
 
@@ -857,10 +905,13 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         matches!(&self.word_verdict, Some((r, v)) if r == raw && *v == verdict)
     }
 
-    /// 打鍵列全体が英語として確定したことのある語か 4 文字以上の英単語か。
+    /// 打鍵列全体が英語として確定したことのある語か、開発用語の一覧の語か、4 文字以上の英単語か。
+    /// 表の短い語は日本語の打ちかけと紛れる (in, den) ので、4 文字未満は一覧の語 (git) だけ。
     fn is_english_word_raw(&self, raw: &str) -> bool {
         const MIN_LEN: usize = 4;
-        self.lexicon.knows_english(raw) || (raw.len() >= MIN_LEN && self.lexicon.is_english_word(raw))
+        self.lexicon.knows_english(raw)
+            || self.lexicon.is_dev_word(raw)
+            || (raw.len() >= MIN_LEN && self.lexicon.is_english_word(raw))
     }
 
     /// 変換できずに ASCII のまま残った文字が組成に含まれるか(英単語の合図)。英字の区切りは数えない。
@@ -924,12 +975,6 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 未確定のローマ字があるか。
     pub fn has_romaji(&self) -> bool {
         !self.romaji.buffer().is_empty()
-    }
-
-    /// 未確定のローマ字が、読みに取り込まれないまま残っているか。残っていると `commit_preview` は表示と一致するとは限らない。
-    /// n だけなら ん として読みに取り込まれ、表示も確定も同じになる (`pending_kana`)。
-    pub fn has_unfolded_romaji(&self) -> bool {
-        self.has_romaji() && self.pending_kana().is_empty()
     }
 
     /// 未確定のローマ字を 1 文字消す。

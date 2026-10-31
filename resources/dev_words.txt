@@ -1,6 +1,6 @@
 # 開発でよく使う英単語 (小文字、1 行 1 語、# はコメント)。JMdict 由来の loanwords.tsv に載らない語を補う。
 # 英単語の直後に助詞が続く打鍵 (mergeshite → mergeして) を切り分けるのと、打ちかけの英語表示に使う。
-# 4 文字未満は使われない。読み (ローマ字のかな) が日本語の語になる語 (same, made, kane, sake, base, case, line, mode, name, note ...) は入れない。
+# 表の語 (loanwords.tsv) は 4 文字未満だと使われないが、この一覧の語は 3 文字でも英語として扱う (git)。そのぶん日本語の打ちかけと紛れる短い語は入れない (ok は おか・おかね など)。読み (ローマ字のかな) が日本語の語になる語 (same, made, kane, sake, base, case, line, mode, name, note ...) は入れない。
 merge
 commit
 rebase
@@ -352,3 +352,4 @@ pipeline
 workflow
 runner
 artifact
+git

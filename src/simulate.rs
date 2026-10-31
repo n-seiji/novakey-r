@@ -433,19 +433,34 @@ struct Run {
     stale: Vec<String>,
     /// 表示と確定される文字列がずれた打鍵 (検査を有効にしたときだけ入る)。空であるべき。
     wysiwyg_broken: Vec<String>,
+    /// 各打鍵のあとの下線付き文字列 (ホストアプリが見ている方)。
+    marked_after: Vec<String>,
 }
 
 fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
-    // 行どうしが文脈を持ち越さないようにする。アプリは 1 つ (bundle id `sim`) に固定。
+    let steps = parse_keys(keys)?;
+    let mut run = play(&steps, verbose)?;
+    if check_preedit {
+        run.wysiwyg_broken = unmatched_enter(&steps, &run.marked_after);
+    }
+    Ok(run)
+}
+
+/// 行どうしが文脈を持ち越さないようにして、Sim を新しく作る。アプリは 1 つ (bundle id `sim`) に固定。
+fn fresh_sim() -> Sim {
     crate::context::with(|store| store.clear_all());
-    let mut sim = Sim::new();
+    let sim = Sim::new();
     sim.client.set_bundle("sim");
+    sim
+}
+
+fn play(steps: &[(String, Step)], verbose: bool) -> Result<Run, String> {
+    let mut sim = fresh_sim();
     let mut stale = Vec::new();
-    // 検査は opt-in。読みに取り込まれない未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない (n だけなら ん として一致するので見る)。
-    let mut wysiwyg_broken = Vec::new();
-    for (label, step) in parse_keys(keys)? {
+    let mut marked_after = Vec::with_capacity(steps.len());
+    for (label, step) in steps {
         let started = std::time::Instant::now();
-        sim.apply(&label, &step)?;
+        sim.apply(label, step)?;
         let judge_ms = crate::judge::take_last_ms();
         if let Some(ms) = judge_ms {
             JUDGE_MS.with(|j| j.borrow_mut().push(ms));
@@ -456,9 +471,7 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
         if sim.client.marked() != sim.controller.marked_text() {
             stale.push(label.clone());
         }
-        if check_preedit && sim.controller.commit_preview().is_some_and(|p| p != sim.controller.marked_text()) {
-            wysiwyg_broken.push(label.clone());
-        }
+        marked_after.push(sim.client.marked());
         if verbose {
             let panel = if sim.panel.visible() { format!(" panel@{}", sim.panel.line() + 1) } else { String::new() };
             println!(
@@ -476,14 +489,40 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
             }
         }
     }
-    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale, wysiwyg_broken })
+    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale, wysiwyg_broken: Vec::new(), marked_after })
+}
+
+/// 「表示されている文字が Enter で確定する」の検査。実装 (preedit / commit_preview) を見ずに、
+/// 下線付き文字列が残った打鍵ごとに、同じ打鍵列を新しい Sim で打ち直して Enter を押し、確定された文字列と比べる。
+/// 学習が on のときは打ち直しの確定が記憶を変えるので、この検査は off のとき (`mise run wysiwyg`) 専用。
+fn unmatched_enter(steps: &[(String, Step)], marked_after: &[String]) -> Vec<String> {
+    let enter = key_input(36, "\r");
+    let mut broken = Vec::new();
+    for (i, marked) in marked_after.iter().enumerate() {
+        if marked.is_empty() {
+            continue;
+        }
+        let mut sim = fresh_sim();
+        let replayed = steps[..=i].iter().try_for_each(|(label, step)| sim.apply(label, step));
+        if replayed.is_err() {
+            continue;
+        }
+        let before = sim.client.committed();
+        sim.press(&enter);
+        let after = sim.client.committed();
+        let committed = after.strip_prefix(before.as_str()).unwrap_or(&after);
+        if committed != marked {
+            broken.push(steps[i].0.clone());
+        }
+    }
+    broken
 }
 
 /// `--simulate '<keys>'`
 pub fn simulate(keys: &str, check_preedit: bool) {
     setup_env();
     match run_keys(keys, true, check_preedit) {
-        Ok(Run { committed, marked, stale, wysiwyg_broken }) => {
+        Ok(Run { committed, marked, stale, wysiwyg_broken, .. }) => {
             println!("final: {committed:?}");
             if !marked.is_empty() {
                 println!("still composing: {marked:?}");
@@ -561,7 +600,8 @@ pub fn simulate_file(path: &str, check_preedit: bool) {
             }
         };
         let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
-        println!("{verdict} {keys}  =>  {shown}{want}");
+        let broken = result.as_ref().ok().filter(|run| !run.wysiwyg_broken.is_empty()).map_or(String::new(), |run| format!("   after {}", run.wysiwyg_broken.join(" ")));
+        println!("{verdict} {keys}  =>  {shown}{want}{broken}");
     }
     if std::env::var_os("SHIZUKU_SIM_TIMING").is_some() {
         print_timing_summary();

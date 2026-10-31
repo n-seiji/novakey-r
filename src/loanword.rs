@@ -65,16 +65,20 @@ pub fn parse_words(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した語の一覧。一覧が無ければ表だけ。
-/// 完全一致 (binary_search) と前方一致 (partition_point) の両方を引けるよう、整列して重複を除く。
-static WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let extra = crate::config::get()
+/// 開発用語の一覧 (`resources/dev_words.txt`)。一覧が無ければ空。
+static DEV_WORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    crate::config::get()
         .dev_words_path
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| parse_words(&s))
-        .unwrap_or_default();
-    let mut all: Vec<String> = words(&TABLE).into_iter().map(str::to_string).chain(extra).collect();
+        .unwrap_or_default()
+});
+
+/// 表の英語に、開発用語の一覧 (JMdict に載らない merge, commit など) を足した語の一覧。一覧が無ければ表だけ。
+/// 完全一致 (binary_search) と前方一致 (partition_point) の両方を引けるよう、整列して重複を除く。
+static WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut all: Vec<String> = words(&TABLE).into_iter().map(str::to_string).chain(DEV_WORDS.iter().cloned()).collect();
     all.sort_unstable();
     all.dedup();
     all
@@ -83,6 +87,11 @@ static WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
 /// 打鍵列が表に載っている英単語か。
 pub fn is_english_word(typed: &str) -> bool {
     WORDS.binary_search_by(|w| w.as_str().cmp(typed)).is_ok()
+}
+
+/// 打鍵列が開発用語の一覧 (`dev_words.txt`) の語か。表の語と違い、短くても英語と見なしてよい語だけが載る。
+pub fn is_dev_word(typed: &str) -> bool {
+    DEV_WORDS.contains(typed)
 }
 
 /// 打鍵列で始まる英単語があるか (打鍵列そのものが語の場合も含む)。

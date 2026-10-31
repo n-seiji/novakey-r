@@ -123,14 +123,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         self.composer.preedit()
     }
 
-    /// いま確定したら挿入される文字列 (状態は変えない)。未確定ローマ字は含めない。ただし n だけなら ん として含む。
+    /// いま確定したら挿入される文字列 (状態は変えない)。表示 (`marked_text`) と一致する。
+    #[cfg(test)]
     pub fn commit_preview(&self) -> String {
         self.composer.commit_preview()
-    }
-
-    /// 未確定のローマ字が、読みに取り込まれないまま残っているか。残っていると `commit_preview` は表示と一致するとは限らない (n だけなら ん として一致する)。
-    pub fn has_unfolded_romaji(&self) -> bool {
-        self.composer.has_unfolded_romaji()
     }
 
     /// キー処理の入口。キーを動作表で解決して実行する。
@@ -152,7 +148,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         let phase = self.phase();
         if gates.direct {
             // 直接入力: 作文中だった分 (未確定ローマ字を含む) は表示どおり確定し、キーは素通しにする。
-            self.composer.flush_romaji();
+            self.composer.flush_romaji_for_commit();
             if !self.composer.is_empty() {
                 self.commit_and_insert(&Gates { learning: false, ..*gates }, "", &mut fx);
             }
@@ -201,7 +197,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn commit_composition(&mut self, gates: &Gates) -> Vec<Effect> {
         self.last_key_was_lt = false;
         let mut fx = Vec::new();
-        self.composer.flush_romaji();
+        self.composer.flush_romaji_for_commit();
         if !self.composer.is_empty() {
             // フォーカス喪失などによる確定は、英語を「選んだ」のではないので、選択による学習はしない。
             fx.push(Effect::Insert(self.commit(gates, false)));
@@ -273,7 +269,9 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 | Key::Letter { upper: true }
                 | Key::Translit(_)
         );
-        if flushes {
+        if key == Key::Enter {
+            self.composer.flush_romaji_for_commit();
+        } else if flushes {
             self.composer.flush_romaji();
         }
         let has_romaji = self.composer.has_romaji();
@@ -477,10 +475,10 @@ mod tests {
     #[test]
     fn 英語として確定した語は次から打ちかけでも英字で表示する() {
         let mut session = remembering_session();
-        assert_eq!(shown_after(&mut session, "git"), "ぎt");
+        assert_eq!(shown_after(&mut session, "merge"), "merge");
         session.handle(&ALLOW, Key::Enter, "\r");
-        assert_eq!(shown_after(&mut session, "git"), "git");
-        assert_eq!(shown_after(&mut session, "a"), "ぎた");
+        assert_eq!(session.memory.learned(), ["merge"]);
+        assert_eq!(shown_after(&mut session, "merge"), "merge");
     }
 
     #[test]
@@ -1011,19 +1009,19 @@ mod tests {
         case("min\u{8}", "み", "み");
         case("minn", "みん", "みん");
         case("min'", "みん", "みん");
-        case("mink", "みんk", "mink");
-        case("miny", "みny", "miny");
-        case("kyonk", "きょんk", "kyonk");
+        case("mink", "みんk", "みんk");
+        case("miny", "みny", "みny");
+        case("kyonk", "きょんk", "きょんk");
     }
 
     #[test]
     fn 単独の_n_と_n_以外の未確定のローマ字は今までどおり() {
         assert_eq!(after("n"), (String::new(), "n".to_string()));
-        assert_eq!(typed("n"), "ん");
-        assert_eq!(after("nk"), (String::new(), "んk".to_string()));
+        assert_eq!(typed("n"), "n", "かなが 1 つも無い n は ん にしない");
+        assert_eq!(after("nk"), (String::new(), "nk".to_string()));
         assert_eq!(typed("nk"), "nk");
         assert_eq!(after("kyout"), (String::new(), "きょうt".to_string()));
-        assert_eq!(typed("kyout"), "kyout");
+        assert_eq!(typed("kyout"), "きょうt", "表示のまま確定する");
     }
 
     #[test]

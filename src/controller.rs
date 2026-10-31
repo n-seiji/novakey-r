@@ -117,13 +117,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.session.borrow().marked_text()
     }
 
-    /// いま確定した場合の文字列。読みに取り込まれない未確定ローマ字 (きょうt の t) があれば None (表示と一致しなくてよい)。
-    /// n だけの未確定は ん として表示にも確定にも含まれるので、表示と一致するか確かめられる。
-    pub fn commit_preview(&self) -> Option<String> {
-        let session = self.session.borrow();
-        (!session.has_unfolded_romaji()).then(|| session.commit_preview())
-    }
-
     fn client(&self) -> Option<C> {
         self.last_client.borrow().clone()
     }
@@ -410,20 +403,6 @@ mod tests {
         type_letters(&f, "a");
         assert_eq!(f.1.marked(), "あ");
         assert_eq!(f.1.committed(), "");
-    }
-
-    #[test]
-    fn 確定の予想が返るのは_表示に含まれない未確定ローマ字が無いときだけ() {
-        let f = fixture();
-        type_letters(&f, "kyon");
-        assert_eq!(f.0.commit_preview(), Some("きょん".to_string()), "n は ん として表示に含まれる");
-        assert_eq!(f.0.commit_preview(), Some(f.0.marked_text()));
-        assert!(press(&f, Key::Escape, "\u{1b}"));
-        type_letters(&f, "kyout");
-        assert_eq!(f.0.commit_preview(), None, "t は表示に含まれない");
-        assert!(press(&f, Key::Escape, "\u{1b}"));
-        type_letters(&f, "n");
-        assert_eq!(f.0.commit_preview(), None, "単独の n は表示に ん を足さない");
     }
 
     #[test]
@@ -867,11 +846,12 @@ mod tests {
         let env = RecEnv::default();
         let client = RecClient::default();
         let (c, core, memory) = observing_controller(env.clone());
-        rec_type(&c, &client, "git");
+        // かなにしきれない打鍵 (rg) があるので、語として知られていなくても英語として打っている。
+        rec_type(&c, &client, "merge");
         env.secure.set(secure);
         rec_press(&c, &client, Key::Enter, "\r");
         assert!(!engine_learned(&core));
-        memory.learned().iter().any(|w| w == "git")
+        memory.learned().iter().any(|w| w == "merge")
     }
 
     #[test]
