@@ -237,7 +237,7 @@ fn exception_name(exception: &AnyObject) -> Option<String> {
     let name = catch_objc_with(false, |s| unsafe { send!(s, exception, name_selector; () -> *mut AnyObject) })?;
     // SAFETY: name は NSString (nil 可) の +0 戻り値で、retain して所有する。
     let name: Option<Id<NSString>> = unsafe { Id::retain(name.cast()) };
-    name.map(|n| lossy_string_quiet(&n))
+    name.map(|n| String::from_utf16_lossy(&utf16_units_with(&n, false)))
 }
 
 const MAX_SEEN_EXCEPTIONS: usize = 32;
@@ -328,12 +328,7 @@ pub fn is_secure_input_enabled() -> bool {
 }
 
 /// NSString の UTF-16 単位列。`UTF8String` は単独サロゲートを含むと NULL を返し objc2 が確かめずに使うので通さない。
-/// 送信が例外を投げたら空にする。
-fn utf16_units(string: &NSString) -> Vec<u16> {
-    utf16_units_with(string, true)
-}
-
-/// `report` が false なら、例外のログと名前の読み取りをしない (exception_name から呼ぶときの再帰を避ける)。
+/// 送信が例外を投げたら空にする。`report` が false なら、例外のログと名前の読み取りをしない (exception_name から呼ぶときの再帰を避ける)。
 fn utf16_units_with(string: &NSString, report: bool) -> Vec<u16> {
     let (length, get_characters) = (sel!(length), sel!(getCharacters:range:));
     // SAFETY: length は NSUInteger を返す。
@@ -356,11 +351,7 @@ fn utf16_units_with(string: &NSString, report: bool) -> Vec<u16> {
 
 /// ホスト由来の NSString を String にする。不正なサロゲートは U+FFFD になる。
 pub fn lossy_string(string: &NSString) -> String {
-    String::from_utf16_lossy(&utf16_units(string))
-}
-
-fn lossy_string_quiet(string: &NSString) -> String {
-    String::from_utf16_lossy(&utf16_units_with(string, false))
+    String::from_utf16_lossy(&utf16_units_with(string, true))
 }
 
 /// 候補パネルが渡す候補 (NSString か NSAttributedString) の文字列。どちらでもなければ None。

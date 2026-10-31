@@ -35,7 +35,7 @@ pub enum ConversionMode {
 }
 
 /// 1 回の入力処理で許される外向きの動き。入口で必ず渡す (既定値は持たない。本番では Controller が毎回作る)。
-/// bundle id が取れないときは学習を許可する (outbound::learning_allowed の現仕様)。
+/// 本番では `learning` は `direct` の否定 (outbound::direct_input)。bundle id が取れないときは学習を許可する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gates {
     /// 確定を学習してよい (セキュア入力中・パスワード管理アプリでは false)。
@@ -123,14 +123,10 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         self.composer.preedit()
     }
 
-    /// いま確定したら挿入される文字列 (状態は変えない)。未確定ローマ字は含めない。
+    /// いま確定したら挿入される文字列 (状態は変えない)。表示 (`marked_text`) と一致する。
+    #[cfg(test)]
     pub fn commit_preview(&self) -> String {
         self.composer.commit_preview()
-    }
-
-    /// 未確定のローマ字があるか。
-    pub fn has_romaji(&self) -> bool {
-        self.composer.has_romaji()
     }
 
     /// キー処理の入口。キーを動作表で解決して実行する。
@@ -152,7 +148,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
         let phase = self.phase();
         if gates.direct {
             // 直接入力: 作文中だった分 (未確定ローマ字を含む) は表示どおり確定し、キーは素通しにする。
-            self.composer.flush_romaji();
+            self.composer.flush_romaji_for_commit();
             if !self.composer.is_empty() {
                 self.commit_and_insert(&Gates { learning: false, ..*gates }, "", &mut fx);
             }
@@ -178,7 +174,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             fx.push(Effect::Insert(text.to_string()));
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
-        let action = keymap::action_for(phase, key);
+        let action = if key == Key::Hyphen && self.composer.hyphen_continues_kana() { Action::TypeText } else { keymap::action_for(phase, key) };
         if action == Action::CommitThenRestart {
             self.commit_and_insert(gates, "", &mut fx);
             let restarted = self.handle(gates, key, text);
@@ -201,7 +197,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
     pub fn commit_composition(&mut self, gates: &Gates) -> Vec<Effect> {
         self.last_key_was_lt = false;
         let mut fx = Vec::new();
-        self.composer.flush_romaji();
+        self.composer.flush_romaji_for_commit();
         if !self.composer.is_empty() {
             // フォーカス喪失などによる確定は、英語を「選んだ」のではないので、選択による学習はしない。
             fx.push(Effect::Insert(self.commit(gates, false)));
@@ -273,7 +269,9 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
                 | Key::Letter { upper: true }
                 | Key::Translit(_)
         );
-        if flushes {
+        if key == Key::Enter {
+            self.composer.flush_romaji_for_commit();
+        } else if flushes {
             self.composer.flush_romaji();
         }
         let has_romaji = self.composer.has_romaji();
@@ -367,13 +365,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             Action::Transliterate(form) => {
                 self.composer.transliterate(form) && self.show_typing(fx)
             }
-            Action::DeleteBack => {
-                let deleted = self.composer.backspace();
-                if deleted {
-                    self.show_typing(fx);
-                }
-                deleted
-            }
+            Action::DeleteBack => self.composer.backspace() && self.show_typing(fx),
         }
     }
 }
@@ -439,7 +431,7 @@ mod tests {
     #[test]
     fn 英単語を打ち終えた時点で英字で表示しenterで英字を確定する() {
         let (shown, out) = typed_english("enter");
-        assert_eq!(shown, ["え", "えn", "えんt", "えんて", "enter"]);
+        assert_eq!(shown, ["え", "えん", "えんt", "えんて", "enter"]);
         assert_eq!(out, "enter");
     }
 
@@ -454,7 +446,7 @@ mod tests {
     fn 英単語の続きを打てばかなに戻る() {
         let (shown, out) = typed_english("rainen");
         assert_eq!(shown[3], "rain");
-        assert_eq!(shown.last().unwrap(), "らいねn");
+        assert_eq!(shown.last().unwrap(), "らいねん");
         assert_eq!(out, "らいねん");
     }
 
@@ -483,10 +475,10 @@ mod tests {
     #[test]
     fn 英語として確定した語は次から打ちかけでも英字で表示する() {
         let mut session = remembering_session();
-        assert_eq!(shown_after(&mut session, "git"), "ぎt");
+        assert_eq!(shown_after(&mut session, "merge"), "merge");
         session.handle(&ALLOW, Key::Enter, "\r");
-        assert_eq!(shown_after(&mut session, "git"), "git");
-        assert_eq!(shown_after(&mut session, "a"), "ぎた");
+        assert_eq!(session.memory.learned(), ["merge"]);
+        assert_eq!(shown_after(&mut session, "merge"), "merge");
     }
 
     #[test]
@@ -522,7 +514,7 @@ mod tests {
     #[test]
     fn 三文字以下の英単語はかなのまま() {
         let (shown, out) = typed_english("inu");
-        assert_eq!(shown[1], "いn");
+        assert_eq!(shown[1], "いん");
         assert_eq!(out, "いぬ");
     }
 
@@ -995,6 +987,147 @@ mod tests {
         let outcome = session.handle(&ALLOW, classify('-'), "-");
         assert!(inserted(&outcome).is_empty());
         assert_eq!(session.marked_text(), "ー");
+    }
+
+    #[test]
+    fn 未確定の_n_は_ん_として表示しenterでそのまま確定する() {
+        for keys in ["kyon", "min", "shinbun", "kanpan", "rainen"] {
+            let (committed, shown) = after(keys);
+            assert_eq!(committed, "", "{keys}");
+            assert!(shown.ends_with('ん'), "{keys}: {shown}");
+            assert_eq!(typed(keys), shown, "{keys}: Enter は表示されているものを確定する");
+        }
+    }
+
+    #[test]
+    fn n_のあとの打鍵は_ん_を差し替え_消し_確定する() {
+        let case = |keys: &str, marked: &str, committed: &str| {
+            assert_eq!(after(keys), (String::new(), marked.to_string()), "{keys}");
+            assert_eq!(typed(keys), committed, "{keys}<enter>");
+        };
+        case("mina", "みな", "みな");
+        case("min\u{8}", "み", "み");
+        case("minn", "みん", "みん");
+        case("min'", "みん", "みん");
+        case("mink", "みんk", "みんk");
+        case("miny", "みny", "みny");
+        case("kyonk", "きょんk", "きょんk");
+    }
+
+    #[test]
+    fn 単独の_n_と_n_以外の未確定のローマ字は今までどおり() {
+        assert_eq!(after("n"), (String::new(), "n".to_string()));
+        assert_eq!(typed("n"), "n", "かなが 1 つも無い n は ん にしない");
+        assert_eq!(after("nk"), (String::new(), "nk".to_string()));
+        assert_eq!(typed("nk"), "nk");
+        assert_eq!(after("kyout"), (String::new(), "きょうt".to_string()));
+        assert_eq!(typed("kyout"), "きょうt", "表示のまま確定する");
+    }
+
+    #[test]
+    fn ん_を見せている間の_esc_は組成を捨てる() {
+        assert_eq!(after("kyon\u{1b}"), (String::new(), String::new()));
+        assert_eq!(after("min\u{1b}"), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn 英字入力のあとの_n_は_ん_にしない() {
+        assert_eq!(after("kyouTokyon"), (String::new(), "きょうTokyon".to_string()));
+        assert_eq!(typed("kyouTokyon"), "きょうTokyon");
+        assert_eq!(typed("Tokyon"), "Tokyon");
+    }
+
+    /// 読みを【】で囲んだ 1 候補だけを返す (live の変換結果が読みと違って見える)。
+    struct BracketEngine;
+    impl CandidateEngine for BracketEngine {
+        fn convert(&mut self, _: u64, hiragana: &str) -> Vec<String> {
+            vec![format!("【{hiragana}】")]
+        }
+        fn select(&mut self, _: u64, _: usize) -> bool {
+            false
+        }
+        fn cancel(&mut self) {}
+    }
+
+    /// live で打鍵列を流し、(Enter 前の下線付きの文字列, Enter で確定された文字列) を返す。
+    fn live_shown_and_committed(keys: &str) -> (String, String) {
+        let mut session = Session::new(Composer::new(BracketEngine, FakeLexicon::default()), FakeMemory::default(), ConversionMode::Live);
+        for ch in keys.chars() {
+            session.handle(&ALLOW, classify(ch), &ch.to_string());
+        }
+        let shown = session.marked_text();
+        let outcome = session.handle(&ALLOW, Key::Enter, "\r");
+        (shown, inserted(&outcome).concat())
+    }
+
+    #[test]
+    fn liveは_n_を_ん_にした読みで変換し表示のまま確定する() {
+        for (keys, shown) in [
+            ("shinbun", "【しんぶん】"),
+            ("shinbunn", "【しんぶん】"),
+            ("shinbun'", "【しんぶん】"),
+            ("shinbun\u{8}", "【しんぶ】"),
+            ("shinbuna", "【しんぶな】"),
+            ("min", "みん"),
+            ("mina", "みな"),
+        ] {
+            assert_eq!(live_shown_and_committed(keys), (shown.to_string(), shown.to_string()), "{keys}");
+        }
+    }
+
+    /// 直近の変換だけを覚える engine。select は世代が直近の変換と合うときだけ成功し、学習した (読み, 表記) を残す。
+    #[derive(Clone, Default)]
+    struct StrictEngine {
+        last: Option<(u64, String, Vec<String>)>,
+        learned: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+        rejected: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl CandidateEngine for StrictEngine {
+        fn convert(&mut self, revision: u64, hiragana: &str) -> Vec<String> {
+            let texts = vec![format!("{hiragana}A"), format!("{hiragana}B")];
+            self.last = Some((revision, hiragana.to_string(), texts.clone()));
+            texts
+        }
+        fn select(&mut self, revision: u64, index: usize) -> bool {
+            match self.last.take() {
+                Some((r, reading, texts)) if r == revision && index < texts.len() => {
+                    self.learned.borrow_mut().push((reading, texts[index].clone()));
+                    true
+                }
+                _ => {
+                    self.rejected.set(self.rejected.get() + 1);
+                    false
+                }
+            }
+        }
+        fn cancel(&mut self) {
+            self.last = None;
+        }
+    }
+
+    /// keys を打って確定したときに engine が学習した (読み, 表記) と、選べなかった回数。
+    fn learned_after(mode: ConversionMode, keys: &str) -> (Vec<(String, String)>, usize, String) {
+        let engine = StrictEngine::default();
+        let (learned, rejected) = (engine.learned.clone(), engine.rejected.clone());
+        let mut session = Session::new(Composer::new(engine, FakeLexicon::default()), FakeMemory::default(), mode);
+        let mut committed = String::new();
+        for ch in keys.chars() {
+            committed.extend(inserted(&session.handle(&ALLOW, classify(ch), &ch.to_string())));
+        }
+        let learned = learned.borrow().clone();
+        (learned, rejected.get(), committed)
+    }
+
+    #[test]
+    fn n_のあとに確定した変換は表示した候補の順位を学習する() {
+        let want = |reading: &str, text: &str| (vec![(reading.to_string(), text.to_string())], 0, text.to_string());
+        // live は第 1 候補。Space は 1 回目で変換に入り 2 回目で次の候補へ進む。
+        assert_eq!(learned_after(ConversionMode::Live, "shinbun\r"), want("しんぶん", "しんぶんA"));
+        assert_eq!(learned_after(ConversionMode::Live, "shinbun\u{8}\r"), want("しんぶ", "しんぶA"));
+        assert_eq!(learned_after(ConversionMode::Live, "shinbuna\r"), want("しんぶな", "しんぶなA"));
+        assert_eq!(learned_after(ConversionMode::Space, "shinbun  \r"), want("しんぶん", "しんぶんB"));
+        assert_eq!(learned_after(ConversionMode::Space, "shinbun\u{8}  \r"), want("しんぶ", "しんぶB"));
+        assert_eq!(learned_after(ConversionMode::Space, "shinbuna  \r"), want("しんぶな", "しんぶなB"));
     }
 
     #[test]

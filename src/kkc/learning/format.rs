@@ -1,6 +1,5 @@
 //! `learning.tsv` の形式と、そのファイルの読み書き (一時ファイル → rename、壊れたファイルの退避)。
 
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,24 +17,9 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// (電源断でも、半端なファイルが本物に置き換わらない)。背景スレッドから呼ぶ。
 /// IME プロセスが同時に複数いると後から書いたものが勝つ (last-writer-wins) が、通常は 1 つなので許容する。
 pub fn write_file(path: &Path, entries: &Entries) {
-    let result = (|| -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            crate::private_fs::create_dir_all(dir)?;
-        }
-        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tsv.tmp-{}-{n}", std::process::id()));
-        let written = (|| -> std::io::Result<()> {
-            let mut file = crate::private_fs::create_file(&tmp)?;
-            file.write_all(serialize(entries).as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
-    })();
-    if let Err(e) = result {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tsv.tmp-{}-{n}", std::process::id()));
+    if let Err(e) = crate::private_fs::write_atomic(path, &tmp, serialize(entries).as_bytes()) {
         crate::platform::log(&format!("learning file not saved: {e}"));
     }
 }

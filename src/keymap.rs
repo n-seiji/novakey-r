@@ -118,44 +118,6 @@ pub fn action_for(phase: Phase, key: Key) -> Action {
     }
 }
 
-/// 物理キー 1 打鍵の解釈。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Stroke {
-    /// 動作表で引くキーと、その入力文字 (特殊キーは空)。
-    Keys(Vec<(Key, String)>),
-    /// ←→ や機能キー。未確定文があれば握りつぶし、無ければアプリへ素通しする。
-    Navigation,
-}
-
-/// keyCode と characters から打鍵を解釈する。特殊キーは keyCode で、それ以外は文字で分類する。
-pub fn stroke(key_code: u16, characters: &str, shift: bool) -> Stroke {
-    let special = match key_code {
-        36 | 76 => Some(Key::Enter),
-        53 => Some(Key::Escape),
-        51 => Some(Key::Backspace),
-        48 => Some(Key::Control),
-        49 if shift => Some(Key::ShiftSpace),
-        49 => Some(Key::Space),
-        125 => Some(Key::Down),
-        126 => Some(Key::Up),
-        123 | 124 => return Stroke::Navigation,
-        _ => None,
-    };
-    if let Some(key) = special {
-        return Stroke::Keys(vec![(key, String::new())]);
-    }
-    let is_function_key = |c: char| ('\u{F700}'..='\u{F8FF}').contains(&c);
-    if characters.is_empty() || characters.chars().any(is_function_key) {
-        return Stroke::Navigation;
-    }
-    Stroke::Keys(
-        characters
-            .chars()
-            .map(|ch| (classify(ch), ch.to_string()))
-            .collect(),
-    )
-}
-
 impl Key {
     /// トレース用の名前。入力文字 (Digit の数字など) を含めない。
     pub fn name(self) -> &'static str {
@@ -221,9 +183,9 @@ const TRANSLIT_FUNCTION_KEYS: &[(u16, Form)] = &[
 const TRANSLIT_CONTROL_KEYS: &[(&str, Form)] = &[
     ("j", Form::Hiragana),
     ("k", Form::Katakana),
-    (";", Form::HalfKatakana),
+    (";", Form::HalfAlnum(Case::Lower)),
     ("l", Form::FullAlnum(Case::Lower)),
-    (":", Form::HalfAlnum(Case::Lower)),
+    (":", Form::HalfKatakana),
     ("'", Form::HalfAlnum(Case::Lower)),
 ];
 
@@ -293,13 +255,6 @@ mod tests {
         assert_eq!(action_for(Phase::Reverted, ShiftSpace), Convert);
         assert_eq!(action_for(CONVERTING, ShiftSpace), PrevCandidate);
         assert_eq!(action_for(WINDOW, ShiftSpace), PrevCandidate);
-    }
-
-    #[test]
-    fn シフトはスペースだけを区別し_エンターとタブは変えない() {
-        assert_eq!(stroke(49, " ", true), Stroke::Keys(vec![(ShiftSpace, String::new())]));
-        assert_eq!(stroke(36, "\r", true), Stroke::Keys(vec![(Enter, String::new())]));
-        assert_eq!(stroke(48, "\u{19}", true), Stroke::Keys(vec![(Control, String::new())]));
     }
 
     #[test]
@@ -456,28 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn 特殊キーはkeycodeで_それ以外は文字で解釈する() {
-        assert_eq!(stroke(49, " ", false), Stroke::Keys(vec![(Space, String::new())]));
-        assert_eq!(stroke(36, "\r", false), Stroke::Keys(vec![(Enter, String::new())]));
-        assert_eq!(stroke(76, "\u{3}", false), Stroke::Keys(vec![(Enter, String::new())]));
-        assert_eq!(stroke(125, "\u{F701}", false), Stroke::Keys(vec![(Down, String::new())]));
-        assert_eq!(stroke(126, "\u{F700}", false), Stroke::Keys(vec![(Up, String::new())]));
-        assert_eq!(stroke(51, "\u{7f}", false), Stroke::Keys(vec![(Backspace, String::new())]));
-        assert_eq!(stroke(48, "\t", false), Stroke::Keys(vec![(Control, String::new())]));
-        assert_eq!(stroke(53, "\u{1b}", false), Stroke::Keys(vec![(Escape, String::new())]));
-        assert_eq!(stroke(0, "A", false), Stroke::Keys(vec![(Letter { upper: true }, "A".to_string())]));
-        assert_eq!(stroke(18, "1", false), Stroke::Keys(vec![(Digit(1), "1".to_string())]));
-    }
-
-    #[test]
-    fn 左右キーと機能キーと文字なしの打鍵は移動扱い() {
-        assert_eq!(stroke(123, "\u{F702}", false), Stroke::Navigation);
-        assert_eq!(stroke(124, "\u{F703}", false), Stroke::Navigation);
-        assert_eq!(stroke(117, "\u{F728}", false), Stroke::Navigation);
-        assert_eq!(stroke(104, "", false), Stroke::Navigation);
-    }
-
-    #[test]
     fn トレース用の名前は入力文字を含まない() {
         assert_eq!(Digit(7).name(), "Digit");
         assert_eq!(PickCandidate(7).name(), "PickCandidate");
@@ -522,9 +455,9 @@ mod tests {
             ("j", Form::Hiragana),
             ("k", Form::Katakana),
             ("K", Form::Katakana),
-            (";", Form::HalfKatakana),
+            (";", Form::HalfAlnum(lower)),
             ("l", Form::FullAlnum(lower)),
-            (":", Form::HalfAlnum(lower)),
+            (":", Form::HalfKatakana),
             ("'", Form::HalfAlnum(lower)),
         ] {
             assert_eq!(translit_form(40, true, chars), Some(want), "ctrl+{chars}");

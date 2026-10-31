@@ -3,7 +3,7 @@
 // english_split.rs - 英単語のあとに助詞などが続く打鍵列 (artifactni) を、英単語とかなに分ける。
 // かなの単位に頼らず打鍵列を切り直す (artifactwo の two は とぉ ではなく t + を)。
 
-use crate::romaji_converter::{Flush, RomajiConverter};
+use crate::romaji_converter::RomajiConverter;
 
 /// 英単語の直後に来てよいかなの始まり。include の de や partner の ne を切らないよう、よく使う助詞などに限る。
 const TAILS: &[&str] = &[
@@ -40,6 +40,13 @@ impl Split {
         self.tail.iter().map(|(_, kana)| kana.as_str()).collect()
     }
 
+    /// かなの部分の未確定のローマ字を、打鍵のままのかな (ASCII) として取り込んだ分割。表示のまま確定するときに使う。
+    pub fn pending_as_kana(mut self) -> Self {
+        let pending = std::mem::take(&mut self.pending);
+        self.tail.push((pending.clone(), pending));
+        self
+    }
+
     pub fn display(&self) -> String {
         std::iter::once(self.head.as_str())
             .chain(self.tail.iter().map(|(_, kana)| kana.as_str()))
@@ -62,11 +69,8 @@ fn convert(raw: &str, finished: bool) -> (Vec<(String, String)>, String) {
             units.push((std::mem::replace(&mut typed, rest), kana));
         }
     }
-    if finished {
-        match conv.flush() {
-            Flush::Empty => {}
-            Flush::Kana(kana) | Flush::Dangling(kana) => units.push((std::mem::take(&mut typed), kana)),
-        }
+    if let Some(kana) = finished.then(|| conv.flush()).flatten() {
+        units.push((std::mem::take(&mut typed), kana));
     }
     (units, conv.buffer().to_string())
 }

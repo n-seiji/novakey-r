@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! 入力内容が残るファイルを、本人だけが読める権限 (ファイル 0600 / ディレクトリ 0700) で作る。
 use std::fs::{DirBuilder, File, OpenOptions, Permissions};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -25,6 +26,24 @@ pub fn open_append(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// 一時ファイル `tmp` に書いて `sync_all` し、`path` へ rename する (電源断でも、半端なファイルが本物に置き換わらない)。
+/// 親ディレクトリは 0700 で作り、失敗したら `tmp` を消す。`tmp` は呼び出し側が一意にする。
+pub fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        create_dir_all(dir)?;
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut file = create_file(tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    written
+}
+
 /// `std::fs::copy` の代わり。コピー先は元の権限を引き継がず 0600 になる。
 pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut src = File::open(from)?;
@@ -36,7 +55,6 @@ pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -86,6 +104,23 @@ mod tests {
             open(&path).unwrap().write_all(b"y").unwrap();
             assert_eq!(mode(&path), 0o600, "{name}");
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_removes_the_tmp_on_failure() {
+        let root = scratch("atomic");
+        let (path, tmp) = (root.join("new/data.txt"), root.join("new/data.txt.tmp"));
+        write_atomic(&path, &tmp, b"one").unwrap();
+        write_atomic(&path, &tmp, b"two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(mode(&path), 0o600);
+        assert!(!tmp.exists());
+        // rename が失敗する (行き先がディレクトリ) ときも、一時ファイルは残さない
+        let dir_target = root.join("dir");
+        std::fs::create_dir(&dir_target).unwrap();
+        assert!(write_atomic(&dir_target, &tmp, b"x").is_err());
+        assert!(!tmp.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

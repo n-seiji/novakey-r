@@ -4,16 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-/// バッファを確定した結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Flush {
-    Empty,
-    /// すべてかなに変換できた。
-    Kana(String),
-    /// 変換できない子音が残った。かな + 残りの ASCII をそのまま持つ(英単語として扱う合図)。
-    Dangling(String),
-}
-
 /// 変換表の出力と、出力後にバッファへ持ち越す文字(`tt` → っ + `t`)。
 type Rule = (&'static str, &'static str);
 
@@ -86,8 +76,8 @@ impl RomajiConverter {
         (!out.is_empty()).then_some(out)
     }
 
-    /// 残りのバッファを確定する。変換しきれない子音の残り(`enter` の `r` など)があれば Dangling。
-    pub fn flush(&mut self) -> Flush {
+    /// 残りのバッファを確定する。かなと、変換しきれない子音の残り(`enter` の `r` など)をそのまま繋げて返す。何も無ければ None。
+    pub fn flush(&mut self) -> Option<String> {
         let table = &*TABLE;
         let mut rest = std::mem::take(&mut self.buffer);
         let mut kana = String::new();
@@ -95,14 +85,8 @@ impl RomajiConverter {
             kana.push_str(out);
             rest = pending.to_string();
         }
-        match (kana.is_empty(), rest.is_empty()) {
-            (true, true) => Flush::Empty,
-            (_, true) => Flush::Kana(kana),
-            _ => {
-                kana.push_str(&rest);
-                Flush::Dangling(kana)
-            }
-        }
+        kana.push_str(&rest);
+        (!kana.is_empty()).then_some(kana)
     }
 
     /// 記号 1 文字をローマ字の続きとして受け取れるか (`n'` → ん, `t'i` → てぃ)。
@@ -146,7 +130,7 @@ mod tests {
             }
         }
 
-        if let Flush::Kana(output) | Flush::Dangling(output) = converter.flush() {
+        if let Some(output) = converter.flush() {
             result.push_str(&output);
         }
 
@@ -162,7 +146,7 @@ mod tests {
     }
 
     /// 入力中に確定したかなと、最後の flush の結果。
-    fn run(input: &str) -> (String, Flush) {
+    fn run(input: &str) -> (String, Option<String>) {
         let mut converter = RomajiConverter::new();
         let done = input
             .chars()
@@ -255,15 +239,15 @@ mod tests {
         assert_eq!(pending_after("konn"), "");
         assert_eq!(pending_after("ka"), "");
         assert_eq!(pending_after("kk"), "k");
-        assert_eq!(run("kan"), ("か".to_string(), Flush::Kana("ん".to_string())));
+        assert_eq!(run("kan"), ("か".to_string(), Some("ん".to_string())));
     }
 
     #[test]
-    fn 変換できない子音はdanglingで返す() {
-        assert_eq!(run("enter"), ("えんて".to_string(), Flush::Dangling("r".to_string())));
-        assert_eq!(run("sh"), (String::new(), Flush::Dangling("sh".to_string())));
-        assert_eq!(run(""), (String::new(), Flush::Empty));
-        assert_eq!(run("ka"), ("か".to_string(), Flush::Empty));
+    fn 変換できない子音はかなに繋げて返す() {
+        assert_eq!(run("enter"), ("えんて".to_string(), Some("r".to_string())));
+        assert_eq!(run("sh"), (String::new(), Some("sh".to_string())));
+        assert_eq!(run(""), (String::new(), None));
+        assert_eq!(run("ka"), ("か".to_string(), None));
     }
 
     #[test]

@@ -18,67 +18,51 @@ use crate::composer::Phase;
 use crate::controller::{new_session, CandidatePanel, Controller, Environment, TextClient};
 use crate::input::{self, KeyInput, Modifiers};
 use crate::session::ConversionMode;
-use crate::translit::Form;
 
-/// 物理キー 1 打鍵。imk.rs の handleEvent が受け取るものと同じ粒度。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Event {
-    key_code: u16,
-    characters: String,
-    shift: bool,
-    control: bool,
-}
-
-impl Event {
-    fn new(key_code: u16, characters: &str) -> Self {
-        Self { key_code, characters: characters.to_string(), shift: false, control: false }
-    }
-
-    fn to_input(&self) -> KeyInput {
-        KeyInput {
-            key_code: self.key_code,
-            characters: self.characters.clone(),
-            // sim では characters と ignoring を区別しない (実機の characters は Ctrl で "\u{b}" になる)。
-            characters_ignoring_modifiers: self.characters.clone(),
-            mods: Modifiers { shift: self.shift, control: self.control, command_or_option: false },
-        }
+fn key_input(key_code: u16, characters: &str) -> KeyInput {
+    KeyInput {
+        key_code,
+        characters: characters.to_string(),
+        // sim では characters と ignoring を区別しない (実機の characters は Ctrl で "\u{b}" になる)。
+        characters_ignoring_modifiers: characters.to_string(),
+        mods: Modifiers::default(),
     }
 }
 
-fn token_event(name: &str) -> Result<Event, String> {
-    let ev = match name {
-        "space" => Event::new(49, " "),
-        "S-space" => Event { shift: true, ..Event::new(49, " ") },
-        "enter" => Event::new(36, "\r"),
-        "esc" => Event::new(53, "\u{1b}"),
-        "bs" => Event::new(51, "\u{7f}"),
-        "tab" => Event::new(48, "\t"),
-        "up" => Event::new(126, "\u{F700}"),
-        "down" => Event::new(125, "\u{F701}"),
-        "left" => Event::new(123, "\u{F702}"),
-        "right" => Event::new(124, "\u{F703}"),
-        "lt" => Event::new(0, "<"),
-        "gt" => Event::new(0, ">"),
-        "F6" => Event::new(97, "\u{F709}"),
-        "F7" => Event::new(98, "\u{F70A}"),
-        "F8" => Event::new(100, "\u{F70B}"),
-        "F9" => Event::new(101, "\u{F70C}"),
-        "F10" => Event::new(109, "\u{F70D}"),
+fn token_key(name: &str) -> Result<KeyInput, String> {
+    let key = match name {
+        "space" => key_input(49, " "),
+        "S-space" => KeyInput { mods: Modifiers { shift: true, ..Modifiers::default() }, ..key_input(49, " ") },
+        "enter" => key_input(36, "\r"),
+        "esc" => key_input(53, "\u{1b}"),
+        "bs" => key_input(51, "\u{7f}"),
+        "tab" => key_input(48, "\t"),
+        "up" => key_input(126, "\u{F700}"),
+        "down" => key_input(125, "\u{F701}"),
+        "left" => key_input(123, "\u{F702}"),
+        "right" => key_input(124, "\u{F703}"),
+        "lt" => key_input(0, "<"),
+        "gt" => key_input(0, ">"),
+        "F6" => key_input(97, "\u{F709}"),
+        "F7" => key_input(98, "\u{F70A}"),
+        "F8" => key_input(100, "\u{F70B}"),
+        "F9" => key_input(101, "\u{F70C}"),
+        "F10" => key_input(109, "\u{F70D}"),
         _ => {
             let ctrl = name
                 .strip_prefix("C-")
                 .filter(|rest| rest.chars().count() == 1)
                 .ok_or_else(|| format!("unknown key token <{name}>"))?;
-            Event { control: true, ..Event::new(0, ctrl) }
+            KeyInput { mods: Modifiers { control: true, ..Modifiers::default() }, ..key_input(0, ctrl) }
         }
     };
-    Ok(ev)
+    Ok(key)
 }
 
-/// シナリオ 1 手。物理キーか、IMK のコールバックの再現。
+/// シナリオ 1 手。物理キー (imk.rs の handleEvent が受け取るものと同じ粒度) か、IMK のコールバックの再現。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
-    Key(Event),
+    Key(KeyInput),
     Pick(usize),
     Highlight(usize),
     Live,
@@ -97,7 +81,7 @@ fn token_step(name: &str) -> Result<Step, String> {
             "live" => Step::Live,
             "space-mode" => Step::SpaceMode,
             "commit-all" => Step::CommitAll,
-            _ => Step::Key(token_event(name)?),
+            _ => Step::Key(token_key(name)?),
         },
     };
     Ok(step)
@@ -114,9 +98,9 @@ fn parse_keys(keys: &str) -> Result<Vec<(String, Step)>, String> {
             events.push((format!("<{name}>"), token_step(name)?));
             rest = &rest[name.len() + 2..];
         } else {
-            let mut ev = Event::new(0, &ch.to_string());
-            ev.shift = ch.is_ascii_uppercase();
-            events.push((ch.to_string(), Step::Key(ev)));
+            let mut key = key_input(0, &ch.to_string());
+            key.mods.shift = ch.is_ascii_uppercase();
+            events.push((ch.to_string(), Step::Key(key)));
             rest = &rest[ch.len_utf8()..];
         }
     }
@@ -271,11 +255,6 @@ struct Sim {
     controller: SimController,
     client: FakeClient,
     panel: FakePanel,
-    /// アプリの下線付き文字列が session の持つ表示と食い違った打鍵 (ラベル)。
-    stale: Vec<String>,
-    /// 表示 (preedit) と、Enter で確定される文字列 (commit_preview) が食い違った打鍵 (ラベル)。
-    /// 検査は opt-in。未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない。
-    wysiwyg_broken: Vec<String>,
 }
 
 impl Sim {
@@ -286,17 +265,15 @@ impl Sim {
             controller: Controller::new(0, session, panel.clone(), FakeEnv::default()),
             client: FakeClient::default(),
             panel,
-            stale: Vec::new(),
-            wysiwyg_broken: Vec::new(),
         }
     }
 
     /// IME が処理しなかったキーを、アプリがそのまま受け取った場合の結果。
-    fn pass_through(&mut self, ev: &Event) {
-        if ev.control {
+    fn pass_through(&mut self, key: &KeyInput) {
+        if key.mods.control {
             return; // Ctrl+文字はアプリ側でショートカットになり、文字は入らない
         }
-        for ch in ev.characters.chars() {
+        for ch in key.characters.chars() {
             match ch {
                 '\r' => self.client.push_committed('\n'),
                 '\u{7f}' | '\u{8}' => self.client.pop_committed(),
@@ -307,9 +284,9 @@ impl Sim {
     }
 
     /// imk.rs の handleEvent と同じ input::route と Controller でキーを処理する。
-    fn press(&mut self, ev: &Event) {
-        if !self.controller.on_key(input::route(&ev.to_input()), self.client.clone()) {
-            self.pass_through(ev);
+    fn press(&mut self, key: &KeyInput) {
+        if !self.controller.on_key(input::route(key), self.client.clone()) {
+            self.pass_through(key);
         }
     }
 
@@ -320,7 +297,7 @@ impl Sim {
 
     fn apply(&mut self, label: &str, step: &Step) -> Result<(), String> {
         match step {
-            Step::Key(ev) => self.press(ev),
+            Step::Key(key) => self.press(key),
             Step::Pick(n) => {
                 let text = self.candidate_at(label, *n)?;
                 self.controller.on_candidate_selected(&text);
@@ -360,13 +337,9 @@ impl Sim {
             .join(" ")
     }
 
-    fn describe_form(form: Form) -> String {
-        form.name().to_string()
-    }
-
     fn phase_name(&self) -> String {
         match self.controller.phase() {
-            Phase::Transliterated(form) => format!("Transliterated({})", Self::describe_form(form)),
+            Phase::Transliterated(form) => format!("Transliterated({})", form.name()),
             other => format!("{other:?}"),
         }
     }
@@ -460,16 +433,34 @@ struct Run {
     stale: Vec<String>,
     /// 表示と確定される文字列がずれた打鍵 (検査を有効にしたときだけ入る)。空であるべき。
     wysiwyg_broken: Vec<String>,
+    /// 各打鍵のあとの下線付き文字列 (ホストアプリが見ている方)。
+    marked_after: Vec<String>,
 }
 
 fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, String> {
-    // 行どうしが文脈を持ち越さないようにする。アプリは 1 つ (bundle id `sim`) に固定。
+    let steps = parse_keys(keys)?;
+    let mut run = play(&steps, verbose)?;
+    if check_preedit {
+        run.wysiwyg_broken = unmatched_enter(&steps, &run.marked_after);
+    }
+    Ok(run)
+}
+
+/// 行どうしが文脈を持ち越さないようにして、Sim を新しく作る。アプリは 1 つ (bundle id `sim`) に固定。
+fn fresh_sim() -> Sim {
     crate::context::with(|store| store.clear_all());
-    let mut sim = Sim::new();
+    let sim = Sim::new();
     sim.client.set_bundle("sim");
-    for (label, step) in parse_keys(keys)? {
+    sim
+}
+
+fn play(steps: &[(String, Step)], verbose: bool) -> Result<Run, String> {
+    let mut sim = fresh_sim();
+    let mut stale = Vec::new();
+    let mut marked_after = Vec::with_capacity(steps.len());
+    for (label, step) in steps {
         let started = std::time::Instant::now();
-        sim.apply(&label, &step)?;
+        sim.apply(label, step)?;
         let judge_ms = crate::judge::take_last_ms();
         if let Some(ms) = judge_ms {
             JUDGE_MS.with(|j| j.borrow_mut().push(ms));
@@ -478,11 +469,9 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
             TIMINGS.with(|t| t.borrow_mut().push((started.elapsed().as_secs_f64() * 1e3, judge_ms.is_some())));
         }
         if sim.client.marked() != sim.controller.marked_text() {
-            sim.stale.push(label.clone());
+            stale.push(label.clone());
         }
-        if check_preedit && sim.controller.commit_preview().is_some_and(|p| p != sim.controller.marked_text()) {
-            sim.wysiwyg_broken.push(label.clone());
-        }
+        marked_after.push(sim.client.marked());
         if verbose {
             let panel = if sim.panel.visible() { format!(" panel@{}", sim.panel.line() + 1) } else { String::new() };
             println!(
@@ -500,14 +489,40 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
             }
         }
     }
-    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale: sim.stale, wysiwyg_broken: sim.wysiwyg_broken })
+    Ok(Run { committed: sim.client.committed(), marked: sim.client.marked(), stale, wysiwyg_broken: Vec::new(), marked_after })
+}
+
+/// 「表示されている文字が Enter で確定する」の検査。実装 (preedit / commit_preview) を見ずに、
+/// 下線付き文字列が残った打鍵ごとに、同じ打鍵列を新しい Sim で打ち直して Enter を押し、確定された文字列と比べる。
+/// 学習が on のときは打ち直しの確定が記憶を変えるので、この検査は off のとき (`mise run wysiwyg`) 専用。
+fn unmatched_enter(steps: &[(String, Step)], marked_after: &[String]) -> Vec<String> {
+    let enter = key_input(36, "\r");
+    let mut broken = Vec::new();
+    for (i, marked) in marked_after.iter().enumerate() {
+        if marked.is_empty() {
+            continue;
+        }
+        let mut sim = fresh_sim();
+        let replayed = steps[..=i].iter().try_for_each(|(label, step)| sim.apply(label, step));
+        if replayed.is_err() {
+            continue;
+        }
+        let before = sim.client.committed();
+        sim.press(&enter);
+        let after = sim.client.committed();
+        let committed = after.strip_prefix(before.as_str()).unwrap_or(&after);
+        if committed != marked {
+            broken.push(steps[i].0.clone());
+        }
+    }
+    broken
 }
 
 /// `--simulate '<keys>'`
 pub fn simulate(keys: &str, check_preedit: bool) {
     setup_env();
     match run_keys(keys, true, check_preedit) {
-        Ok(Run { committed, marked, stale, wysiwyg_broken }) => {
+        Ok(Run { committed, marked, stale, wysiwyg_broken, .. }) => {
             println!("final: {committed:?}");
             if !marked.is_empty() {
                 println!("still composing: {marked:?}");
@@ -585,7 +600,8 @@ pub fn simulate_file(path: &str, check_preedit: bool) {
             }
         };
         let want = expected.filter(|_| verdict != "ok  ").map_or(String::new(), |w| format!("   want {w:?}"));
-        println!("{verdict} {keys}  =>  {shown}{want}");
+        let broken = result.as_ref().ok().filter(|run| !run.wysiwyg_broken.is_empty()).map_or(String::new(), |run| format!("   after {}", run.wysiwyg_broken.join(" ")));
+        println!("{verdict} {keys}  =>  {shown}{want}{broken}");
     }
     if std::env::var_os("SHIZUKU_SIM_TIMING").is_some() {
         print_timing_summary();
@@ -605,8 +621,8 @@ mod tests {
         let keys = parse_keys("a<S-space><C-k><lt>").unwrap();
         let labels: Vec<_> = keys.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, ["a", "<S-space>", "<C-k>", "<lt>"]);
-        assert!(matches!(&keys[1].1, Step::Key(ev) if ev.shift));
-        assert!(matches!(&keys[2].1, Step::Key(ev) if ev.control));
+        assert!(matches!(&keys[1].1, Step::Key(key) if key.mods.shift));
+        assert!(matches!(&keys[2].1, Step::Key(key) if key.mods.control));
     }
 
     #[test]
