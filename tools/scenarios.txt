@@ -549,6 +549,11 @@ kyou->asita<space><enter>	今日->明日
 <lt><right>-<enter>	<ー
 <lt><up>-<enter>	<ー
 <lt><esc>-<enter>	<ー
+# 漢数字の要素は算用数字の候補も出す (第八世代 → 第8世代。Space で並び、番号は審判なしの engine の順)
+daihachisedai<space><pick:6>	第8世代
+daijuusedai<space><pick:6>	第10世代
+hachisedai<space><pick:6>	8世代
+daikyuusedai<space><pick:6>	第9世代
 # 未確定のローマ字が n だけのとき、表示では ん として見せる (Space は読み、live は ん を含めた読みの変換)。確定は表示のまま。次の打鍵で差し替わる (mina は みな)。
 # 途中の下線付きの表示は --simulate に出る (unit test も見る)。`mise run wysiwyg` が表示と確定の一致を見る。
 min<enter>	みん
