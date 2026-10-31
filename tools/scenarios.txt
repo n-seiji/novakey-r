@@ -168,8 +168,8 @@ kyou<space><space><C-k><enter>	キョウ
 <F7>	
 <C-a>	
 kyou<C-a>
-kyou<C-;><enter>	ｷｮｳ
-kyou<C-:><enter>	kyou
+kyou<C-;><enter>	kyou
+kyou<C-:><enter>	ｷｮｳ
 kyonn<enter>	きょん
 kyon<enter>	きょん
 kyon<space><enter>	きょん
