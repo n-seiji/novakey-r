@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "shizuku"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "objc-sys",
  "objc2",
