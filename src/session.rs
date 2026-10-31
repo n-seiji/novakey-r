@@ -174,7 +174,13 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             fx.push(Effect::Insert(text.to_string()));
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
-        let action = if key == Key::Hyphen && self.composer.hyphen_continues_kana() { Action::TypeText } else { keymap::action_for(phase, key) };
+        // 数字を含む開発用語 (md5) は、数字で組成を区切らない (区切ると Enter が素通しの改行になる)。
+        let continues_word = matches!(key, Key::Digit(_)) && self.composer.digit_continues_dev_word(text);
+        let action = if (key == Key::Hyphen && self.composer.hyphen_continues_kana()) || continues_word {
+            Action::TypeText
+        } else {
+            keymap::action_for(phase, key)
+        };
         if action == Action::CommitThenRestart {
             self.commit_and_insert(gates, "", &mut fx);
             let restarted = self.handle(gates, key, text);
@@ -426,6 +432,22 @@ mod tests {
         }
         shown.pop();
         (shown, out)
+    }
+
+    #[test]
+    fn 数字を含む開発用語は数字で組成を区切らずenterで改行にならない() {
+        let lexicon = FakeLexicon::default().with_dev_word(|w| w == "md5").with_dev_word_prefix(|w| "md5".starts_with(w));
+        let memory = lexicon.memory();
+        let mut session = Session::new(Composer::new(NullEngine, lexicon), memory, ConversionMode::Space);
+        let mut out = String::new();
+        for ch in "md5\r".chars() {
+            for effect in session.handle(&ALLOW, classify(ch), &ch.to_string()).effects {
+                if let Effect::Insert(text) = effect {
+                    out.push_str(&text);
+                }
+            }
+        }
+        assert_eq!(out, "md5");
     }
 
     #[test]

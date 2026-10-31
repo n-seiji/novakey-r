@@ -26,6 +26,13 @@ shinbun<bs><space><space><space><enter>	しん部
 shinbu<space><enter>	しん部
 <live>shinbu<enter>	しん部
 <live>shinbun<bs><enter>	しん部
+# 数字を含む開発用語の確定も同じ経路 (英語として確定)。覚えた後も、手前の base6 や md は変わらない
+base64<enter>	base64
+base64<enter>	base64
+md5<enter>	md5
+md5<enter>	md5
+base6<enter>	ばせ6
+md<enter>	md
 # 派生した 起きなそう は先頭に出て、覚える。先頭を替えても候補の添字は学習データとずれず、選んだ 翁層 が次から先頭になる
 okinasou<space><enter>	起きなそう
 okinasou<space><pick:2>	翁層

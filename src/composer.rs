@@ -730,7 +730,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             return;
         }
         let raw = self.raw();
-        if raw.bytes().all(|b| b.is_ascii_lowercase()) && self.is_whole_word(&raw) {
+        if self.is_english_charset(&raw) && self.is_whole_word(&raw) {
             // 打鍵を消して全体が英単語になった (mades → made)。変換と判定は refresh が 1 度で行う。
             self.refresh();
             return;
@@ -859,6 +859,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 英語を打っていると見なせる局面。英字のまま表示し、Enter の確定もその英字にする (表示と確定は同じ判定を共有する)。
     /// かなの途中に変換できない子音が挟まった (merge の めrげ) か、かなにしきれない打鍵が残り、
     /// 打鍵列全体が英語として確定したことのある語・開発用語の一覧の語 (git) か 4 文字以上の英単語 (enter) になっている。
+    /// 一覧の語は数字を含んでよい (base64)。打鍵列全体がその語になったときだけで、手前 (base6) や一覧にない数字付き (kyou1) は対象外 (`is_english_charset`)。
     /// 先頭が `/` でも、残りがその語なら同じ (/posts)。表の短い語は日本語の打ちかけ (in, den) と紛れるので外す。
     /// 語でない打鍵列に子音が残っただけ (kyout) は英語とせず、かな表示のまま確定する (`kana_view`)。
     pub fn is_typing_english(&self) -> bool {
@@ -866,7 +867,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         let typed = raw.strip_prefix('/').unwrap_or(&raw);
         let word = || self.is_whole_word_pending();
         self.is_kana_editing()
-            && typed.bytes().all(|b| b.is_ascii_lowercase())
+            && self.is_english_charset(typed)
             && (self.has_ascii_kana() || word() || self.is_verdict(&raw, Verdict::Word) || self.is_verdict(&raw, Verdict::Judged))
     }
 
@@ -885,7 +886,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn judge_word(&mut self) {
         let raw = self.raw();
         let eligible = self.is_kana_editing()
-            && raw.bytes().all(|b| b.is_ascii_lowercase())
+            && self.is_english_charset(&raw)
             && self.is_whole_word(&raw)
             && self.engine.has_dictionary();
         if !eligible {
@@ -942,7 +943,23 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn is_whole_word_typed(&self) -> bool {
         let raw = self.raw();
         let typed = raw.strip_prefix('/').unwrap_or(&raw);
-        self.is_kana_editing() && typed.bytes().all(|b| b.is_ascii_lowercase()) && self.is_english_word_raw(typed)
+        self.is_kana_editing() && self.is_english_charset(typed) && self.is_english_word_raw(typed)
+    }
+
+    /// 英語を打っている途中 (Dangling) に数字を打つと、続けて開発用語の数字付きの語 (md5, utf8) か、その途中 (utf1) になるか。
+    /// なるなら数字で確定せず組成に足す。ならない数字 (git1) は今までどおり確定して数字を入れる。
+    pub fn digit_continues_dev_word(&self, digit: &str) -> bool {
+        self.phase() == Phase::Dangling && self.pin.is_none() && self.romaji.buffer().is_empty() && self.is_english_charset(&(self.raw() + digit))
+    }
+
+    /// 打鍵列が英語の候補になりうる文字だけか。小文字の英字だけ、または開発用語の一覧の数字を含む語 (base64) かその途中 (base6)。
+    /// 一覧の語に当たらない数字付きの打鍵列 (kyou1, git1) は今までどおり英語として扱わない。
+    fn is_english_charset(&self, typed: &str) -> bool {
+        let is_letter = |b: u8| b.is_ascii_lowercase();
+        typed.bytes().all(is_letter)
+            || (typed.bytes().next().is_some_and(is_letter)
+                && typed.bytes().all(|b| is_letter(b) || b.is_ascii_digit())
+                && self.lexicon.is_dev_word_prefix(typed))
     }
 
     /// 打鍵列全体が英語として確定したことのある語か、開発用語の一覧の語か、4 文字以上の英単語か。

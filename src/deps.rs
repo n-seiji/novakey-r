@@ -11,6 +11,8 @@ pub trait Lexicon {
     fn is_english_word(&self, typed: &str) -> bool;
     /// 打鍵列が開発用語の一覧の語か。表の語と違い、4 文字未満でも英語と見なしてよい語だけが載る。
     fn is_dev_word(&self, typed: &str) -> bool;
+    /// 打鍵列で始まる開発用語の一覧の語があるか (打鍵列そのものが語の場合も含む)。数字を含む語の途中 (base6) を見分ける。
+    fn is_dev_word_prefix(&self, typed: &str) -> bool;
     /// 打鍵列で始まる英単語があるか (打鍵列そのものが語の場合も含む)。
     fn is_english_prefix(&self, typed: &str) -> bool;
     /// 英語として確定したことのある語か (EnglishMemory が覚えたもの)。
@@ -35,6 +37,9 @@ impl Lexicon for ProdLexicon {
     }
     fn is_dev_word(&self, typed: &str) -> bool {
         crate::loanword::is_dev_word(typed)
+    }
+    fn is_dev_word_prefix(&self, typed: &str) -> bool {
+        crate::loanword::is_dev_word_prefix(typed)
     }
     fn is_english_prefix(&self, typed: &str) -> bool {
         crate::loanword::is_english_prefix(typed)
@@ -70,6 +75,7 @@ mod fakes {
         english: fn(&str) -> Vec<String>,
         english_word: fn(&str) -> bool,
         dev_word: fn(&str) -> bool,
+        dev_word_prefix: fn(&str) -> bool,
         english_prefix: fn(&str) -> bool,
         emoji: fn(&str) -> Vec<String>,
         learned: Rc<RefCell<Vec<String>>>,
@@ -81,6 +87,7 @@ mod fakes {
                 english: |_| Vec::new(),
                 english_word: |_| false,
                 dev_word: |_| false,
+                dev_word_prefix: |_| false,
                 english_prefix: |_| false,
                 emoji: |_| Vec::new(),
                 learned: Rc::default(),
@@ -99,6 +106,10 @@ mod fakes {
         }
         pub fn with_dev_word(mut self, f: fn(&str) -> bool) -> Self {
             self.dev_word = f;
+            self
+        }
+        pub fn with_dev_word_prefix(mut self, f: fn(&str) -> bool) -> Self {
+            self.dev_word_prefix = f;
             self
         }
         pub fn with_english_prefix(mut self, f: fn(&str) -> bool) -> Self {
@@ -124,6 +135,9 @@ mod fakes {
         }
         fn is_dev_word(&self, typed: &str) -> bool {
             (self.dev_word)(typed)
+        }
+        fn is_dev_word_prefix(&self, typed: &str) -> bool {
+            (self.dev_word_prefix)(typed)
         }
         fn is_english_prefix(&self, typed: &str) -> bool {
             (self.english_prefix)(typed)
