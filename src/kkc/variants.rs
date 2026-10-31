@@ -10,7 +10,7 @@ use super::dict::Entry;
 use super::elem::{Elem, CID_NUMBER, CID_PROPER_NOUN};
 
 /// 派生候補の元にする全文候補の数 (engine の順)
-pub const ORIGINS: usize = 2;
+pub const ORIGINS: usize = 4;
 /// 1 回の変換で足す派生候補の最大数
 pub const MAX_VARIANTS: usize = 3;
 /// 派生候補のスコアは元の候補から引く。審判が拮抗したときに元の候補を優先するための値。
@@ -136,6 +136,18 @@ fn counter_variants(e: &Elem) -> Vec<Elem> {
     out
 }
 
+/// 漢数字の要素 (第|八|世代 の 八、第十 の 第十) を算用数字に読み替えた要素 (N)。第のつく要素 (第十) は 1 つでも、
+/// 数詞だけの要素 (品詞 1295) は他の要素と一緒の候補のときだけ (八 → 8 を単独では出さない)。読みが表の数詞と合うものだけ。
+fn arabic_variant(e: &Elem, alone: bool) -> Option<Elem> {
+    let (prefix, ruby_prefix, word, ruby) = match (e.word.strip_prefix('第'), e.ruby.strip_prefix("ダイ")) {
+        (Some(w), Some(r)) => ("第", "ダイ", w, r),
+        _ if e.lcid == CID_NUMBER && !alone => ("", "", e.word.as_str(), e.ruby.as_str()),
+        _ => return None,
+    };
+    let &(_, digits, _) = NUMERALS.iter().find(|&&(kanji, digits, readings)| kanji == word && kanji != digits && readings.contains(&ruby))?;
+    Some(Elem::new(format!("{prefix}{digits}"), format!("{ruby_prefix}{ruby}"), e.lcid, e.rcid, e.mid, e.value()))
+}
+
 fn is_voiced(c: char) -> bool {
     "ガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ".contains(c)
 }
@@ -177,6 +189,10 @@ fn counter_replacements(data: &[Rc<Elem>]) -> Vec<Vec<Rc<Elem>>> {
     (0..data.len()).flat_map(|i| counter_variants(&data[i]).into_iter().map(move |e| (i, e))).map(|(i, e)| with_replaced(data, i, e)).collect()
 }
 
+fn arabic_replacements(data: &[Rc<Elem>]) -> Vec<Vec<Rc<Elem>>> {
+    (0..data.len()).filter_map(|i| arabic_variant(&data[i], data.len() < 2).map(|e| with_replaced(data, i, e))).collect()
+}
+
 fn rendaku_replacements(data: &[Rc<Elem>], lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<Vec<Rc<Elem>>> {
     (1..data.len())
         .flat_map(|i| rendaku_variants(&data[i - 1], &data[i], lookup).into_iter().map(move |e| (i, e)))
@@ -188,7 +204,7 @@ fn surface(data: &[Rc<Elem>]) -> String {
     data.iter().map(|e| e.word.as_str()).collect::<String>().replace('\u{1F}', "")
 }
 
-/// `origins` (元の全文候補の語列。engine の順) から派生候補を作る。元ごとに B+F、B、F の順で、
+/// `origins` (元の全文候補の語列。engine の順) から派生候補を作る。元ごとに B+F、B、F、N の順で、
 /// `exclude` (既にある候補の文字列) と重ならないものを `MAX_VARIANTS` まで。
 pub fn generate(origins: &[&[Rc<Elem>]], exclude: &HashSet<String>, lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<(usize, Variant)> {
     let mut seen = exclude.clone();
@@ -197,7 +213,7 @@ pub fn generate(origins: &[&[Rc<Elem>]], exclude: &HashSet<String>, lookup: &dyn
         let counters = counter_replacements(data);
         let both = counters.iter().flat_map(|d| rendaku_replacements(d, lookup));
         let rendaku = rendaku_replacements(data, lookup);
-        for d in both.chain(counters.iter().cloned()).chain(rendaku) {
+        for d in both.chain(counters.iter().cloned()).chain(rendaku).chain(arabic_replacements(data)) {
             let text = surface(&d);
             if out.len() < MAX_VARIANTS && seen.insert(text.clone()) {
                 out.push((k, Variant { text, data: d }));
@@ -229,6 +245,35 @@ mod tests {
         }
         let e = |word: &str, lcid, value| Entry { ruby: "ガシ".into(), word: word.into(), lcid, rcid: lcid, mid: 1, value };
         vec![e("貸し", 1285, -14.2), e("貸し", 735, -14.2), e("我師", 1300, -9.0), e("餓死", 1283, -11.6), e("賀詞", 1285, -15.8)]
+    }
+
+    #[test]
+    fn 単独の漢数字は算用数字にも読み替える() {
+        let dai = elem("第", "ダイ", 558);
+        let sedai = elem("世代", "セダイ", 1285);
+        let v = generate(&[&[dai.clone(), elem("八", "ハチ", CID_NUMBER), sedai.clone()]], &HashSet::new(), &no_dict);
+        assert_eq!(texts(&v), ["第8世代"]);
+        assert_eq!(v[0].1.data[1].ruby, "ハチ");
+        assert_eq!(v[0].1.data[1].lcid, CID_NUMBER);
+        assert_eq!(texts(&generate(&[&[dai, elem("十", "ジュウ", CID_NUMBER), sedai.clone()]], &HashSet::new(), &no_dict)), ["第10世代"]);
+        assert_eq!(texts(&generate(&[&[elem("八", "ハチ", CID_NUMBER), sedai]], &HashSet::new(), &no_dict)), ["8世代"]);
+    }
+
+    #[test]
+    fn 第のつく漢数字の要素も算用数字にする() {
+        let sedai = elem("世代", "セダイ", 1285);
+        let v = generate(&[&[elem("第十", "ダイジュウ", 1290), sedai]], &HashSet::new(), &no_dict);
+        assert_eq!(texts(&v), ["第10世代"]);
+        assert_eq!(v[0].1.data[0].ruby, "ダイジュウ");
+        assert_eq!(texts(&generate(&[&[elem("第九", "ダイキュウ", 1290)]], &HashSet::new(), &no_dict)), ["第9"]);
+        assert!(generate(&[&[elem("第一印象", "ダイイチインショウ", 1285)]], &HashSet::new(), &no_dict).is_empty());
+    }
+
+    #[test]
+    fn 数詞でない要素や1要素だけの候補は算用数字にしない() {
+        assert!(generate(&[&[elem("八", "ハチ", CID_NUMBER)]], &HashSet::new(), &no_dict).is_empty());
+        assert!(generate(&[&[elem("鉢", "ハチ", 1285), elem("世代", "セダイ", 1285)]], &HashSet::new(), &no_dict).is_empty());
+        assert!(generate(&[&[elem("八", "ヤ", CID_NUMBER), elem("世代", "セダイ", 1285)]], &HashSet::new(), &no_dict).is_empty());
     }
 
     #[test]

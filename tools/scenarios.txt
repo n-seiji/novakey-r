@@ -30,7 +30,7 @@ artifactwotsukau<space><enter>	artifactを使う
 <live>artifactwokousinnsite<enter>	artifactを更新して
 <live>mergewosite<enter>	mergeをして
 <live>artifactni<enter>	artifactに
-<live>artifactwok<enter>	artifactwok
+<live>artifactwok<enter>	artifactをk
 <live>artifactwokousinsite<bs><bs><enter>	artifactを更新
 include<enter>	include
 git<space>merge<enter>	git merge
@@ -234,7 +234,7 @@ nnya<enter>	んや
 n'a<enter>	んあ
 n'<enter>	ん
 nn<enter>	ん
-n<enter>	ん
+n<enter>	n
 nk<enter>	nk
 nka<enter>	んか
 kanji<space><enter>	感じ
@@ -376,7 +376,7 @@ kyou<space>k<enter>	強k
 kyou<space>k<S-space><enter>	強k
 kyou<space><up>k<esc><enter>	kyou\n
 kyou<space>k<esc><enter>	強\n
-kyou<space>n<enter>	強ん
+kyou<space>n<enter>	強n
 ky<bs><enter>	k
 ky<enter>	ky
 ky<S-space><enter>	ky
@@ -501,7 +501,7 @@ loginjinihiraku<space><enter>	login耳に開く
 <live>filetype<enter>	filetype
 <live>timei<enter>	地名
 leann<enter>	ぇあん
-evenness<enter>	evenness
+evenness<enter>	えゔぇんえっs
 # かなにしきれる英単語で、そのかなが辞書の見出しでないもの (issue → いっすえ) は、審判なしで英語として打つ (live でも Space でも)。
 # 見出しでもある語 (made, kitto) と、途中で英語の語に見える打鍵 (dosei の dose) の確定は変えない。
 <live>issue<enter>	issue
@@ -549,3 +549,59 @@ kyou->asita<space><enter>	今日->明日
 <lt><right>-<enter>	<ー
 <lt><up>-<enter>	<ー
 <lt><esc>-<enter>	<ー
+# 漢数字の要素は算用数字の候補も出す (第八世代 → 第8世代。Space で並び、番号は審判なしの engine の順)
+daihachisedai<space><pick:6>	第8世代
+daijuusedai<space><pick:6>	第10世代
+hachisedai<space><pick:6>	8世代
+daikyuusedai<space><pick:6>	第9世代
+# 未確定のローマ字が n だけのとき、表示では ん として見せる (Space は読み、live は ん を含めた読みの変換)。確定は表示のまま。次の打鍵で差し替わる (mina は みな)。
+# 途中の下線付きの表示は --simulate に出る (unit test も見る)。`mise run wysiwyg` が表示と確定の一致を見る。
+min<enter>	みん
+min<space><enter>	民
+min<bs><enter>	み
+mina<enter>	みな
+minn<enter>	みん
+min'<enter>	みん
+mink<enter>	mink
+man<enter>	まん
+<live>min<enter>	みん
+<live>mina<enter>	みな
+<live>kyon<enter>	きょん
+<live>rainen<enter>	来年
+<live>shinbun<enter>	新聞
+<live>shinbun<space><enter>	新聞
+<live>shinbun<bs><enter>	深部
+<live>shinbuna<enter>	深部な
+<live>shinbunn<enter>	新聞
+<live>shinbun'<enter>	新聞
+<live>shinbunk<enter>	新聞k
+# 固定中 (live の Backspace のあと) の n は、固定の後ろの残りの読みに ん を足して変換する。
+<live>kaisyanokenn<bs>n<enter>	会社のん
+<live>kaisyanokenn<bs>na<enter>	会社の名
+<live>kaisyanokenn<bs>n<bs><enter>	会社の
+# 英語として扱う間の n は今までどおり英字のまま。
+<live>open<enter>	open
+# 表示されている文字が Enter で確定する (`mise run wysiwyg` が打鍵ごとに確かめる)。語として知られている打鍵列 (git, test, /posts) は英字のまま表示して確定し、
+# そうでない打鍵列の末尾に残った子音 (kyout) は、表示されているかな + 子音のまま確定する。かなが 1 つも無い子音だけ (k, kk, zz) は打鍵のまま。
+git<enter>	git
+test<enter>	test
+/post<enter>	/post
+/posts<enter>	/posts
+kyout<enter>	きょうt
+kyouh<enter>	きょうh
+nek<enter>	ねk
+watashih<enter>	わたしh
+kyouto<enter>	きょうと
+gitai<enter>	ぎたい
+oka<enter>	おか
+ok<enter>	おk
+kka<enter>	っか
+/kyou<enter>	・きょう
+api<enter>	api
+apia<enter>	あぴあ
+api-ru<space><enter>	アピール
+apiiru<enter>	あぴいる
+apito<enter>	あぴと
+kyouhaapi<enter>	きょうはあぴ
+node<enter>	ので
+nodeha<enter>	のでは

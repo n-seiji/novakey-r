@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Cocoa を知らないキー入力の表現と、その振り分け。imk.rs (実機) と simulate.rs (headless) が共有する。
-use crate::keymap::{self, Key, Stroke};
+use crate::keymap::{self, Key};
 use crate::translit::Form;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,10 +60,36 @@ pub fn route(input: &KeyInput) -> Route {
     if let Some(form) = translit {
         return Route::Translit(form);
     }
-    match keymap::stroke(input.key_code, &input.characters, input.mods.shift) {
-        Stroke::Keys(keys) => Route::Keys(keys),
-        Stroke::Navigation => Route::Navigation,
+    stroke(input.key_code, &input.characters, input.mods.shift)
+}
+
+/// keyCode と characters から打鍵を解釈する。特殊キーは keyCode で、それ以外は文字で分類する。
+fn stroke(key_code: u16, characters: &str, shift: bool) -> Route {
+    let special = match key_code {
+        36 | 76 => Some(Key::Enter),
+        53 => Some(Key::Escape),
+        51 => Some(Key::Backspace),
+        48 => Some(Key::Control),
+        49 if shift => Some(Key::ShiftSpace),
+        49 => Some(Key::Space),
+        125 => Some(Key::Down),
+        126 => Some(Key::Up),
+        123 | 124 => return Route::Navigation,
+        _ => None,
+    };
+    if let Some(key) = special {
+        return Route::Keys(vec![(key, String::new())]);
     }
+    let is_function_key = |c: char| ('\u{F700}'..='\u{F8FF}').contains(&c);
+    if characters.is_empty() || characters.chars().any(is_function_key) {
+        return Route::Navigation;
+    }
+    Route::Keys(
+        characters
+            .chars()
+            .map(|ch| (keymap::classify(ch), ch.to_string()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -185,5 +211,34 @@ mod tests {
     fn debug_output_does_not_contain_typed_text() {
         let dbg = format!("{:?}", route(&input(0, "xyz", NONE)));
         assert!(!dbg.contains('x') && !dbg.contains('z'), "{dbg}");
+    }
+
+    #[test]
+    fn シフトはスペースだけを区別し_エンターとタブは変えない() {
+        assert_eq!(stroke(49, " ", true), Route::Keys(vec![(Key::ShiftSpace, String::new())]));
+        assert_eq!(stroke(36, "\r", true), Route::Keys(vec![(Key::Enter, String::new())]));
+        assert_eq!(stroke(48, "\u{19}", true), Route::Keys(vec![(Key::Control, String::new())]));
+    }
+
+    #[test]
+    fn 特殊キーはkeycodeで_それ以外は文字で解釈する() {
+        assert_eq!(stroke(49, " ", false), Route::Keys(vec![(Key::Space, String::new())]));
+        assert_eq!(stroke(36, "\r", false), Route::Keys(vec![(Key::Enter, String::new())]));
+        assert_eq!(stroke(76, "\u{3}", false), Route::Keys(vec![(Key::Enter, String::new())]));
+        assert_eq!(stroke(125, "\u{F701}", false), Route::Keys(vec![(Key::Down, String::new())]));
+        assert_eq!(stroke(126, "\u{F700}", false), Route::Keys(vec![(Key::Up, String::new())]));
+        assert_eq!(stroke(51, "\u{7f}", false), Route::Keys(vec![(Key::Backspace, String::new())]));
+        assert_eq!(stroke(48, "\t", false), Route::Keys(vec![(Key::Control, String::new())]));
+        assert_eq!(stroke(53, "\u{1b}", false), Route::Keys(vec![(Key::Escape, String::new())]));
+        assert_eq!(stroke(0, "A", false), Route::Keys(vec![(Key::Letter { upper: true }, "A".to_string())]));
+        assert_eq!(stroke(18, "1", false), Route::Keys(vec![(Key::Digit(1), "1".to_string())]));
+    }
+
+    #[test]
+    fn 左右キーと機能キーと文字なしの打鍵は移動扱い() {
+        assert_eq!(stroke(123, "\u{F702}", false), Route::Navigation);
+        assert_eq!(stroke(124, "\u{F703}", false), Route::Navigation);
+        assert_eq!(stroke(117, "\u{F728}", false), Route::Navigation);
+        assert_eq!(stroke(104, "", false), Route::Navigation);
     }
 }

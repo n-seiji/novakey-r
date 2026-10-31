@@ -7,15 +7,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::dict::{to_katakana, Dictionary};
+use super::dict::{Dictionary, CC_MISSING};
 use super::learning::Learning;
 use super::elem::{include_mm_value_calculation, is_clause, Elem, MID_BOS_EOS};
 use super::wise::wise_dicdata;
 
 /// 辞書のエントリの最大長さ (`DicdataStore.maxlength`)
 pub const MAX_LENGTH: usize = 20;
-/// 連接コストの行が無いときの値
-const CC_MISSING: f32 = -25.0;
 
 /// 1 回の辞書引きの結果の 1 件。`ruby_chars` は ruby のスカラー数 (= ノードの長さ)。
 #[derive(Debug, Clone)]
@@ -158,14 +156,8 @@ pub struct Lattice {
 }
 
 impl Lattice {
-    /// `chars` はカタカナ化済みの読み。
-    #[cfg(test)]
-    pub fn build(dict: &Dictionary, cache: &mut LookupCache, chars: &[char]) -> Self {
-        Self::build_with_memory(dict, cache, None, chars)
-    }
-
-    /// `memory` の学習エントリも辞書の語と同じようにノードにする (辞書の語のあとに並べる)。
-    pub fn build_with_memory(dict: &Dictionary, cache: &mut LookupCache, memory: Option<&Learning>, chars: &[char]) -> Self {
+    /// `memory` の学習エントリも辞書の語と同じようにノードにする (辞書の語のあとに並べる)。`chars` はカタカナ化済みの読み。
+    pub fn build(dict: &Dictionary, cache: &mut LookupCache, memory: &Learning, chars: &[char]) -> Self {
         let n = chars.len();
         let mut nodes = vec![Node::new(Rc::new(Elem::bos()), 0, false)];
         let mut ranges = Vec::with_capacity(n);
@@ -182,15 +174,13 @@ impl Lattice {
                 }
                 nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
             }
-            if let Some(memory) = memory {
-                learned.clear();
-                memory.lookup(&substring, &mut learned);
-                for f in &learned {
-                    if start + f.ruby_chars > n {
-                        continue;
-                    }
-                    nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
+            learned.clear();
+            memory.lookup(&substring, &mut learned);
+            for f in &learned {
+                if start + f.ruby_chars > n {
+                    continue;
                 }
+                nodes.push(Node::new(f.elem.clone(), start + f.ruby_chars, false));
             }
             // 機械的に作るエントリ
             let mut segment = String::new();
@@ -362,13 +352,9 @@ impl Lattice {
     }
 }
 
-/// 読み (ひらがな可) をカタカナ化した文字列の `Vec<char>`
-pub fn katakana_chars(reading: &str) -> Vec<char> {
-    to_katakana(reading).chars().collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::dict::to_katakana;
     use super::*;
 
     fn elem(word: &str, ruby: &str, lcid: usize, rcid: usize, mid: usize, v: f32) -> Rc<Elem> {
@@ -397,50 +383,26 @@ mod tests {
         (e.word.clone(), e.ruby.clone(), e.lcid, e.rcid, e.mid, e.base.to_bits())
     }
 
-    /// origin/main の LookupCache (読みの substring をキーにする) をそのまま残した参照実装。
-    struct OldLookupCache {
-        map: HashMap<String, Rc<Vec<Found>>>,
-        limit: usize,
-    }
-
-    impl OldLookupCache {
-        fn lookup(&mut self, dict: &Dictionary, substring: &str) -> Rc<Vec<Found>> {
-            if let Some(v) = self.map.get(substring) {
-                return v.clone();
-            }
-            let entries = dict.prefix_entries(substring).unwrap_or_default();
-            let found: Vec<Found> = entries
-                .into_iter()
-                .map(|e| {
-                    let ruby_chars = e.ruby.chars().count();
-                    Found { elem: Rc::new(Elem::new(e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value)), ruby_chars }
-                })
-                .collect();
-            if self.map.len() >= self.limit {
-                self.map.clear();
-            }
-            let rc = Rc::new(found);
-            self.map.insert(substring.to_string(), rc.clone());
-            rc
-        }
-    }
-
-    fn check_against_old(limit: usize, rounds: usize) -> usize {
+    fn check_against_uncached(limit: usize, rounds: usize) -> usize {
         let dict = Dictionary::open_default().unwrap();
         let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/kkc_corpus.txt")).unwrap();
         let readings: Vec<&str> = corpus.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("typed-seq")).collect();
         assert!(readings.len() >= 100, "corpus too small");
-        let mut old = OldLookupCache { map: HashMap::new(), limit };
-        let mut new = LookupCache::with_limit(limit);
+        let mut cache = LookupCache::with_limit(limit);
         let mut checked = 0;
         for _ in 0..rounds {
             for r in readings.iter().step_by(readings.len() / 80 + 1) {
                 let chars: Vec<char> = to_katakana(r).chars().collect();
                 for start in 0..chars.len() {
                     let sub: String = chars[start..(start + MAX_LENGTH).min(chars.len())].iter().collect();
-                    let o: Vec<_> = old.lookup(&dict, &sub).iter().map(|f| key(&f.elem)).collect();
-                    let n: Vec<_> = new.lookup(&dict, &sub).iter().flat_map(|g| g.iter()).map(|f| key(&f.elem)).collect();
-                    assert_eq!(o, n, "窓 {start} の辞書引きが旧経路と違う (limit {limit})");
+                    let want: Vec<_> = dict
+                        .prefix_entries(&sub)
+                        .unwrap()
+                        .into_iter()
+                        .map(|e| (e.word, e.ruby, e.lcid as usize, e.rcid as usize, e.mid as usize, e.value.to_bits()))
+                        .collect();
+                    let got: Vec<_> = cache.lookup(&dict, &sub).iter().flat_map(|g| g.iter()).map(|f| key(&f.elem)).collect();
+                    assert_eq!(want, got, "窓 {start} の辞書引きが直接引いた結果と違う (limit {limit})");
                     checked += 1;
                 }
             }
@@ -449,13 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn node_cache_lookup_matches_old_substring_cache() {
-        assert!(check_against_old(CACHE_LIMIT, 2) > 500);
+    fn node_cache_lookup_matches_uncached_lookup() {
+        assert!(check_against_uncached(CACHE_LIMIT, 2) > 500);
     }
 
     #[test]
-    fn node_cache_lookup_matches_old_cache_when_cleared_often() {
-        assert!(check_against_old(7, 2) > 500);
+    fn node_cache_lookup_matches_uncached_lookup_when_cleared_often() {
+        assert!(check_against_uncached(7, 2) > 500);
     }
 
     fn totals(l: &Lattice, idx: usize) -> Vec<f32> {

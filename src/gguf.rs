@@ -55,7 +55,7 @@ impl Dtype {
         match self {
             Self::F32 => n.checked_mul(4).ok_or("gguf tensor too large"),
             Self::Q8_0 => {
-                if ne0 % Q8_0_BLOCK_ELEMS != 0 {
+                if !ne0.is_multiple_of(Q8_0_BLOCK_ELEMS) {
                     return Err("gguf q8_0 row not a multiple of 32");
                 }
                 (n / Q8_0_BLOCK_ELEMS).checked_mul(Q8_0_BLOCK_BYTES).ok_or("gguf tensor too large")
@@ -151,15 +151,13 @@ impl<S: Read> Header<S> {
         Ok(v)
     }
 
-    fn skip_string(&mut self) -> R<()> {
-        let n = self.len()?;
-        self.skip(n)
-    }
-
     /// 型 `t` の値を 1 つ読み飛ばす。
     fn skip_value(&mut self, t: u32, depth: u32) -> R<()> {
         match t {
-            8 => self.skip_string(),
+            8 => {
+                let n = self.len()?;
+                self.skip(n)
+            }
             9 => {
                 if depth >= MAX_NESTING {
                     return Err("gguf metadata nested too deep");
@@ -186,8 +184,8 @@ fn fixed_size(t: u32) -> Option<usize> {
     match t {
         0 | 1 | 7 => Some(1),   // u8, i8, bool
         2 | 3 => Some(2),       // u16, i16
-        4 | 5 | 6 => Some(4),   // u32, i32, f32
-        10 | 11 | 12 => Some(8), // u64, i64, f64
+        4..=6 => Some(4),   // u32, i32, f32
+        10..=12 => Some(8), // u64, i64, f64
         _ => None,
     }
 }

@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::dict::{escaped_identifier, to_katakana, DictError, Dictionary, Entry};
+use super::wise::to_hiragana;
 
 /// golden から候補を TSV にする Python ヘルパー (列は `tools/kkc_golden_candidates.py` の docstring を参照)。
 pub fn golden_candidates_tsv() -> Result<String, String> {
@@ -54,13 +55,7 @@ fn is_synthetic_variant(ruby: &str, word: &str, lcid: u16, rcid: u16, mid: u16) 
     if (lcid, rcid, mid) != (1288, 1288, 501) {
         return false;
     }
-    let hira: String = ruby
-        .chars()
-        .map(|c| match c as u32 {
-            0x30A1..=0x30F6 => char::from_u32(c as u32 - 0x60).unwrap_or(c),
-            _ => c,
-        })
-        .collect();
+    let hira = to_hiragana(ruby);
     let mut cap = ruby.to_lowercase();
     if let Some(first) = cap.get(..1) {
         cap = first.to_uppercase() + &cap[1..];
