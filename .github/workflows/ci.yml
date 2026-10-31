@@ -36,6 +36,7 @@ jobs:
       - run: cargo test --release
       - run: mise run scenarios
       - run: mise run scenarios-learning
+      - run: mise run dev-words
       - run: mise run wysiwyg
       - run: mise run main-queue
       - run: mise run characterization

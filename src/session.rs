@@ -174,7 +174,7 @@ impl<E: CandidateEngine, L: Lexicon, M: EnglishMemory> Session<E, L, M> {
             fx.push(Effect::Insert(text.to_string()));
             return Outcome { handled: true, action: Some(Action::InsertDirect), phase, effects: fx };
         }
-        let action = keymap::action_for(phase, key);
+        let action = if key == Key::Hyphen && self.composer.hyphen_continues_kana() { Action::TypeText } else { keymap::action_for(phase, key) };
         if action == Action::CommitThenRestart {
             self.commit_and_insert(gates, "", &mut fx);
             let restarted = self.handle(gates, key, text);

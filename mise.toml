@@ -31,6 +31,10 @@ env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "現挙動の固定 (tools/characterization.txt)。リアーキ中に出力が変わったら失敗"
 run = "cargo run --release -- --simulate-file tools/characterization.txt"
 
+[tasks.dev-words]
+description = "resources/dev_words.txt の全語を 1 語ずつ打って Enter し、その語のまま確定されるか確かめる (審判なし。例外は scripts/check-dev-words.sh)"
+run = "scripts/check-dev-words.sh"
+
 [tasks.wysiwyg]
 env = { SHIZUKU_DICTIONARY = "{{config_root}}/dictionary" }
 description = "各キーのあと、下線付きの表示と Enter で確定される文字列が一致するかを scenarios / characterization の全行で確かめる (同じ打鍵列を新しい Sim で打ち直して Enter を押し、確定された文字列を比べる。未確定ローマ字が残るときも見る)"

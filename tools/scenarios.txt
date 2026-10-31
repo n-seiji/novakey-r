@@ -592,3 +592,11 @@ oka<enter>	おか
 ok<enter>	おk
 kka<enter>	っか
 /kyou<enter>	・きょう
+api<enter>	api
+apia<enter>	あぴあ
+api-ru<space><enter>	アピール
+apiiru<enter>	あぴいる
+apito<enter>	あぴと
+kyouhaapi<enter>	きょうはあぴ
+node<enter>	ので
+nodeha<enter>	のでは

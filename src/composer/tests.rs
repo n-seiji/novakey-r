@@ -14,6 +14,8 @@ struct Log {
     prefers: Rc<RefCell<bool>>,
     /// `rejects_english` の答え。
     rejects: Rc<RefCell<bool>>,
+    /// この読みで始まる辞書の見出しがあるものとして答える読み。
+    prefixes: Rc<RefCell<Vec<String>>>,
     /// true なら辞書を開けていない engine として答える。
     no_dictionary: Rc<RefCell<bool>>,
     /// `prefers_text` に渡された (text, over)。
@@ -51,6 +53,9 @@ impl CandidateEngine for MockEngine {
     }
     fn rejects_english(&mut self, _raw: &str, _reading: &str) -> bool {
         *self.log.rejects.borrow()
+    }
+    fn has_reading_prefix(&self, hiragana: &str) -> bool {
+        self.log.prefixes.borrow().iter().any(|p| p.starts_with(hiragana))
     }
     fn has_dictionary(&self) -> bool {
         !*self.log.no_dictionary.borrow()
@@ -2192,4 +2197,42 @@ fn enterで英語として扱い直す組成の_n_は_ん_にせず打鍵のま�
     c.flush_romaji();
     assert_eq!(c.phase(), Phase::Dangling);
     assert_eq!(c.commit_preview(), ".ymn");
+}
+
+/// 審判が英語を却下する engine (headwords の読みは辞書の見出し)。一覧の語は api、表の語は made。
+fn vetoing_composer(headwords: &[&str]) -> Composer<MockEngine, FakeLexicon> {
+    let log = Log::default();
+    *log.headwords.borrow_mut() = headwords.iter().map(ToString::to_string).collect();
+    *log.rejects.borrow_mut() = true;
+    *log.prefixes.borrow_mut() = vec!["あぴーる".to_string()];
+    let lexicon = FakeLexicon::default().with_dev_word(|w| w == "api").with_english_word(|w| w == "made");
+    Composer::new(MockEngine { log, table: vec![] }, lexicon)
+}
+
+#[test]
+fn 一覧の語は審判が英語を却下しても英語のまま() {
+    let mut c = vetoing_composer(&["あぴ", "まで"]);
+    type_keys(&mut c, "api");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "api");
+    assert_eq!(c.commit_preview(), "api");
+}
+
+#[test]
+fn 表の語は審判が英語を却下すれば読みのまま() {
+    let mut c = vetoing_composer(&["あぴ", "まで"]);
+    type_keys(&mut c, "made");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "まで");
+}
+
+#[test]
+fn 英単語の直後のハイフンは読みに長音を足した見出しがあるときだけ長音にする() {
+    let mut c = vetoing_composer(&["あぴ"]);
+    type_keys(&mut c, "api");
+    assert!(c.hyphen_continues_kana());
+    // 見出しの無い語 (made → まで に ー を足した見出しは無い) は英語のまま確定する。
+    let mut c = vetoing_composer(&["まで"]);
+    type_keys(&mut c, "made");
+    assert!(!c.hyphen_continues_kana());
 }

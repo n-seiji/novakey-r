@@ -75,6 +75,10 @@ pub trait CandidateEngine {
     fn prefers_text(&mut self, _text: &str, _over: &str) -> bool {
         false
     }
+    /// ひらがなの読みで始まる辞書の見出しがあるか (あぴー → アピール)。英単語の直後の `-` が長音として続くかの確認に使う。
+    fn has_reading_prefix(&self, _hiragana: &str) -> bool {
+        false
+    }
     /// 英字 `raw` より読み `reading` (engine の第 1 候補) の方が、はっきり文として自然か。審判が使えない engine は false。
     fn rejects_english(&mut self, _raw: &str, _reading: &str) -> bool {
         false
@@ -384,6 +388,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// 下線付きで見せる文字列。表示の決定はここだけ。
     pub fn preedit(&self) -> String {
+        if self.is_whole_word_pending() {
+            return self.raw();
+        }
         if let Some(split) = self.shown_split() {
             // 未確定の n だけは、Enter の flush で ん になって分割の読みに入る (commit_preview と同じ分割)。
             let split = if split.pending == PENDING_N { self.english_split(true).unwrap_or(split) } else { split };
@@ -694,6 +701,10 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     /// ローマ字を確定し終えた組成が、英語として扱い直されるか。
     fn settle(&self, english: bool) -> Settle {
+        // 打鍵列全体が英単語なら、語の途中で切れる分割 (refactor の refac + と + r) より語そのものを優先する。
+        if english && self.is_whole_word_typed() {
+            return Settle::Dangling;
+        }
         // 見えている分割に未確定のローマ字が付いている間 (artifactwok の artifactをk) は、その表示のまま確定する。
         // n だけは対象外: 確定で ん になり、分割の読みに入る (kousin の n)。
         if let Some(split) = self.english_split(false).filter(|s| !s.pending.is_empty() && s.pending != PENDING_N) {
@@ -853,7 +864,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     pub fn is_typing_english(&self) -> bool {
         let raw = self.raw();
         let typed = raw.strip_prefix('/').unwrap_or(&raw);
-        let word = || !self.romaji.buffer().is_empty() && self.is_english_word_raw(typed);
+        let word = || self.is_whole_word_pending();
         self.is_kana_editing()
             && typed.bytes().all(|b| b.is_ascii_lowercase())
             && (self.has_ascii_kana() || word() || self.is_verdict(&raw, Verdict::Word) || self.is_verdict(&raw, Verdict::Judged))
@@ -869,6 +880,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     /// 見出しでもある語 (made, home) は、審判が英語を選んだときだけ英語。比べる相手は engine の第 1 候補。
     /// ただし、候補一覧から選んで英語として確定したことのある語 (done → どね) は見出しでも前者と同じ扱い: 審判が読みをはっきり選ばない限り英語。
     /// 審判がまだ読み込めていない間は却下しないので、そのときは必ず英語になる。
+    /// 開発用語の一覧 (dev_words.txt) の語は、見出しかどうかにも審判の却下にもよらず必ず英語 (api → あぴ にしない)。審判は小さいモデルで、api や repo のような語を読みの方に寄せてしまうため。一覧の語は、読みが日本語の語になる語を入れない約束で選んでいる。覚えた語と表の語 (loanwords.tsv) は、上の判定のまま。
     /// 固定中は表示と比べ、英語になるときだけ固定が外れる (`enter_english`)。raw が変わりうる所 (refresh / track_english / unpin) で呼ぶ。
     fn judge_word(&mut self) {
         let raw = self.raw();
@@ -886,7 +898,9 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             Some(pin) => Some(pin.surface() + converted.as_deref().unwrap_or_else(|| self.rest())),
             None => converted,
         };
-        let verdict = if self.engine.has_reading(&self.hiragana) && !self.lexicon.knows_english(&raw) {
+        let verdict = if self.lexicon.is_dev_word(&raw) {
+            Verdict::Word
+        } else if self.engine.has_reading(&self.hiragana) && !self.lexicon.knows_english(&raw) {
             match first {
                 Some(over) if self.engine.prefers_text(&raw, &over) => Verdict::Judged,
                 _ => Verdict::Kana,
@@ -900,9 +914,35 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.word_verdict = Some((raw, verdict));
     }
 
+    /// Dangling の英単語の直後の `-` を、英単語の区切りではなく長音として読みに続けるか。
+    /// 英語と判定された語のかな読み + ー で始まる見出しがあるときだけ (api-ru → アピール)。なければ英語のまま確定して `-` を入れる (repo-name, test-case)。
+    /// 組成の途中の日本語に続く英単語 (kyouhaapi-) は対象外 (全体が 1 つの英単語のときだけ)。
+    pub fn hyphen_continues_kana(&self) -> bool {
+        let raw = self.raw();
+        self.phase() == Phase::Dangling
+            && self.pin.is_none()
+            && self.is_verdict(&raw, Verdict::Word)
+            && self.romaji.buffer().is_empty()
+            && !self.hiragana.is_empty()
+            && !self.has_ascii_kana()
+            && self.engine.has_reading_prefix(&format!("{}ー", self.hiragana))
+    }
+
     /// 組成全体 (raw) の判定が `verdict` か。
     fn is_verdict(&self, raw: &str, verdict: Verdict) -> bool {
         matches!(&self.word_verdict, Some((r, v)) if r == raw && *v == verdict)
+    }
+
+    /// かなにしきれない打鍵が残っていて、打鍵列全体 (先頭の `/` は除く) が英単語か。表示も Enter も、英語分割より先にこれで語そのものにする。
+    fn is_whole_word_pending(&self) -> bool {
+        !self.romaji.buffer().is_empty() && self.is_whole_word_typed()
+    }
+
+    /// 打鍵列全体 (先頭の `/` は除く) が英単語か。ローマ字が確定済みでもよい。
+    fn is_whole_word_typed(&self) -> bool {
+        let raw = self.raw();
+        let typed = raw.strip_prefix('/').unwrap_or(&raw);
+        self.is_kana_editing() && typed.bytes().all(|b| b.is_ascii_lowercase()) && self.is_english_word_raw(typed)
     }
 
     /// 打鍵列全体が英語として確定したことのある語か、開発用語の一覧の語か、4 文字以上の英単語か。

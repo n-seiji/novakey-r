@@ -69,6 +69,11 @@ impl KkcCore {
         !self.headwords(&dict::to_katakana(hiragana)).is_empty()
     }
 
+    /// その読みで始まる辞書の見出しがあるか (あぴー → アピール)。読みそのものが見出しでなくてもよい。学習・動的な語は見ない。辞書が読めなければ false。
+    pub fn has_reading_prefix(&self, hiragana: &str) -> bool {
+        self.dict.has_reading_prefix(&dict::to_katakana(hiragana)).unwrap_or(false)
+    }
+
     /// カタカナの読み `katakana` で、表記が漢字 `kanji` 1 字の見出しが辞書にあるか。live 変換の Backspace が読みを切り分けるのに使う。
     pub fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
         let mut buf = [0u8; 4];
@@ -323,6 +328,10 @@ impl CandidateEngine for RustEngine {
 
     fn has_reading(&self, hiragana: &str) -> bool {
         self.core.as_ref().is_some_and(|core| core.has_reading(hiragana))
+    }
+
+    fn has_reading_prefix(&self, hiragana: &str) -> bool {
+        self.core.as_ref().is_some_and(|core| core.has_reading_prefix(hiragana))
     }
 
     fn has_dictionary(&self) -> bool {
