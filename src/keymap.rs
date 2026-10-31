@@ -221,9 +221,9 @@ const TRANSLIT_FUNCTION_KEYS: &[(u16, Form)] = &[
 const TRANSLIT_CONTROL_KEYS: &[(&str, Form)] = &[
     ("j", Form::Hiragana),
     ("k", Form::Katakana),
-    (";", Form::HalfKatakana),
+    (";", Form::HalfAlnum(Case::Lower)),
     ("l", Form::FullAlnum(Case::Lower)),
-    (":", Form::HalfAlnum(Case::Lower)),
+    (":", Form::HalfKatakana),
     ("'", Form::HalfAlnum(Case::Lower)),
 ];
 
@@ -522,9 +522,9 @@ mod tests {
             ("j", Form::Hiragana),
             ("k", Form::Katakana),
             ("K", Form::Katakana),
-            (";", Form::HalfKatakana),
+            (";", Form::HalfAlnum(lower)),
             ("l", Form::FullAlnum(lower)),
-            (":", Form::HalfAlnum(lower)),
+            (":", Form::HalfKatakana),
             ("'", Form::HalfAlnum(lower)),
         ] {
             assert_eq!(translit_form(40, true, chars), Some(want), "ctrl+{chars}");
