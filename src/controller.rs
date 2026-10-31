@@ -232,7 +232,7 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         let secure = self.env.secure_input();
         Gates {
             learning: outbound::learning_allowed(secure, bundle_id),
-            direct: outbound::direct_input(secure, bundle_id),
+            direct: outbound::direct_input(secure),
         }
     }
 
@@ -250,11 +250,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.bundle_id.get().map(String::as_str)
     }
 
-    /// 文脈を覚えて使ってよいアプリの bundle id。取れない・学習が許されない・素通し (セキュア入力・パスワード管理アプリ) のときは None。
+    /// 文脈を覚えて使ってよいアプリの bundle id。取れない・学習が許されない (セキュア入力・パスワード管理アプリ) ときは None。
+    /// セキュア入力は学習も止めるので、素通し (`direct`) は別に見なくてよい。
     fn context_app(&self, client: Option<&C>) -> Option<String> {
         let gates = self.gates(client);
-        let allowed = gates.learning && !gates.direct;
-        self.bundle_id(client).filter(|_| allowed).map(str::to_string)
+        self.bundle_id(client).filter(|_| gates.learning).map(str::to_string)
     }
 
     /// このアプリで直前に打った文字列 (覚えていなければ空)と、英語を打つアプリか。同じ `context_app` の門を 1 回だけ通る。
@@ -708,11 +708,38 @@ mod tests {
     }
 
     #[test]
-    fn keys_pass_through_uncomposed_in_a_password_manager() {
-        let (handled, client, _) = handled_in_direct_mode(RecEnv::default(), Some("com.1password.1password"));
-        assert!(handled.iter().all(|h| !h), "{handled:?}");
-        assert_eq!(*client.marked.borrow(), "");
-        assert!(client.inserted.borrow().is_empty());
+    fn keys_are_composed_but_nothing_is_learned_in_a_password_manager() {
+        let (handled, client, memory) = handled_in_direct_mode(RecEnv::default(), Some("com.1password.1password"));
+        assert!(handled[..4].iter().all(|h| *h), "{handled:?}");
+        assert!(!client.inserted.borrow().is_empty() || !client.marked.borrow().is_empty());
+        assert!(memory.learned().is_empty());
+        assert!(crate::context::with(|store| store.get("com.1password.1password", std::time::Instant::now()).is_empty()));
+    }
+
+    /// パスワード管理アプリで確定・候補クリック・数字キー選択をしても、学習も文脈の記録もされない。
+    #[test]
+    fn a_commit_a_click_and_a_digit_pick_learn_nothing_in_a_password_manager() {
+        const APP: &str = "com.1password.1password";
+        let context_empty = || crate::context::with(|store| store.get(APP, std::time::Instant::now()).is_empty());
+        let setup = || {
+            let client = RecClient::default();
+            client.set_bundle(Some(APP));
+            let (c, core, _) = observing_controller(RecEnv::default());
+            open_candidate_window(&c, &client);
+            (c, client, core)
+        };
+        let (c, _client, core) = setup();
+        c.on_candidate_selected("幹事");
+        assert!(!engine_learned(&core), "click");
+        assert!(context_empty(), "click");
+        let (c, client, core) = setup();
+        assert!(rec_press(&c, &client, Key::Digit(3), "3"));
+        assert!(!engine_learned(&core), "digit");
+        assert!(context_empty(), "digit");
+        let (c, client, core) = setup();
+        assert!(rec_press(&c, &client, Key::Enter, "\r"));
+        assert!(!engine_learned(&core), "enter");
+        assert!(context_empty(), "enter");
     }
 
     #[test]
@@ -1006,8 +1033,10 @@ mod tests {
     fn 学習が許されないアプリと_bundle_id_が取れないクライアントでは覚えない() {
         let f = fixture();
         f.1.set_bundle("com.1password.1password");
-        // パスワード管理アプリでは素通しになり、何も入らない (覚える文字も無い)。
-        assert!(!press(&f, Key::Letter { upper: true }, "H"));
+        // パスワード管理アプリでは日本語を打てるが、確定しても何も覚えない。
+        assert!(press(&f, Key::Letter { upper: true }, "H"));
+        type_letters(&f, "ello");
+        assert!(press(&f, Key::Enter, "\r"));
         assert_eq!(context_of("com.1password.1password"), "");
         // bundle id が取れないクライアントでは、確定しても誰の文脈にも入らない。
         let g = fixture();
