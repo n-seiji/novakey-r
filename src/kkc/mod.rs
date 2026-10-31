@@ -227,22 +227,47 @@ fn is_permutation(order: &[usize], n: usize) -> bool {
 
 /// 上位の全文候補から派生候補 (`variants`) を作り、最後の全文候補の直後に全文候補として足す。
 /// 先頭の `top` (打ち切り済み) は動かさない。スコアは元の候補から `PENALTY` 引く。審判がなければ元の全文候補の後ろに並ぶ。
-fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
+/// 読みが 〜なそう (+ 短い続き) で終わるときは、〜ない を変換して ない を なそう に替えた候補も足す (`nasou_candidates`)。
+fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>, katakana: &str) {
     let full: Vec<usize> = (0..top.len()).filter(|&i| top[i].source == result::Source::Full).collect();
     let Some(&last_full) = full.last() else {
         return;
     };
     let origins: Vec<&[Rc<elem::Elem>]> = full.iter().take(variants::ORIGINS).map(|&i| top[i].data.as_slice()).collect();
-    let exclude: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
+    let mut exclude: HashSet<String> = top.iter().map(|c| c.text.replace('\u{1F}', "")).collect();
     let made = variants::generate(&origins, &exclude, &|ruby| core.headwords(ruby));
-    let cands: Vec<result::Cand> = made
+    let mut cands: Vec<result::Cand> = made
         .into_iter()
         .map(|(k, v)| {
             let value = top[full[k]].value - variants::PENALTY;
             result::Cand::new(v.text, value, v.data, result::Source::Full)
         })
         .collect();
+    exclude.extend(cands.iter().map(|c| c.text.replace('\u{1F}', "")));
+    cands.extend(nasou_candidates(core, katakana, &exclude));
     top.splice(last_full + 1..last_full + 1, cands);
+}
+
+/// 読みが 〜なそう (+ 続き) で終わるとき、同じ読みの なそう を ない にして変換し、動詞+ない の候補の ない を なそう に替える。
+/// 辞書は 翁 (おきな) が 起き+な より強く、おきなそう の候補に 起きなそう が出ないため。エンジンの順位は変えず、審判が他の全文候補と並べる。
+/// 該当する読みのときだけ余分に 1 回変換する。`MAX_VARIANTS` とは別枠なので他の派生に押し出されない。
+fn nasou_candidates(core: &KkcCore, katakana: &str, exclude: &HashSet<String>) -> Vec<result::Cand> {
+    let Some((negative, tail)) = variants::nasou_split(katakana) else {
+        return Vec::new();
+    };
+    let converted = core.convert_all(&negative);
+    let alt: Vec<(f32, &[Rc<elem::Elem>])> = converted
+        .main
+        .iter()
+        .take(TOP_N)
+        .filter(|c| c.source == result::Source::Full)
+        .take(variants::ORIGINS)
+        .map(|c| (c.value, c.data.as_slice()))
+        .collect();
+    variants::nasou_variants(&alt, tail, exclude, &|ruby| core.headwords(ruby))
+        .into_iter()
+        .map(|(score, v)| result::Cand::new(v.text, score - variants::PENALTY, v.data, result::Source::Full))
+        .collect()
 }
 
 /// 先頭の後ろに、`rest` のうち読み全体を覆う候補 (語の読みをつないだものが `katakana` と一致) を engine の順で足す。
@@ -281,9 +306,9 @@ impl CandidateEngine for RustEngine {
         }
         let converted = core.convert_all(hiragana);
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
-        add_variants(core, &mut top);
-        let head_len = top.len();
         let katakana = dict::to_katakana(hiragana);
+        add_variants(core, &mut top, &katakana);
+        let head_len = top.len();
         append_tail(&mut top, &converted.main[converted.main.len().min(TOP_N)..], &katakana);
         let mut order: Vec<usize> = (0..top.len()).collect();
         let slots: Vec<usize> = (0..head_len).filter(|&i| top[i].source == result::Source::Full).collect();
@@ -757,6 +782,73 @@ mod tests {
         assert_eq!(cands[n_full + added..shown_base.len() + added], shown_base[n_full..], "全文以外の候補は押し出されない");
     }
 
+    thread_local! {
+        static WANT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    }
+
+    /// `WANT` の文字列を先頭に、残りは元の順にする審判
+    fn want_first_judge(_context: &str, texts: &[&str], _scores: &[f32]) -> Option<Vec<usize>> {
+        let want = WANT.with(|w| w.get());
+        let k = texts.iter().position(|t| *t == want)?;
+        let mut order: Vec<usize> = (0..texts.len()).filter(|&i| i != k).collect();
+        order.insert(0, k);
+        Some(order)
+    }
+
+    fn want_first(want: &'static str) -> Judge {
+        WANT.with(|w| w.set(want));
+        want_first_judge
+    }
+
+    #[test]
+    fn 翁が勝つ読みでも_動詞の否定から起きなそうが全文候補として入る() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        let base = core.convert_all("おきなそう");
+        assert!(base.main.iter().all(|c| c.text != "起きなそう"), "エンジン単体では出ない前提");
+        let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+        let cands = e.convert(1, "おきなそう");
+        let i = index_of(&cands, "起きなそう");
+        let n_full = base.main.iter().take(TOP_N).filter(|c| c.source == result::Source::Full).count();
+        assert!(i >= n_full, "元の全文候補より前には出ない");
+        assert_eq!(cands.iter().filter(|c| *c == "起きなそう").count(), 1);
+        let words = e.words(1, i).unwrap();
+        assert_eq!(words.iter().map(|(w, _)| w.as_str()).collect::<String>(), "起きなそう");
+        assert_eq!(words.iter().map(|(_, r)| r.as_str()).collect::<String>(), "オキナソウ");
+    }
+
+    #[test]
+    fn 起きなそうは続き付きの読みでも読み全体を覆い_審判が選べば学習される() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        for (reading, want) in [("おきなそう", "起きなそう"), ("おきなそうです", "起きなそうです"), ("みなそう", "見なそう")] {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(want_first(want));
+            let shown = e.convert(1, reading);
+            assert_eq!(shown[0], want);
+            let words = e.words(1, 0).unwrap();
+            assert_eq!(words.iter().map(|(_, r)| r.as_str()).collect::<String>(), dict::to_katakana(reading), "{reading}");
+        }
+        let mut e = RustEngine::with_core(core.clone()).with_judge(want_first("起きなそう"));
+        e.convert(1, "おきなそう");
+        assert!(e.select(1, 0));
+        let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "おきなそう");
+        assert_eq!(after[0], "起きなそう", "{after:?}");
+    }
+
+    #[test]
+    fn 動詞でない否定や読みが違うときは足さない() {
+        let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
+        for reading in ["はなそう", "かなそう", "おなそう", "みなさん", "おきな", "おきない"] {
+            let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
+            let shown = e.convert(1, reading);
+            assert!(!shown.iter().any(|t| t == "歯なそう" || t == "お内そう"), "{reading}: {shown:?}");
+            let main = core.convert_all(reading).main;
+            let mut top: Vec<result::Cand> = main[..main.len().min(TOP_N)].to_vec();
+            let before = top.len();
+            add_variants(&core, &mut top, &dict::to_katakana(reading));
+            let added = top.len() - before;
+            assert!(added <= variants::MAX_VARIANTS, "{reading}: {added}");
+        }
+    }
+
     #[test]
     fn 派生候補の語列は表記も読みも表示と読みに一致する() {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
@@ -802,7 +894,7 @@ mod tests {
     fn head_len(core: &Rc<KkcCore>, reading: &str) -> usize {
         let converted = core.convert_all(reading);
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
-        add_variants(core, &mut top);
+        add_variants(core, &mut top, &dict::to_katakana(reading));
         top.len()
     }
 

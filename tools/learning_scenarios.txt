@@ -26,3 +26,6 @@ shinbun<bs><space><space><space><enter>	しん部
 shinbu<space><enter>	しん部
 <live>shinbu<enter>	しん部
 <live>shinbun<bs><enter>	しん部
+# 派生した 起きなそう も覚える
+okinasou<space><pick:6>	起きなそう
+okinasou<space><enter>	起きなそう

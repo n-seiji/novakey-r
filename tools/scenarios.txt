@@ -629,3 +629,9 @@ apito<enter>	あぴと
 kyouhaapi<enter>	きょうはあぴ
 node<enter>	ので
 nodeha<enter>	のでは
+# 〜なそう: 辞書は 翁 が 起き+な に勝つので、〜ない を変換して ない を なそう に替えた候補が全文候補に入る (審判なしの並びでの番号)
+okinasou<space><pick:6>	起きなそう
+okinasouda<space><pick:3>	起きなそうだ
+okinasoudesu<space><pick:3>	起きなそうです
+konasou<space><pick:6>	来なそう
+hanasou<space><enter>	話そう
