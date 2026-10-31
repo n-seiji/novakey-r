@@ -35,9 +35,20 @@ static TABLE: LazyLock<Table> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-/// ひらがなの読み全体に対応する絵文字 (表の順)。表に無ければ空。
+/// ひらがなの読み全体に対応する絵文字 (表の順)。記号の呼び名 (`symbols::symbols_named`) の記号が先、絵文字が後。表に無ければ空。
 pub fn emoji_for(hiragana: &str) -> Vec<String> {
-    lookup(&TABLE, hiragana).to_vec()
+    merged(crate::symbols::symbols_named(hiragana), lookup(&TABLE, hiragana))
+}
+
+/// 記号を先に、絵文字をその後ろに。同じ文字列が両方にあれば先の 1 つだけ。
+fn merged(symbols: &[&str], emoji: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
+    for e in emoji {
+        if !out.contains(e) {
+            out.push(e.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -60,6 +71,13 @@ mod tests {
         let t = table();
         assert!(lookup(&t, "ね").is_empty());
         assert!(lookup(&t, "ねこたち").is_empty());
+    }
+
+    #[test]
+    fn 記号は絵文字より先に並び_重複は先の1つだけ() {
+        let emoji = ["⭐".to_string(), "☆".to_string()];
+        assert_eq!(merged(&["☆", "★"], &emoji), ["☆", "★", "⭐"]);
+        assert_eq!(merged(&[], &emoji), ["⭐", "☆"]);
     }
 
     #[test]
