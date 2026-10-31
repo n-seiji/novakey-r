@@ -33,3 +33,7 @@ md5<enter>	md5
 md5<enter>	md5
 base6<enter>	ばせ6
 md<enter>	md
+# 派生した 起きなそう は先頭に出て、覚える。先頭を替えても候補の添字は学習データとずれず、選んだ 翁層 が次から先頭になる
+okinasou<space><enter>	起きなそう
+okinasou<space><pick:2>	翁層
+okinasou<space><enter>	翁層
