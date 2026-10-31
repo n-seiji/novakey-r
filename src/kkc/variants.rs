@@ -209,6 +209,8 @@ pub const NASOU_MAX: usize = 2;
 const VERB_RCIDS: std::ops::Range<usize> = 570..1000;
 /// 形容詞 1 語 (儚い・危ない・少ない) の `rcid`
 const ADJECTIVE_RCID: usize = 19;
+/// 否定まで 1 語の動詞 (わからない・分からない) の `rcid`
+const NEGATIVE_WORD_RCID: usize = 473;
 
 /// 読み (カタカナ) が `〜ナソウ` + 短い続き で終わるとき、`ナソウ` を `ナイ` に替えた続きなしの読みと、その続き。
 pub fn nasou_split(katakana: &str) -> Option<(String, (&'static str, &'static str))> {
@@ -222,7 +224,8 @@ pub fn nasou_split(katakana: &str) -> Option<(String, (&'static str, &'static st
 /// スコアは元の候補のスコアに続きの辞書のスコアを足したもの。
 pub fn nasou_variants(negative: &[(f32, &[Rc<Elem>])], tail: (&str, &str), exclude: &HashSet<String>, max: usize, lookup: &dyn Fn(&str) -> Vec<Entry>) -> Vec<(f32, Variant)> {
     // はかない には 儚い (形容詞 1 語) の候補があるので、吐かない (動詞) 由来の 吐かなそう を作らない。形容詞 + そう は 動詞の否定の ない を替えた形ではないため。
-    if negative.iter().any(|(_, d)| d.len() == 1 && d[0].rcid == ADJECTIVE_RCID && d[0].ruby.ends_with("ナイ")) {
+    // わからない も同じ: 1 語の候補を差し替えられないので、次点の 解ら + ない から 解らなそう だけを作ってしまう。
+    if negative.iter().any(|(_, d)| d.len() == 1 && matches!(d[0].rcid, ADJECTIVE_RCID | NEGATIVE_WORD_RCID) && d[0].ruby.ends_with("ナイ")) {
         return Vec::new();
     }
     let tail_elem = if tail.0.is_empty() {

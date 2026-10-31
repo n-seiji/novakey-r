@@ -641,3 +641,5 @@ hanasou<space><enter>	話そう
 hakanasou<space><enter>	儚そう
 abunasou<space><enter>	危なそう
 kitanasou<space><enter>	汚そう
+wakaranasou<enter>	わからなそう
+wakaranasou<space><enter>	わからなそう
