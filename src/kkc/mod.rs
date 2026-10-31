@@ -66,23 +66,17 @@ impl KkcCore {
 
     /// 読みがそのまま辞書の見出しにあるか。トライを 1 本たどるだけで、ラティスは作らない。学習・動的な語は見ない。
     pub fn has_reading(&self, hiragana: &str) -> bool {
-        let katakana = dict::to_katakana(hiragana);
-        !katakana.is_empty()
-            && self.dict.prefix_entries(&katakana).is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana))
+        !self.headwords(&dict::to_katakana(hiragana)).is_empty()
     }
 
     /// カタカナの読み `katakana` で、表記が漢字 `kanji` 1 字の見出しが辞書にあるか。live 変換の Backspace が読みを切り分けるのに使う。
     pub fn has_kanji_reading(&self, katakana: &str, kanji: char) -> bool {
         let mut buf = [0u8; 4];
         let kanji: &str = kanji.encode_utf8(&mut buf);
-        !katakana.is_empty()
-            && self
-                .dict
-                .prefix_entries(katakana)
-                .is_ok_and(|entries| entries.iter().any(|e| e.ruby == katakana && e.word == kanji))
+        self.headwords(katakana).iter().any(|e| e.word == kanji)
     }
 
-    /// カタカナの読みがちょうど一致する辞書の見出し (派生候補の連濁の語探し用)。学習・動的な語は見ない。辞書が読めなければ空。
+    /// カタカナの読みがちょうど一致する辞書の見出し。学習・動的な語は見ない。辞書が読めなければ空。
     fn headwords(&self, katakana: &str) -> Vec<dict::Entry> {
         self.dict.prefix_entries(katakana).map(|v| v.into_iter().filter(|e| e.ruby == katakana).collect()).unwrap_or_default()
     }
@@ -92,10 +86,10 @@ impl KkcCore {
         if reading.is_empty() {
             return Converted::default();
         }
-        let chars = lattice::katakana_chars(reading);
-        let katakana: String = chars.iter().collect();
+        let katakana = dict::to_katakana(reading);
+        let chars: Vec<char> = katakana.chars().collect();
         let learning = self.learning.borrow();
-        let mut lat = lattice::Lattice::build_with_memory(&self.dict, &mut self.cache.borrow_mut(), Some(&learning), &chars);
+        let mut lat = lattice::Lattice::build(&self.dict, &mut self.cache.borrow_mut(), &learning, &chars);
         lat.run(&self.dict, N_BEST);
         result::process(&self.dict, &lat, &katakana)
     }
@@ -240,8 +234,7 @@ fn add_variants(core: &KkcCore, top: &mut Vec<result::Cand>) {
         .into_iter()
         .map(|(k, v)| {
             let value = top[full[k]].value - variants::PENALTY;
-            let ruby_count = v.data.iter().map(|e| e.ruby_len).sum();
-            result::Cand { text: v.text, value, ruby_count, data: v.data, source: result::Source::Full }
+            result::Cand::new(v.text, value, v.data, result::Source::Full)
         })
         .collect();
     top.splice(last_full + 1..last_full + 1, cands);
@@ -255,7 +248,7 @@ fn append_tail(top: &mut Vec<result::Cand>, rest: &[result::Cand], katakana: &st
         if top.len() >= MAX_SHOWN {
             break;
         }
-        let covers_all = cand.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana;
+        let covers_all = cand.ruby() == katakana;
         // ASCII だけ (server, VAN, @hotmail.com など) の候補は足さない。英単語は composer が loanwords.tsv から入れる。記号・絵文字は足す
         // (composer が emoji.tsv の絵文字を入れるときは、この後ろの複製を消して決まった位置に入れる)。
         let has_letter = !cand.text.is_ascii();
@@ -285,7 +278,7 @@ impl CandidateEngine for RustEngine {
         let mut top: Vec<result::Cand> = converted.main[..converted.main.len().min(TOP_N)].to_vec();
         add_variants(core, &mut top);
         let head_len = top.len();
-        let katakana: String = lattice::katakana_chars(hiragana).iter().collect();
+        let katakana = dict::to_katakana(hiragana);
         append_tail(&mut top, &converted.main[converted.main.len().min(TOP_N)..], &katakana);
         let mut order: Vec<usize> = (0..top.len()).collect();
         let slots: Vec<usize> = (0..head_len).filter(|&i| top[i].source == result::Source::Full).collect();
@@ -795,9 +788,6 @@ mod tests {
         let after = RustEngine::with_core(core).with_judge(no_judge).convert(2, "いっとうがし");
         assert_eq!(after[0], "一棟貸し", "{after:?}");
     }
-    fn katakana_of(reading: &str) -> String {
-        lattice::katakana_chars(reading).iter().collect()
-    }
 
     /// 先頭 (TOP_N + 派生候補) の長さ。審判なし・tail なしの旧来の返り値の長さと同じ。
     fn head_len(core: &Rc<KkcCore>, reading: &str) -> usize {
@@ -813,7 +803,7 @@ mod tests {
         let core = Rc::new(KkcCore::open_with_learning(Learning::in_memory()).unwrap());
         for reading in ["かんじ", "こうしょう", "きしゃ", "いっとう", "きょうはいいてんきですね"] {
             let main = core.convert_all(reading).main;
-            let whole = main.iter().skip(TOP_N).filter(|c| c.data.iter().map(|e| e.ruby.as_str()).collect::<String>() == katakana_of(reading)).count();
+            let whole = main.iter().skip(TOP_N).filter(|c| c.ruby() == dict::to_katakana(reading)).count();
             let shown = RustEngine::with_core(core.clone()).with_judge(no_judge).convert(1, reading).len();
             eprintln!("COUNT main={} whole_past_9={whole} head={} shown={shown}", main.len(), head_len(&core, reading));
         }
@@ -827,7 +817,7 @@ mod tests {
         let head = head_len(&core, "かんじ");
         assert!(shown.len() > TOP_N && shown.len() <= MAX_SHOWN, "{}", shown.len());
         assert!(shown.len() > head, "tail がある");
-        let want = katakana_of("かんじ");
+        let want = dict::to_katakana("かんじ");
         for i in 0..shown.len() {
             let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
             if i >= head {
@@ -844,7 +834,7 @@ mod tests {
         let reading = "きょうはいいてんきですね";
         let mut e = RustEngine::with_core(core.clone()).with_judge(no_judge);
         let shown = e.convert(1, reading);
-        let want = katakana_of(reading);
+        let want = dict::to_katakana(reading);
         for i in head_len(&core, reading)..shown.len() {
             let ruby: String = e.words(1, i).unwrap().iter().map(|(_, r)| r.as_str()).collect();
             assert_eq!(ruby, want);

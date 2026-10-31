@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use super::dict::to_katakana;
 use super::elem::{count_graphemes, Elem, CID_NUMBER, CID_PROPER_NOUN, CID_SYMBOL, MID_GENERAL, MID_NUMBER, MID_SMALL_NUMBER};
 
 /// 全角記号 -> 半角記号の対応。`DicdataStore.fullwidthToHalfwidth` を ICU の結果で固定した表
@@ -136,14 +137,6 @@ pub fn is_number(c: char) -> bool {
     c.is_numeric() || matches!(c, '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千' | '万' | '億' | '兆' | '零' | '壱' | '弐' | '参' | '拾' | '京' | '〇' | '廿' | '卅' | '卌' | '皕' | '陌' | '阡' | '萬' | '貳' | '叁' | '肆' | '伍' | '陸' | '柒' | '捌' | '玖' | '仟' | '佰')
 }
 
-/// ひらがな -> カタカナ (`String.toKatakana`)。
-pub fn to_katakana_char(c: char) -> char {
-    match c as u32 {
-        0x3041..=0x3096 => char::from_u32(c as u32 + 0x60).unwrap_or(c),
-        _ => c,
-    }
-}
-
 /// カタカナ -> ひらがな (`String.toHiragana`)。
 pub fn to_hiragana(s: &str) -> String {
     s.chars()
@@ -238,45 +231,20 @@ enum Tok {
 
 impl Tok {
     fn is_number(self) -> bool {
-        matches!(self, Tok::Ichi | Tok::Ni | Tok::San | Tok::Yon | Tok::Go | Tok::Roku | Tok::Nana | Tok::Hachi | Tok::Kyuu | Tok::Rei | Tok::End)
+        self == Tok::End || self.digit().is_some()
     }
     fn is_not_number(self) -> bool {
         matches!(self, Tok::Juu | Tok::Hyaku | Tok::Sen | Tok::Man | Tok::Oku | Tok::Chou | Tok::Err | Tok::End)
     }
-    fn to_roman(self) -> &'static str {
-        match self {
-            Tok::Ichi => "1",
-            Tok::Ni => "2",
-            Tok::San => "3",
-            Tok::Yon => "4",
-            Tok::Go => "5",
-            Tok::Roku => "6",
-            Tok::Nana => "7",
-            Tok::Hachi => "8",
-            Tok::Kyuu => "9",
-            Tok::Rei => "0",
-            _ => "",
-        }
-    }
     fn to_kanji(self) -> &'static str {
         match self {
-            Tok::Ichi => "一",
-            Tok::Ni => "二",
-            Tok::San => "三",
-            Tok::Yon => "四",
-            Tok::Go => "五",
-            Tok::Roku => "六",
-            Tok::Nana => "七",
-            Tok::Hachi => "八",
-            Tok::Kyuu => "九",
-            Tok::Rei => "〇",
             Tok::Juu => "十",
             Tok::Hyaku => "百",
             Tok::Sen => "千",
             Tok::Man => "万",
             Tok::Oku => "億",
             Tok::Chou => "兆",
-            Tok::End | Tok::Err => "",
+            _ => self.digit().map_or("", |d| KANSUJI_DIGITS[usize::from(d)]),
         }
     }
     fn max_digit(self) -> Option<usize> {
@@ -500,7 +468,7 @@ fn japanese_number_dicdata(head: &str, out: &mut Vec<Elem>) {
     }
     let kanji: String = tokens.iter().map(|t| t.to_kanji()).collect();
     let roman: String = if tokens.iter().all(|t| t.is_number()) {
-        tokens.iter().map(|t| t.to_roman()).collect()
+        tokens.iter().filter_map(|t| t.digit()).map(|d| char::from(b'0' + d)).collect()
     } else if tokens.iter().all(|t| t.is_not_number()) {
         return;
     } else {
@@ -565,7 +533,7 @@ pub fn wise_dicdata(segment: &str, range: std::ops::Range<usize>, full_text: &[c
     // `convertTarget.count == 1` は grapheme 数。1 スカラーの場合に加え、結合文字つきの 1 文字も数える
     let is_single_grapheme = single.is_some() || (segment.chars().count() > 1 && count_graphemes(segment) == 1);
     if is_single_grapheme {
-        let katakana: String = segment.chars().map(to_katakana_char).collect();
+        let katakana = to_katakana(segment);
         let hiragana = to_hiragana(segment);
         if katakana == hiragana {
             result.push(Elem::new(katakana.clone(), katakana, CID_PROPER_NOUN, CID_PROPER_NOUN, MID_GENERAL, -14.0));

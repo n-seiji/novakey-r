@@ -288,6 +288,13 @@ struct Node {
     eos_lp: f32,
 }
 
+/// 未計算のノード (`lp` と `eos_lp` は NaN)。捨てた枠の初期化にも使う。
+impl Default for Node {
+    fn default() -> Self {
+        Self { parent: 0, tok: 0, depth: 0, stamp: 0, children: Vec::new(), kv: Vec::new(), lp: f32::NAN, eos_lp: f32::NAN }
+    }
+}
+
 const KV_LEN: usize = NL * 2 * DM + DM;
 
 /// 過去に採点した系列の木 (共通の接頭辞の K / V と対数確率を使い回す)。
@@ -324,16 +331,7 @@ impl Cache {
             Some(id) => id,
             None => {
                 let depth = self.nodes[parent as usize].depth + 1;
-                let id = self.alloc(Node {
-                    parent,
-                    tok,
-                    depth,
-                    stamp,
-                    children: Vec::new(),
-                    kv: Vec::new(),
-                    lp: f32::NAN,
-                    eos_lp: f32::NAN,
-                });
+                let id = self.alloc(Node { parent, tok, depth, stamp, ..Node::default() });
                 self.nodes[parent as usize].children.push((tok, id));
                 pending.push(id);
                 id
@@ -378,16 +376,7 @@ impl Cache {
                 }
                 let parent = self.nodes[id as usize].parent;
                 self.nodes[parent as usize].children.retain(|c| c.1 != id);
-                self.nodes[id as usize] = Node {
-                    parent: 0,
-                    tok: 0,
-                    depth: 0,
-                    stamp: 0,
-                    children: Vec::new(),
-                    kv: Vec::new(),
-                    lp: f32::NAN,
-                    eos_lp: f32::NAN,
-                };
+                self.nodes[id as usize] = Node::default();
                 self.free.push(id);
             }
         }
@@ -486,7 +475,7 @@ impl Model {
             return Err("unexpected embedding shape");
         }
         mat(&self.wte, self.wte.rows, DM)?;
-        if self.wpe.len() % DM != 0 || self.wpe.len() / DM <= MAX_TOKENS + 1 {
+        if !self.wpe.len().is_multiple_of(DM) || self.wpe.len() / DM <= MAX_TOKENS + 1 {
             return Err("unexpected position table");
         }
         Ok(())
@@ -508,8 +497,13 @@ impl Model {
         }
         // 作業領域は長さが固定 (作り直さない) なので、ここで留めた番地が使われ続ける。
         let bytes = f32s.iter().map(|v| std::mem::size_of_val(*v)).chain(u8s.iter().map(|v| v.len())).sum();
-        let ok = f32s.iter().fold(true, |ok, v| crate::platform::lock_memory(v) && ok);
-        let ok = u8s.iter().fold(ok, |ok, v| crate::platform::lock_memory(v) && ok);
+        let mut ok = true;
+        for v in &f32s {
+            ok &= crate::platform::lock_memory(v);
+        }
+        for v in &u8s {
+            ok &= crate::platform::lock_memory(v);
+        }
         (bytes, ok)
     }
 
@@ -550,16 +544,7 @@ impl Model {
         cache.stamp += 1;
         let mut pending: Vec<u32> = Vec::new();
         if cache.nodes.is_empty() {
-            cache.nodes.push(Node {
-                parent: 0,
-                tok: BOS,
-                depth: 0,
-                stamp: 0,
-                children: Vec::new(),
-                kv: Vec::new(),
-                lp: 0.0,
-                eos_lp: f32::NAN,
-            });
+            cache.nodes.push(Node { tok: BOS, lp: 0.0, ..Node::default() });
             pending.push(0);
         }
         let stamp = cache.stamp;
@@ -693,7 +678,7 @@ impl Model {
     fn logits_small(&self, xs: &[f32], r: usize, wants: &[(usize, u32)]) -> (Vec<(f32, f32)>, Vec<f32>) {
         let xq = quantize_rows(xs, r, DM);
         let nchunk = self.wte.rows.div_ceil(VOCAB_SMALL_CHUNK);
-        let parts: Vec<(Vec<(f32, f32)>, Vec<(usize, f32)>)> = (0..nchunk)
+        let parts: Vec<_> = (0..nchunk)
             .into_par_iter()
             .map(|ci| {
                 let (v0, v1) = (ci * VOCAB_SMALL_CHUNK, ((ci + 1) * VOCAB_SMALL_CHUNK).min(self.wte.rows));
@@ -708,7 +693,7 @@ impl Model {
                         (mx, col.map(|&v| (v - mx).exp()).sum())
                     })
                     .collect();
-                let hits = wants
+                let hits: Vec<_> = wants
                     .iter()
                     .enumerate()
                     .filter(|(_, w)| (v0..v1).contains(&(w.1 as usize)))
@@ -1247,7 +1232,7 @@ mod tests {
     }
 
     fn leaf(parent: u32, tok: u32, depth: u32, stamp: u64) -> Node {
-        Node { parent, tok, depth, stamp, children: Vec::new(), kv: vec![0.0], lp: 0.0, eos_lp: f32::NAN }
+        Node { parent, tok, depth, stamp, kv: vec![0.0], lp: 0.0, ..Node::default() }
     }
 
     /// 共通の接頭辞は同じノードを通り、上限を超えたら古い葉から捨てる (根と今回のノードは残る)。
