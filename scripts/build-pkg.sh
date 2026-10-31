@@ -2,7 +2,7 @@
 # Build dist/Shizuku-<version>.pkg (plus a .sha256 file) from the already signed dist/Shizuku.app
 # (in CI also notarized and stapled). The package installs into the current user's home only
 # (~/Library/Input Methods), so it needs no admin password. It updates an existing bundle in place,
-# which keeps Shizuku usable in Input Sources (see BundleOverwriteAction below). Never modifies the app.
+# which keeps Shizuku usable in Input Sources (see component.plist below). Never modifies the app.
 # Usage: scripts/build-pkg.sh <identity>   (a "Developer ID Installer: ..." identity, or "-" to
 #        leave the package unsigned for local tests)
 set -euo pipefail
@@ -55,12 +55,15 @@ exit 0
 SH
 chmod 755 "$tmp/scripts/postinstall"
 
-# Install exactly where the package says, even if another Shizuku.app exists elsewhere.
-pkgbuild --analyze --root "$tmp/root" "$tmp/component.plist" >/dev/null
-plutil -replace 0.BundleIsRelocatable -bool NO "$tmp/component.plist"
-# The default ("upgrade") swaps the whole bundle, and macOS then stops offering the input method
-# until it is removed and added again in System Settings (seen on macOS 26). "update" keeps the bundle.
-plutil -replace 0.BundleOverwriteAction -string update "$tmp/component.plist"
+# No bundle entries: the installer then just writes the files. With a bundle entry, the default
+# action ("upgrade") swaps the whole bundle, and macOS stops offering the input method until it is
+# removed and added again in System Settings (seen on macOS 26); "update" keeps the bundle but
+# installs nothing when there is none yet. Without entries the package is also not relocatable.
+cat > "$tmp/component.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><array/></plist>
+PLIST
 
 # The install location is relative to the chosen domain: the user's home (see Distribution).
 pkgbuild --root "$tmp/root" \

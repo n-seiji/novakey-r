@@ -66,6 +66,8 @@ jobs:
           grep -q 'enable_currentUserHome="true"' "$expanded/Distribution"
           grep -q 'enable_localSystem="false"' "$expanded/Distribution"
           grep -q 'relocatable="false"' "$expanded/Shizuku.pkg/PackageInfo"
+          # A bundle entry makes the installer swap the bundle, which leaves Shizuku unusable until re-added.
+          ! grep -q '<bundle ' "$expanded/Shizuku.pkg/PackageInfo"
           pkgutil --payload-files "$pkg" | grep -qx './Shizuku.app/Contents/MacOS/shizuku'
       # The runner is thrown away afterwards, so installing into its home is harmless. No sudo:
       # the package only offers the current user's home.
