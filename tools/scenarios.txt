@@ -683,3 +683,12 @@ neovim<enter>	neovim
 neovimwo<enter>	neovimを
 vim<enter>	vim
 nvim<enter>	nvim
+rifakuta<space><enter>	リファクタ
+rifakutasuru<space><enter>	リファクタする
+rifakutaringu<space><enter>	リファクタリング
+rinta<space><enter>	リンタ
+ribe-su<space><enter>	リベース
+ribe-suwosuru<space><enter>	リベースをする
+monorepo<space><enter>	モノレポ
+dekore-ta<space><enter>	デコレータ
+sanitaizusuru<space><enter>	サニタイズする

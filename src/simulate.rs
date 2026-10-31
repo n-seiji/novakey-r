@@ -365,6 +365,7 @@ pub(crate) fn setup_env() {
         learning_enabled: learning,
         loanwords_path: Some(repo_table("SHIZUKU_LOANWORDS", "loanwords.tsv")),
         dev_words_path: Some(repo_table("SHIZUKU_DEV_WORDS", "dev_words.txt")),
+        dev_kana_words_path: Some(repo_table("SHIZUKU_DEV_KANA_WORDS", "dev_kana_words.txt")),
         emoji_path: Some(repo_table("SHIZUKU_EMOJI", "emoji.tsv")),
         // シミュレータは SHIZUKU_JUDGE_DIR を指定したときだけ審判を読む。
         judge_dir: std::env::var_os("SHIZUKU_JUDGE_DIR").map(PathBuf::from),
