@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build dist/Shizuku-<version>.pkg (plus a .sha256 file) from the already signed dist/Shizuku.app
 # (in CI also notarized and stapled). The package installs into the current user's home only
-# (~/Library/Input Methods), so it needs no admin password. Installing it over an existing bundle
-# keeps Shizuku in Input Sources; deleting the bundle first does not. Never modifies the app.
+# (~/Library/Input Methods), so it needs no admin password. It updates an existing bundle in place,
+# which keeps Shizuku usable in Input Sources (see component.plist below). Never modifies the app.
 # Usage: scripts/build-pkg.sh <identity>   (a "Developer ID Installer: ..." identity, or "-" to
 #        leave the package unsigned for local tests)
 set -euo pipefail
@@ -32,19 +32,38 @@ chmod 755 "$tmp/root"
 # ditto keeps the signature, the stapled ticket and extended attributes.
 ditto "$APP" "$tmp/root/Shizuku.app"
 
-# After the files are replaced, stop this user's running Shizuku so the next key launches the new
-# binary (macOS starts an input method on demand). The bundle is only overwritten, never deleted,
-# so Shizuku stays in Input Sources. Never fails the install.
+# An in-place update leaves files that the new version no longer ships, and an extra file breaks the
+# bundle's code signature seal, so the postinstall removes everything not in this list.
+(cd "$tmp/root/Shizuku.app" && find . -type f | sed 's|^\./||') > "$tmp/scripts/payload-files.txt"
+[[ -s "$tmp/scripts/payload-files.txt" ]] || fail "empty payload"
+
+# After the files are updated, remove stale files and stop this user's running Shizuku so the next
+# key launches the new binary (macOS starts an input method on demand). Never fails the install.
 cat > "$tmp/scripts/postinstall" <<'SH'
 #!/bin/sh
+list="$(/usr/bin/dirname "$0")/payload-files.txt"
+app="$2/Shizuku.app"
+[ -d "$app" ] || app="$HOME/Library/Input Methods/Shizuku.app"
+if [ -s "$list" ] && [ -d "$app/Contents" ]; then
+  /usr/bin/find "$app" -type f | while IFS= read -r file; do
+    /usr/bin/grep -Fxq -- "${file#"$app"/}" "$list" || /bin/rm -f "$file"
+  done
+  /usr/bin/find "$app" -type d -empty -delete
+fi
 /usr/bin/pkill -x -u "$(/usr/bin/id -u)" shizuku || true
 exit 0
 SH
 chmod 755 "$tmp/scripts/postinstall"
 
-# Install exactly where the package says, even if another Shizuku.app exists elsewhere.
-pkgbuild --analyze --root "$tmp/root" "$tmp/component.plist" >/dev/null
-plutil -replace 0.BundleIsRelocatable -bool NO "$tmp/component.plist"
+# No bundle entries: the installer then just writes the files. With a bundle entry, the default
+# action ("upgrade") swaps the whole bundle, and macOS stops offering the input method until it is
+# removed and added again in System Settings (seen on macOS 26); "update" keeps the bundle but
+# installs nothing when there is none yet. Without entries the package is also not relocatable.
+cat > "$tmp/component.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><array/></plist>
+PLIST
 
 # The install location is relative to the chosen domain: the user's home (see Distribution).
 pkgbuild --root "$tmp/root" \
