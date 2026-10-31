@@ -40,6 +40,13 @@ impl Split {
         self.tail.iter().map(|(_, kana)| kana.as_str()).collect()
     }
 
+    /// かなの部分の未確定のローマ字を、打鍵のままのかな (ASCII) として取り込んだ分割。表示のまま確定するときに使う。
+    pub fn pending_as_kana(mut self) -> Self {
+        let pending = std::mem::take(&mut self.pending);
+        self.tail.push((pending.clone(), pending));
+        self
+    }
+
     pub fn display(&self) -> String {
         std::iter::once(self.head.as_str())
             .chain(self.tail.iter().map(|(_, kana)| kana.as_str()))

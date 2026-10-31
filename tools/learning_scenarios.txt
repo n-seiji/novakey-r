@@ -18,3 +18,11 @@ the<enter>	the
 madeni<enter>	までに
 donewo<enter>	どねを
 thenoyoni<enter>	てぇのよに
+# 末尾の n を ん として見せている間の変換は、学習に使う変換の世代を食い違わせない。n のあとに確定しても、n を消して確定しても、表示した候補を学習する
+shinbun<space><space><space><enter>	新分
+<live>shinbun<enter>	新分
+shinbun<space><enter>	新分
+shinbun<bs><space><space><space><enter>	しん部
+shinbu<space><enter>	しん部
+<live>shinbu<enter>	しん部
+<live>shinbun<bs><enter>	しん部

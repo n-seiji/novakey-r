@@ -358,6 +358,11 @@ impl Dictionary {
         Ok(out)
     }
 
+    /// カタカナの読みで始まる見出しがあるか (読みそのものが見出しでなくてもよい)。トライの道が読みの終わりまで続くかだけを見る。
+    pub fn has_reading_prefix(&self, katakana_reading: &str) -> Result<bool, DictError> {
+        Ok(!katakana_reading.is_empty() && self.prefix_nodes(katakana_reading)?.len() == katakana_reading.chars().count())
+    }
+
     /// `prefix_entries` が読む (先頭文字, トライのノード) を短い prefix から順に返す。
     pub fn prefix_nodes(&self, katakana_reading: &str) -> Result<Vec<(char, usize)>, DictError> {
         let chars: Vec<char> = katakana_reading.chars().collect();

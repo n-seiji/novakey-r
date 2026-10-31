@@ -117,12 +117,6 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.session.borrow().marked_text()
     }
 
-    /// 未確定ローマ字が無いときの、いま確定した場合の文字列。あれば None (表示と一致しなくてよい)。
-    pub fn commit_preview(&self) -> Option<String> {
-        let session = self.session.borrow();
-        (!session.has_romaji()).then(|| session.commit_preview())
-    }
-
     fn client(&self) -> Option<C> {
         self.last_client.borrow().clone()
     }
@@ -852,11 +846,12 @@ mod tests {
         let env = RecEnv::default();
         let client = RecClient::default();
         let (c, core, memory) = observing_controller(env.clone());
-        rec_type(&c, &client, "git");
+        // かなにしきれない打鍵 (rg) があるので、語として知られていなくても英語として打っている。
+        rec_type(&c, &client, "merge");
         env.secure.set(secure);
         rec_press(&c, &client, Key::Enter, "\r");
         assert!(!engine_learned(&core));
-        memory.learned().iter().any(|w| w == "git")
+        memory.learned().iter().any(|w| w == "merge")
     }
 
     #[test]

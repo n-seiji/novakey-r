@@ -14,6 +14,8 @@ struct Log {
     prefers: Rc<RefCell<bool>>,
     /// `rejects_english` の答え。
     rejects: Rc<RefCell<bool>>,
+    /// この読みで始まる辞書の見出しがあるものとして答える読み。
+    prefixes: Rc<RefCell<Vec<String>>>,
     /// true なら辞書を開けていない engine として答える。
     no_dictionary: Rc<RefCell<bool>>,
     /// `prefers_text` に渡された (text, over)。
@@ -51,6 +53,9 @@ impl CandidateEngine for MockEngine {
     }
     fn rejects_english(&mut self, _raw: &str, _reading: &str) -> bool {
         *self.log.rejects.borrow()
+    }
+    fn has_reading_prefix(&self, hiragana: &str) -> bool {
+        self.log.prefixes.borrow().iter().any(|p| p.starts_with(hiragana))
     }
     fn has_dictionary(&self) -> bool {
         !*self.log.no_dictionary.borrow()
@@ -1314,12 +1319,14 @@ fn live中の英語分割を表示している間は候補を選んでも確定�
 }
 
 #[test]
-fn live中でも英語分割に戻れない末尾の子音はrawのまま確定する() {
+fn live中の英語分割に付いた末尾の子音は_見えている分割のまま確定する() {
     let (mut c, _) = live_split_composer();
+    c.set_live(false);
     type_keys(&mut c, "artifactwok");
-    c.flush_romaji();
-    assert_eq!(c.phase(), Phase::Dangling);
-    assert_eq!(commit_learning(&mut c), "artifactwok");
+    let shown = c.preedit();
+    assert_eq!(shown, "artifactをk");
+    c.flush_romaji_for_commit();
+    assert_eq!(commit_learning(&mut c), shown);
 }
 
 #[test]
@@ -1586,11 +1593,11 @@ fn typed_romaji(keys: &str) -> Composer<MockEngine, FakeLexicon> {
 }
 
 #[test]
-fn 未確定のローマ字は_preedit_に出るが_commit_preview_には入らない() {
+fn 未確定のローマ字は_preedit_にも_commit_preview_にも同じに入る() {
     let c = typed_romaji("kyout");
     assert!(c.has_romaji());
     assert_eq!(c.preedit(), "きょうt");
-    assert_eq!(c.commit_preview(), "きょう");
+    assert_eq!(c.commit_preview(), "きょうt");
 }
 
 #[test]
@@ -1831,7 +1838,7 @@ fn 英単語のあとに打鍵が続いて語でなくなればかなに戻る()
         assert_eq!(c.phase(), Phase::Dangling);
         c.type_romaji("n");
         assert_eq!(c.phase(), Phase::Composing);
-        assert_eq!(c.preedit(), "いっすえn");
+        assert_eq!(c.preedit(), "いっすえん");
         c.backspace_romaji();
         assert_eq!(c.phase(), Phase::Dangling, "{headwords:?}");
         assert_eq!(c.preedit(), "issue");
@@ -1886,4 +1893,346 @@ fn 固定中に消して英単語に戻ると直接打ったときと同じ英�
     assert_eq!(c.phase(), direct.phase());
     assert_eq!(c.preedit(), direct.preedit());
     assert_eq!(c.commit_preview(), "issue");
+}
+
+// 未確定のローマ字が n だけのとき、表示と Enter の確定では ん として扱う。
+
+/// 直近の変換 (engine が覚えている 1 つ) が、いま見えている読みと世代の両方に合っている。
+fn assert_engine_in_step(c: &Composer<MockEngine, FakeLexicon>, log: &Log, why: &str) {
+    let (revision, reading) = log.converts.borrow().last().cloned().expect("converted");
+    assert_eq!(revision, c.reading.generation, "{why}: 世代");
+    assert_eq!(reading, c.rest(), "{why}: 変換した読み");
+    assert_eq!(c.candidates().first().map(|x| x.text.clone()), Some(format!("{reading}K1")), "{why}: 候補");
+}
+
+#[test]
+fn かなの入力中に未確定のローマ字が_n_だけなら_ん_として見せる() {
+    for (keys, shown) in [("kyon", "きょん"), ("min", "みん"), ("shinbun", "しんぶん"), ("kanpan", "かんぱん")] {
+        let c = typed_romaji(keys);
+        assert!(c.has_romaji(), "{keys}");
+        assert_eq!(c.phase(), Phase::Composing, "{keys}");
+        assert_eq!(c.display(), shown, "{keys}");
+        assert_eq!(c.preedit(), shown, "{keys}: 打鍵の n を重ねて出さない");
+        assert_eq!(c.commit_preview(), shown, "{keys}");
+        assert_eq!(c.raw(), keys, "{keys}");
+    }
+}
+
+#[test]
+fn n_のあとの打鍵で_ん_は差し替わる() {
+    for (keys, shown) in [
+        ("mina", "みな"),
+        ("minn", "みん"),
+        ("min'", "みん"),
+        ("mink", "みんk"),
+        ("miny", "みny"),
+        ("minya", "みにゃ"),
+        ("minu", "みぬ"),
+    ] {
+        let c = typed_romaji(keys);
+        assert_eq!(c.preedit(), shown, "{keys}");
+        assert_eq!(c.commit_preview(), shown, "{keys}");
+    }
+}
+
+#[test]
+fn n_以外の未確定のローマ字と単独の_n_は打鍵のまま見せて確定する() {
+    let c = typed_romaji("kyout");
+    assert_eq!(c.preedit(), "きょうt");
+    assert_eq!(c.commit_preview(), "きょうt");
+    let c = typed_romaji("n");
+    assert_eq!(c.phase(), Phase::Empty);
+    assert_eq!(c.preedit(), "n");
+    assert_eq!(c.commit_preview(), "n", "かなが 1 つも無い n は ん にしない");
+    let c = typed_romaji("kyonk");
+    assert_eq!(c.preedit(), "きょんk");
+    assert_eq!(c.commit_preview(), "きょんk");
+}
+
+#[test]
+fn 表示は未確定の子音を足したかなで_確定も同じ文字列() {
+    for (keys, shown) in [("kyout", "きょうt"), ("nek", "ねk"), ("watashih", "わたしh"), ("kyouh", "きょうh"), ("kyonk", "きょんk")] {
+        let c = typed_romaji(keys);
+        assert_eq!(c.preedit(), shown, "{keys}");
+        assert_eq!(c.commit_preview(), shown, "{keys}");
+    }
+}
+
+#[test]
+fn かなが無く子音だけの打鍵は_打鍵のまま見せて確定する() {
+    for keys in ["k", "nk", "kk", "zz", "tt"] {
+        let c = typed_romaji(keys);
+        assert_eq!(c.preedit(), keys, "{keys}: かなにする意図が無いので raw");
+        assert_eq!(c.commit_preview(), keys, "{keys}");
+    }
+    let c = typed_romaji("nka");
+    assert_eq!(c.preedit(), "んか", "母音が来ればかなになる");
+    let c = typed_romaji("kka");
+    assert_eq!(c.preedit(), "っか");
+}
+
+#[test]
+fn 開発用語は短くても英字で見せて確定する_日本語の打ちかけは戻る() {
+    let lexicon = || FakeLexicon::default().with_dev_word(|w| w == "git");
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, lexicon());
+    type_keys(&mut c, "git");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "git");
+    assert_eq!(c.commit_preview(), "git");
+    type_keys(&mut c, "a");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "ぎた");
+    // 表の語 (4 文字以上のみ使う) と違い、一覧の語は 3 文字でも使う。一覧に無い短い語は使わない。
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, FakeLexicon::default().with_english_word(|w| w == "in"));
+    type_keys(&mut c, "in");
+    assert_eq!(c.preedit(), "いん");
+    let mut c = Composer::new(MockEngine { log: Log::default(), table: vec![] }, lexicon());
+    type_keys(&mut c, "ok");
+    assert_eq!(c.preedit(), "おk");
+    assert_eq!(c.commit_preview(), "おk");
+}
+
+#[test]
+fn スラッシュで始まる英単語は_スラッシュごと英字で見せて確定する() {
+    let mut c = english_composer(|w| matches!(w, "post" | "posts"));
+    c.type_text("/");
+    type_keys(&mut c, "posts");
+    assert_eq!(c.preedit(), "/posts");
+    assert_eq!(c.commit_preview(), "/posts");
+    let mut c = english_composer(|w| matches!(w, "post" | "posts"));
+    c.type_text("/");
+    type_keys(&mut c, "kyou");
+    assert_eq!(c.preedit(), "・きょう");
+    assert_eq!(c.commit_preview(), "・きょう");
+}
+
+#[test]
+fn 読みに戻した後の入力中は_n_を今までどおり打鍵のまま見せる() {
+    let (mut c, _) = composer();
+    type_kyou(&mut c);
+    assert!(c.begin_conversion());
+    c.revert();
+    assert_eq!(c.phase(), Phase::Reverted);
+    c.type_romaji("n");
+    assert_eq!(c.preedit(), "きょうn");
+    assert_eq!(c.commit_preview(), "きょうn");
+}
+
+#[test]
+fn ん_を足した読みで候補を作り_backspace_で直前の読みと候補に戻る() {
+    let (mut c, log) = composer();
+    type_keys(&mut c, "mi");
+    assert_eq!(texts(&c), ["みK1", "みK2"]);
+    assert_engine_in_step(&c, &log, "mi");
+    type_keys(&mut c, "n");
+    assert_eq!(texts(&c), ["みんK1", "みんK2"]);
+    assert_engine_in_step(&c, &log, "min");
+    c.backspace_romaji();
+    assert!(!c.has_romaji());
+    assert_eq!(c.preedit(), "み");
+    assert_eq!(texts(&c), ["みK1", "みK2"]);
+    assert_engine_in_step(&c, &log, "min<bs>");
+    type_keys(&mut c, "na");
+    assert_eq!(c.preedit(), "みな");
+    assert_engine_in_step(&c, &log, "mina");
+}
+
+#[test]
+fn liveの変換は_ん_を含めた読みで行う() {
+    let (mut c, log) = composer();
+    c.set_live(true);
+    type_keys(&mut c, "shinbun");
+    assert_eq!(c.preedit(), "しんぶんK1");
+    assert_eq!(c.commit_preview(), "しんぶんK1");
+    assert_eq!(log.converts.borrow().last().map(|(_, reading)| reading.as_str()), Some("しんぶん"));
+    c.backspace_romaji();
+    assert_eq!(c.preedit(), "しんぶK1");
+    assert_eq!(log.converts.borrow().last().map(|(_, reading)| reading.as_str()), Some("しんぶ"));
+    type_keys(&mut c, "na");
+    assert_eq!(c.preedit(), "しんぶなK1");
+}
+
+#[test]
+fn liveでも読みが2かなに収まる間は_ん_を足してもひらがなのまま() {
+    let (mut c, _) = composer();
+    c.set_live(true);
+    type_keys(&mut c, "min");
+    assert_eq!(c.preedit(), "みん");
+    type_keys(&mut c, "a");
+    assert_eq!(c.preedit(), "みな");
+}
+
+#[test]
+fn n_の有無が変わる打鍵でだけ変換し直す() {
+    let (mut c, log) = composer();
+    type_keys(&mut c, "shinbu");
+    let converts = || log.converts.borrow().len();
+    let base = converts();
+    type_keys(&mut c, "n");
+    assert_eq!(converts(), base + 1, "n で ん を足した読みを 1 回変換する");
+    for _ in 0..3 {
+        let _ = (c.preedit(), c.display().into_owned(), c.commit_preview(), c.candidates().len(), c.phase(), c.raw());
+    }
+    assert_eq!(converts(), base + 1, "読み取りでは変換しない");
+    c.backspace_romaji();
+    assert_eq!(converts(), base + 2, "n を消して読みを戻すときに 1 回");
+    type_keys(&mut c, "k");
+    type_keys(&mut c, "y");
+    assert_eq!(converts(), base + 2, "n 以外の未確定のローマ字では変換しない");
+    c.backspace_romaji();
+    c.backspace_romaji();
+    type_keys(&mut c, "n");
+    type_keys(&mut c, "y");
+    assert_eq!(converts(), base + 4, "n が ny になって ん が消えるときに 1 回");
+}
+
+#[test]
+fn n_のあとの確定は変換した読みと順位を学習に渡す() {
+    // 学習は (世代, 順位) で engine の直近の変換を引く。ん を足した変換が直近に残っていてはいけない。
+    for (live, keys, backspaces, reading) in [
+        (false, "shinbun", 0, "しんぶん"),
+        (false, "shinbun", 1, "しんぶ"),
+        (false, "shinbuna", 0, "しんぶな"),
+        (true, "shinbun", 0, "しんぶん"),
+        (true, "shinbun", 1, "しんぶ"),
+        (true, "shinbuna", 0, "しんぶな"),
+    ] {
+        let (mut c, log) = composer();
+        c.set_live(live);
+        type_keys(&mut c, keys);
+        for _ in 0..backspaces {
+            c.backspace_romaji();
+        }
+        c.flush_romaji();
+        if !live {
+            assert!(c.begin_conversion());
+            assert!(c.advance());
+        }
+        let Committed { text, engine, .. } = c.commit();
+        let (revision, EngineRank(rank)) = engine.unwrap_or_else(|| panic!("{keys} {backspaces} live={live}: 学習対象がある"));
+        let (last_revision, last_reading) = log.converts.borrow().last().cloned().expect("converted");
+        assert_eq!(revision, last_revision, "{keys} {backspaces} live={live}: 直近の変換の世代");
+        assert_eq!(last_reading, reading, "{keys} {backspaces} live={live}");
+        assert_eq!(text, format!("{reading}K{}", rank + 1), "{keys} {backspaces} live={live}: 順位が確定した候補を指す");
+        assert_eq!(rank, usize::from(!live), "{keys} {backspaces} live={live}");
+    }
+}
+
+#[test]
+fn 固定中の_ん_は残りの読みに足して変換し_固定は保たれる() {
+    let mut c = pinned_sensei();
+    assert_eq!(c.rest(), "");
+    c.type_romaji("n");
+    assert_eq!(c.hiragana, "せんせいん");
+    assert!(c.pin.is_some());
+    assert!(c.pin_matches_reading());
+    assert_eq!(c.rest(), "ん");
+    assert_eq!(c.engine.converted.borrow().last().map(String::as_str), Some("ん"), "固定した分は変換しない");
+    assert_eq!(c.preedit(), "先生変ん");
+    assert_wysiwyg(&c);
+    c.backspace_romaji();
+    assert_eq!(c.hiragana, "せんせい");
+    assert!(c.pin.is_some());
+    assert_eq!(c.preedit(), "先生");
+    assert_wysiwyg(&c);
+    c.type_romaji("n");
+    c.flush_romaji();
+    let committed = c.commit();
+    assert_eq!(committed.text, "先生変ん");
+    assert_eq!(committed.engine, None, "固定を含む確定は学習しない");
+}
+
+/// 辞書の英単語を `is_word` で決める composer。
+fn english_composer(is_word: fn(&str) -> bool) -> Composer<MockEngine, FakeLexicon> {
+    Composer::new(MockEngine { log: Log::default(), table: vec![] }, FakeLexicon::default().with_english_word(is_word))
+}
+
+#[test]
+fn 英語を打っている間の_n_は今までどおり英字で見せる() {
+    let mut c = english_composer(|w| w == "open");
+    type_keys(&mut c, "open");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "open");
+    assert_eq!(c.commit_preview(), "open");
+    let (mut c, _, mut memory) = learn_composer(&[]);
+    memory.learn("man");
+    type_keys(&mut c, "man");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "man");
+}
+
+#[test]
+fn 英単語から読みに戻った_n_は_ん_として見せ_英語に戻れば英字に戻る() {
+    let (mut c, _) = word_composer(&[], false);
+    type_keys(&mut c, "issue");
+    c.type_romaji("n");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "いっすえん");
+    assert_eq!(c.commit_preview(), "いっすえん");
+    c.backspace_romaji();
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "issue");
+    assert_eq!(c.hiragana, "いっすえ");
+}
+
+#[test]
+fn 英語分割が見えている間の_n_は_ん_で見せて_enter_と一致する() {
+    let mut c = english_composer(|w| w == "login");
+    type_keys(&mut c, "loginjinihirakun");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert!(c.english_split(false).is_some());
+    assert_eq!(c.preedit(), "loginじにひらくん");
+    assert_eq!(c.commit_preview(), c.preedit());
+    assert_eq!(c.hiragana, "ぉぎんじにひらく");
+}
+
+#[test]
+fn enterで英語として扱い直す組成の_n_は_ん_にせず打鍵のまま見せる() {
+    // 記号があって英語の判定は働かないが、ASCII のまま残ったかな (y, m) があるので、Enter の flush は raw で確定する。
+    let (mut c, _) = composer();
+    c.type_text(".");
+    type_keys(&mut c, "ymn");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "。ymn");
+    c.flush_romaji();
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.commit_preview(), ".ymn");
+}
+
+/// 審判が英語を却下する engine (headwords の読みは辞書の見出し)。一覧の語は api、表の語は made。
+fn vetoing_composer(headwords: &[&str]) -> Composer<MockEngine, FakeLexicon> {
+    let log = Log::default();
+    *log.headwords.borrow_mut() = headwords.iter().map(ToString::to_string).collect();
+    *log.rejects.borrow_mut() = true;
+    *log.prefixes.borrow_mut() = vec!["あぴーる".to_string()];
+    let lexicon = FakeLexicon::default().with_dev_word(|w| w == "api").with_english_word(|w| w == "made");
+    Composer::new(MockEngine { log, table: vec![] }, lexicon)
+}
+
+#[test]
+fn 一覧の語は審判が英語を却下しても英語のまま() {
+    let mut c = vetoing_composer(&["あぴ", "まで"]);
+    type_keys(&mut c, "api");
+    assert_eq!(c.phase(), Phase::Dangling);
+    assert_eq!(c.preedit(), "api");
+    assert_eq!(c.commit_preview(), "api");
+}
+
+#[test]
+fn 表の語は審判が英語を却下すれば読みのまま() {
+    let mut c = vetoing_composer(&["あぴ", "まで"]);
+    type_keys(&mut c, "made");
+    assert_eq!(c.phase(), Phase::Composing);
+    assert_eq!(c.preedit(), "まで");
+}
+
+#[test]
+fn 英単語の直後のハイフンは読みに長音を足した見出しがあるときだけ長音にする() {
+    let mut c = vetoing_composer(&["あぴ"]);
+    type_keys(&mut c, "api");
+    assert!(c.hyphen_continues_kana());
+    // 見出しの無い語 (made → まで に ー を足した見出しは無い) は英語のまま確定する。
+    let mut c = vetoing_composer(&["まで"]);
+    type_keys(&mut c, "made");
+    assert!(!c.hyphen_continues_kana());
 }
