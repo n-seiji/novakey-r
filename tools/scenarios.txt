@@ -549,3 +549,30 @@ kyou->asita<space><enter>	今日->明日
 <lt><right>-<enter>	<ー
 <lt><up>-<enter>	<ー
 <lt><esc>-<enter>	<ー
+# 未確定のローマ字が n だけのとき、表示では ん として見せる (Space は読み、live は ん を含めた読みの変換)。確定は表示のまま。次の打鍵で差し替わる (mina は みな)。
+# 途中の下線付きの表示は --simulate に出る (unit test も見る)。`mise run wysiwyg` が表示と確定の一致を見る。
+min<enter>	みん
+min<space><enter>	民
+min<bs><enter>	み
+mina<enter>	みな
+minn<enter>	みん
+min'<enter>	みん
+mink<enter>	mink
+man<enter>	まん
+<live>min<enter>	みん
+<live>mina<enter>	みな
+<live>kyon<enter>	きょん
+<live>rainen<enter>	来年
+<live>shinbun<enter>	新聞
+<live>shinbun<space><enter>	新聞
+<live>shinbun<bs><enter>	深部
+<live>shinbuna<enter>	深部な
+<live>shinbunn<enter>	新聞
+<live>shinbun'<enter>	新聞
+<live>shinbunk<enter>	shinbunk
+# 固定中 (live の Backspace のあと) の n は、固定の後ろの残りの読みに ん を足して変換する。
+<live>kaisyanokenn<bs>n<enter>	会社のん
+<live>kaisyanokenn<bs>na<enter>	会社の名
+<live>kaisyanokenn<bs>n<bs><enter>	会社の
+# 英語として扱う間の n は今までどおり英字のまま。
+<live>open<enter>	open

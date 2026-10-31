@@ -117,10 +117,11 @@ impl<C: TextClient + Clone, P: CandidatePanel, E: Environment, L: Lexicon, M: En
         self.session.borrow().marked_text()
     }
 
-    /// 未確定ローマ字が無いときの、いま確定した場合の文字列。あれば None (表示と一致しなくてよい)。
+    /// いま確定した場合の文字列。読みに取り込まれない未確定ローマ字 (きょうt の t) があれば None (表示と一致しなくてよい)。
+    /// n だけの未確定は ん として表示にも確定にも含まれるので、表示と一致するか確かめられる。
     pub fn commit_preview(&self) -> Option<String> {
         let session = self.session.borrow();
-        (!session.has_romaji()).then(|| session.commit_preview())
+        (!session.has_unfolded_romaji()).then(|| session.commit_preview())
     }
 
     fn client(&self) -> Option<C> {
@@ -409,6 +410,20 @@ mod tests {
         type_letters(&f, "a");
         assert_eq!(f.1.marked(), "あ");
         assert_eq!(f.1.committed(), "");
+    }
+
+    #[test]
+    fn 確定の予想が返るのは_表示に含まれない未確定ローマ字が無いときだけ() {
+        let f = fixture();
+        type_letters(&f, "kyon");
+        assert_eq!(f.0.commit_preview(), Some("きょん".to_string()), "n は ん として表示に含まれる");
+        assert_eq!(f.0.commit_preview(), Some(f.0.marked_text()));
+        assert!(press(&f, Key::Escape, "\u{1b}"));
+        type_letters(&f, "kyout");
+        assert_eq!(f.0.commit_preview(), None, "t は表示に含まれない");
+        assert!(press(&f, Key::Escape, "\u{1b}"));
+        type_letters(&f, "n");
+        assert_eq!(f.0.commit_preview(), None, "単独の n は表示に ん を足さない");
     }
 
     #[test]

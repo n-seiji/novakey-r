@@ -441,7 +441,7 @@ fn run_keys(keys: &str, verbose: bool, check_preedit: bool) -> Result<Run, Strin
     let mut sim = Sim::new();
     sim.client.set_bundle("sim");
     let mut stale = Vec::new();
-    // 検査は opt-in。未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない。
+    // 検査は opt-in。読みに取り込まれない未確定ローマ字が残るとき (`kyout<enter>` → `kyout`) は仕様で一致しないので見ない (n だけなら ん として一致するので見る)。
     let mut wysiwyg_broken = Vec::new();
     for (label, step) in parse_keys(keys)? {
         let started = std::time::Instant::now();

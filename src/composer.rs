@@ -252,6 +252,9 @@ const EMOJI_LIMIT: usize = 5;
 const EMOJI_AFTER_ENGINE: usize = 3;
 /// live 変換は、読みがこの文字数 (かな) を超えてから表示を変換する。これ以下はひらがなのまま (Space の変換は別)。
 const LIVE_MIN_KANA: usize = 2;
+/// 未確定のローマ字がこれだけのとき、読みには `PENDING_N_KANA` を足して見せる (`Composer::pending_kana`)。
+const PENDING_N: &str = "n";
+const PENDING_N_KANA: &str = "ん";
 
 pub struct Composer<E: CandidateEngine, L: Lexicon> {
     engine: E,
@@ -382,10 +385,12 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         if (self.typing == Typing::English && self.is_kana_editing()) || self.is_typing_english() {
             return self.raw();
         }
-        format!("{}{}", self.display(), self.romaji.buffer())
+        // n だけの未確定のローマ字は、読み (display) が ん として含んでいる。
+        let pending = if self.pending_kana().is_empty() { self.romaji.buffer() } else { "" };
+        format!("{}{pending}", self.display())
     }
 
-    /// Enter で確定される文字列 (状態は変えない)。未確定ローマ字は確定済みとして扱わない。
+    /// Enter で確定される文字列 (状態は変えない)。未確定ローマ字は確定済みとして扱わない。ただし n だけなら、読みが ん として含んでいる (`pending_kana`)。
     /// かな入力中は、確定の前に行う flush が局面を英語に変える分 (merge, artifactni) も見込む。
     pub fn commit_preview(&self) -> String {
         match self.settle(self.is_typing_english()) {
@@ -432,8 +437,44 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         true
     }
 
+    /// 読みに足して見せる、未確定のローマ字のかな。n だけなら ん (次の打鍵で `mina` の な や `ny` に差し替わる)、それ以外は空。
+    /// かなを入力中 (Typing::Kana の Editing) で、Enter の flush が組成を英語として扱い直さない (raw で確定しない) ときだけ。
+    /// 扱い直す組成 (英語分割が見えている、ASCII のまま残ったかながある) は、n も打鍵のまま見せる。この条件を決めるのはここだけ。
+    fn pending_kana(&self) -> &'static str {
+        let folded = matches!(self.stage, Stage::Editing)
+            && self.typing == Typing::Kana
+            && !self.segments.is_empty()
+            && self.romaji.buffer() == PENDING_N
+            && matches!(self.settle(self.is_typing_english()), Settle::Unchanged);
+        if folded { PENDING_N_KANA } else { "" }
+    }
+
+    /// 見えている読み: 確定した区切りのかなに、未確定の n を ん として足したもの。
+    fn shown_reading(&self) -> String {
+        self.segments.iter().map(Segment::reading).chain(std::iter::once(self.pending_kana())).collect()
+    }
+
     fn sync_hiragana(&mut self) {
-        self.hiragana = self.segments.iter().map(Segment::reading).collect();
+        self.hiragana = self.shown_reading();
+    }
+
+    /// 未確定の n を ん として見せるかの変化を、読みと候補に反映する。読みが変わったときだけ、新しい世代で変換し直す。
+    /// 英語を打っている間は変換しないので、読みの ん を外すだけ。
+    fn sync_pending_kana(&mut self) {
+        if self.shown_reading() == self.hiragana {
+            return;
+        }
+        if matches!(self.stage, Stage::Editing) && self.typing == Typing::Kana {
+            self.refresh();
+        } else {
+            self.sync_hiragana();
+        }
+    }
+
+    /// 未確定のローマ字が変わった打鍵のあとの後始末。英語かの判定を直してから、n を ん として見せるかを読みに反映する。
+    fn settle_pending(&mut self) {
+        self.track_english();
+        self.sync_pending_kana();
     }
 
     fn reset_candidates(&mut self) {
@@ -447,14 +488,15 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
 
     fn refresh(&mut self) {
         self.reset_candidates();
-        self.sync_hiragana();
         self.stage = Stage::Editing;
+        // 読みの ん (`pending_kana`) は Kana の入力中だけ足すので、読みを作る前に局面を Kana にしておく。
+        self.typing = Typing::Kana;
+        self.sync_hiragana();
         if self.hiragana.is_empty() {
             self.pin = None;
             self.typing = Typing::Empty;
             return;
         }
-        self.typing = Typing::Kana;
         self.word_verdict = None;
         if self.is_typing_english() {
             self.enter_english();
@@ -494,6 +536,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
     fn enter_english(&mut self) {
         self.pin = None;
         self.typing = Typing::English;
+        self.sync_hiragana();
         self.english_shown = true;
         self.sync_live_split();
     }
@@ -838,7 +881,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
             .filter_map(|ch| self.romaji.process_input(ch.to_ascii_lowercase()))
             .collect();
         if kana.is_empty() {
-            self.track_english();
+            self.settle_pending();
             return;
         }
         // 確定した単位の打鍵は、ローマ字に残った未確定の打鍵 (`tt` の 2 つ目の t など) を除いたもの。
@@ -883,15 +926,22 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         !self.romaji.buffer().is_empty()
     }
 
+    /// 未確定のローマ字が、読みに取り込まれないまま残っているか。残っていると `commit_preview` は表示と一致するとは限らない。
+    /// n だけなら ん として読みに取り込まれ、表示も確定も同じになる (`pending_kana`)。
+    pub fn has_unfolded_romaji(&self) -> bool {
+        self.has_romaji() && self.pending_kana().is_empty()
+    }
+
     /// 未確定のローマ字を 1 文字消す。
     pub fn backspace_romaji(&mut self) {
         self.romaji.handle_backspace();
-        self.track_english();
+        self.settle_pending();
     }
 
     /// 未確定のローマ字を捨てる。
     pub fn clear_romaji(&mut self) {
         self.romaji.clear();
+        self.sync_pending_kana();
     }
 
     /// テスト用: 打鍵 raw と、それで確定したかな kana を追加する (kana が空なら raw は次に持ち越す)。
@@ -903,6 +953,7 @@ impl<E: CandidateEngine, L: Lexicon> Composer<E, L> {
         self.romaji.clear();
         if kana.is_empty() {
             self.romaji.set_buffer(&pending);
+            self.sync_pending_kana();
             return;
         }
         let split = pending.strip_suffix(carry).map_or(pending.len(), str::len);
