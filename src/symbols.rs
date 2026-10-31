@@ -40,6 +40,38 @@ const VARIANTS: &[&[&str]] = &[
     &["；", ";"],
 ];
 
+/// 記号の呼び名 (ひらがなの読み全体) -> 記号。絵文字と同じ経路 (`emoji::emoji_for` -> composer の絵文字候補) で、
+/// 表の順に絵文字より先に出る。エンジンの辞書にも居る記号は、後ろの複製が消えてここの位置に寄る。手で足す表。
+const NAMES: &[(&str, &[&str])] = &[
+    ("こめじるし", &["※"]),
+    ("まる", &["○", "●", "◎"]),
+    ("しろまる", &["○"]),
+    ("くろまる", &["●"]),
+    ("にじゅうまる", &["◎"]),
+    ("さんかく", &["△", "▲", "▽", "▼"]),
+    ("しろさんかく", &["△"]),
+    ("くろさんかく", &["▲"]),
+    ("しかく", &["□", "■"]),
+    ("しろしかく", &["□"]),
+    ("くろしかく", &["■"]),
+    ("ほし", &["☆", "★"]),
+    ("しろほし", &["☆"]),
+    ("くろほし", &["★"]),
+    ("やじるし", &["→", "←", "↑", "↓"]),
+    ("ゆうびん", &["〒"]),
+    ("おんぷ", &["♪", "♫", "♬"]),
+    ("ばつ", &["×"]),
+    ("ひしがた", &["◇", "◆"]),
+    ("でんわ", &["☎"]),
+    ("かっこ", &["「」", "『』", "（）", "【】"]),
+    ("なみ", &["〜", "～"]),
+];
+
+/// 記号の呼び名に対応する記号 (表の順)。読み全体の完全一致だけ。無ければ空。
+pub fn symbols_named(reading: &str) -> &'static [&'static str] {
+    NAMES.iter().find(|(name, _)| *name == reading).map_or(&[], |(_, symbols)| symbols)
+}
+
 /// 打鍵した ASCII 記号の既定の和文表記。
 pub fn default_form(ascii: &str) -> Option<&'static str> {
     DEFAULT_FORMS
@@ -69,6 +101,22 @@ mod tests {
         }
         assert_eq!(default_form("a"), None);
         assert_eq!(default_form("1"), None);
+    }
+
+    #[test]
+    fn 記号の呼び名は読み全体の完全一致で引ける() {
+        assert_eq!(symbols_named("こめじるし"), ["※"]);
+        assert_eq!(symbols_named("まる"), ["○", "●", "◎"]);
+        assert!(symbols_named("こめ").is_empty());
+        assert!(symbols_named("まるい").is_empty());
+    }
+
+    #[test]
+    fn 記号の呼び名の表は空の読みも空の記号も重複した読みも持たない() {
+        for (i, (name, symbols)) in NAMES.iter().enumerate() {
+            assert!(!name.is_empty() && !symbols.is_empty() && symbols.iter().all(|s| !s.is_empty()), "{name}");
+            assert!(NAMES[..i].iter().all(|(n, _)| n != name), "{name} が重複");
+        }
     }
 
     #[test]
